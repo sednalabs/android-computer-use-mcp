@@ -25,7 +25,9 @@ jobs:
           sdk_root="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
           echo "ANDROID_HOME=${sdk_root}" >> "${GITHUB_ENV}"
           echo "ANDROID_SDK_ROOT=${sdk_root}" >> "${GITHUB_ENV}"
+          set +o pipefail
           yes | "${sdk_root}/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null
+          set -o pipefail
           "${sdk_root}/cmdline-tools/latest/bin/sdkmanager" "emulator"
           test -f "${sdk_root}/emulator/lib/emulator_controller.proto"
 
