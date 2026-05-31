@@ -1,0 +1,2662 @@
+{
+  "schema": "mcp_tool_schema_snapshot",
+  "tools": [
+    {
+      "description": "Capture a PNG screenshot from the device and save it locally.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "Arguments for capturing a device screenshot artifact.",
+        "properties": {
+          "filename": {
+            "default": null,
+            "description": "Optional path to save the screenshot artifact.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "serial": {
+            "default": null,
+            "description": "ADB serial of the target device.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "title": "ScreenshotArgs",
+        "type": "object"
+      },
+      "name": "android.capture_screenshot"
+    },
+    {
+      "description": "Capture recent logcat output and save it locally.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "Arguments for collecting recent logcat output as an artifact.",
+        "properties": {
+          "filename": {
+            "default": null,
+            "description": "Optional path to save the collected logcat output.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "lines": {
+            "default": null,
+            "description": "Number of recent log lines to capture.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "serial": {
+            "default": null,
+            "description": "ADB serial of the target device.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "title": "LogcatArgs",
+        "type": "object"
+      },
+      "name": "android.collect_logcat"
+    },
+    {
+      "description": "Dump the current UI hierarchy XML and save it locally.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "Arguments for dumping the current UI hierarchy as an artifact.",
+        "properties": {
+          "filename": {
+            "default": null,
+            "description": "Optional path to save the dumped hierarchy.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "serial": {
+            "default": null,
+            "description": "ADB serial of the target device.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "title": "UiDumpArgs",
+        "type": "object"
+      },
+      "name": "android.dump_ui_hierarchy"
+    },
+    {
+      "description": "Find the first normalized UI element matching a semantic selector in the current hierarchy.",
+      "inputSchema": {
+        "$defs": {
+          "UiSelector": {
+            "description": "Defines the criteria for selecting a UI element in the Android accessibility tree.",
+            "properties": {
+              "checked": {
+                "default": null,
+                "description": "Filter by checked state.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "clickable": {
+                "default": null,
+                "description": "Filter by clickability.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "content_desc": {
+                "default": null,
+                "description": "Content description attribute.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "enabled": {
+                "default": null,
+                "description": "Filter by enabled state.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "focusable": {
+                "default": null,
+                "description": "Filter by focusability.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "focused": {
+                "default": null,
+                "description": "Filter by focused state.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "label": {
+                "default": null,
+                "description": "Logical label of the element.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "label_exact": {
+                "default": null,
+                "description": "Whether the label match must be exact.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "long_clickable": {
+                "default": null,
+                "description": "Filter by long-clickability.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "resource_id": {
+                "default": null,
+                "description": "Resource ID of the element.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "scrollable": {
+                "default": null,
+                "description": "Filter by scrollability.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "selected": {
+                "default": null,
+                "description": "Filter by selection state.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "text": {
+                "default": null,
+                "description": "Text content of the element.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "text_exact": {
+                "default": null,
+                "description": "Whether the text match must be exact.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              }
+            },
+            "type": "object"
+          },
+          "UiSelectorInput": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/UiSelector",
+                "description": "A structured selector definition."
+              },
+              {
+                "description": "Text shorthand for common selector patterns.",
+                "type": "string"
+              }
+            ],
+            "description": "Allows either a fully defined selector or a text-based shorthand."
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "Arguments for finding a UI element based on a selector.",
+        "properties": {
+          "hierarchy_filename": {
+            "default": null,
+            "description": "Optional path to save the hierarchy.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "match_index": {
+            "default": null,
+            "description": "The index to match if multiple elements are found.",
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "selector": {
+            "$ref": "#/$defs/UiSelectorInput",
+            "description": "The selector defining the UI element to locate."
+          },
+          "serial": {
+            "default": null,
+            "description": "ADB serial of the target device.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "selector"
+        ],
+        "title": "FindUiElementArgs",
+        "type": "object"
+      },
+      "name": "android.find_ui_element"
+    },
+    {
+      "annotations": {
+        "readOnlyHint": true
+      },
+      "description": "Report SDK paths, known AVDs, and attached Android devices.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "EmptyArgs",
+        "type": "object"
+      },
+      "name": "android.health"
+    },
+    {
+      "description": "Send a keyevent to the device.",
+      "inputSchema": {
+        "$defs": {
+          "UiSelector": {
+            "description": "Defines the criteria for selecting a UI element in the Android accessibility tree.",
+            "properties": {
+              "checked": {
+                "default": null,
+                "description": "Filter by checked state.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "clickable": {
+                "default": null,
+                "description": "Filter by clickability.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "content_desc": {
+                "default": null,
+                "description": "Content description attribute.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "enabled": {
+                "default": null,
+                "description": "Filter by enabled state.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "focusable": {
+                "default": null,
+                "description": "Filter by focusability.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "focused": {
+                "default": null,
+                "description": "Filter by focused state.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "label": {
+                "default": null,
+                "description": "Logical label of the element.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "label_exact": {
+                "default": null,
+                "description": "Whether the label match must be exact.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "long_clickable": {
+                "default": null,
+                "description": "Filter by long-clickability.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "resource_id": {
+                "default": null,
+                "description": "Resource ID of the element.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "scrollable": {
+                "default": null,
+                "description": "Filter by scrollability.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "selected": {
+                "default": null,
+                "description": "Filter by selection state.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "text": {
+                "default": null,
+                "description": "Text content of the element.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "text_exact": {
+                "default": null,
+                "description": "Whether the text match must be exact.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              }
+            },
+            "type": "object"
+          },
+          "UiSelectorInput": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/UiSelector",
+                "description": "A structured selector definition."
+              },
+              {
+                "description": "Text shorthand for common selector patterns.",
+                "type": "string"
+              }
+            ],
+            "description": "Allows either a fully defined selector or a text-based shorthand."
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "Arguments for sending a key event to the device.",
+        "properties": {
+          "keycode": {
+            "description": "Android keycode name to dispatch, such as `KEYCODE_ENTER`.",
+            "type": "string"
+          },
+          "serial": {
+            "default": null,
+            "description": "ADB serial of the target device.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "timeout_secs": {
+            "default": null,
+            "description": "Timeout in seconds for dispatch and postcondition verification.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "wait_for_activity": {
+            "default": null,
+            "description": "Optional activity name expected after the key event.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "wait_for_package": {
+            "default": null,
+            "description": "Optional package name expected after the key event.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "wait_for_selector": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/UiSelectorInput"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional selector to verify after the key event."
+          }
+        },
+        "required": [
+          "keycode"
+        ],
+        "title": "KeyeventArgs",
+        "type": "object"
+      },
+      "name": "android.input.keyevent"
+    },
+    {
+      "description": "Send a swipe gesture to the device.",
+      "inputSchema": {
+        "$defs": {
+          "UiSelector": {
+            "description": "Defines the criteria for selecting a UI element in the Android accessibility tree.",
+            "properties": {
+              "checked": {
+                "default": null,
+                "description": "Filter by checked state.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "clickable": {
+                "default": null,
+                "description": "Filter by clickability.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "content_desc": {
+                "default": null,
+                "description": "Content description attribute.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "enabled": {
+                "default": null,
+                "description": "Filter by enabled state.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "focusable": {
+                "default": null,
+                "description": "Filter by focusability.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "focused": {
+                "default": null,
+                "description": "Filter by focused state.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "label": {
+                "default": null,
+                "description": "Logical label of the element.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "label_exact": {
+                "default": null,
+                "description": "Whether the label match must be exact.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "long_clickable": {
+                "default": null,
+                "description": "Filter by long-clickability.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "resource_id": {
+                "default": null,
+                "description": "Resource ID of the element.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "scrollable": {
+                "default": null,
+                "description": "Filter by scrollability.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "selected": {
+                "default": null,
+                "description": "Filter by selection state.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "text": {
+                "default": null,
+                "description": "Text content of the element.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "text_exact": {
+                "default": null,
+                "description": "Whether the text match must be exact.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              }
+            },
+            "type": "object"
+          },
+          "UiSelectorInput": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/UiSelector",
+                "description": "A structured selector definition."
+              },
+              {
+                "description": "Text shorthand for common selector patterns.",
+                "type": "string"
+              }
+            ],
+            "description": "Allows either a fully defined selector or a text-based shorthand."
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "Arguments for swiping between two screen coordinates.",
+        "properties": {
+          "duration_ms": {
+            "default": null,
+            "description": "Optional swipe duration in milliseconds.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "expect_scroll_change": {
+            "default": false,
+            "description": "Whether the caller expects the swipe to change scroll position.",
+            "type": "boolean"
+          },
+          "serial": {
+            "default": null,
+            "description": "ADB serial of the target device.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "timeout_secs": {
+            "default": null,
+            "description": "Timeout in seconds for swipe dispatch and verification.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "wait_for_selector": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/UiSelectorInput"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional selector to verify after the swipe."
+          },
+          "x1": {
+            "description": "Starting horizontal coordinate in device pixels.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "x2": {
+            "description": "Ending horizontal coordinate in device pixels.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "y1": {
+            "description": "Starting vertical coordinate in device pixels.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "y2": {
+            "description": "Ending vertical coordinate in device pixels.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "x1",
+          "y1",
+          "x2",
+          "y2"
+        ],
+        "title": "SwipeArgs",
+        "type": "object"
+      },
+      "name": "android.input.swipe"
+    },
+    {
+      "description": "Send a tap input event to the device.",
+      "inputSchema": {
+        "$defs": {
+          "UiSelector": {
+            "description": "Defines the criteria for selecting a UI element in the Android accessibility tree.",
+            "properties": {
+              "checked": {
+                "default": null,
+                "description": "Filter by checked state.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "clickable": {
+                "default": null,
+                "description": "Filter by clickability.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "content_desc": {
+                "default": null,
+                "description": "Content description attribute.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "enabled": {
+                "default": null,
+                "description": "Filter by enabled state.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "focusable": {
+                "default": null,
+                "description": "Filter by focusability.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "focused": {
+                "default": null,
+                "description": "Filter by focused state.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "label": {
+                "default": null,
+                "description": "Logical label of the element.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "label_exact": {
+                "default": null,
+                "description": "Whether the label match must be exact.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "long_clickable": {
+                "default": null,
+                "description": "Filter by long-clickability.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "resource_id": {
+                "default": null,
+                "description": "Resource ID of the element.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "scrollable": {
+                "default": null,
+                "description": "Filter by scrollability.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "selected": {
+                "default": null,
+                "description": "Filter by selection state.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "text": {
+                "default": null,
+                "description": "Text content of the element.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "text_exact": {
+                "default": null,
+                "description": "Whether the text match must be exact.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              }
+            },
+            "type": "object"
+          },
+          "UiSelectorInput": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/UiSelector",
+                "description": "A structured selector definition."
+              },
+              {
+                "description": "Text shorthand for common selector patterns.",
+                "type": "string"
+              }
+            ],
+            "description": "Allows either a fully defined selector or a text-based shorthand."
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "Arguments for tapping an absolute screen coordinate.",
+        "properties": {
+          "retry_with_adb_on_no_change": {
+            "default": true,
+            "description": "Whether to retry with ADB if the first backend reports no UI change.",
+            "type": "boolean"
+          },
+          "serial": {
+            "default": null,
+            "description": "ADB serial of the target device.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tapped_selector": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/UiSelectorInput"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional selector describing the tapped element for verification."
+          },
+          "timeout_secs": {
+            "default": null,
+            "description": "Timeout in seconds for tap dispatch and verification.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "wait_for_selector": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/UiSelectorInput"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional selector to verify after the tap."
+          },
+          "wait_until_absent": {
+            "default": false,
+            "description": "Whether to wait for the tapped selector to disappear.",
+            "type": "boolean"
+          },
+          "x": {
+            "description": "Horizontal coordinate in device pixels.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "y": {
+            "description": "Vertical coordinate in device pixels.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "x",
+          "y"
+        ],
+        "title": "TapArgs",
+        "type": "object"
+      },
+      "name": "android.input.tap"
+    },
+    {
+      "description": "Send text input to the device.",
+      "inputSchema": {
+        "$defs": {
+          "UiSelector": {
+            "description": "Defines the criteria for selecting a UI element in the Android accessibility tree.",
+            "properties": {
+              "checked": {
+                "default": null,
+                "description": "Filter by checked state.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "clickable": {
+                "default": null,
+                "description": "Filter by clickability.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "content_desc": {
+                "default": null,
+                "description": "Content description attribute.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "enabled": {
+                "default": null,
+                "description": "Filter by enabled state.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "focusable": {
+                "default": null,
+                "description": "Filter by focusability.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "focused": {
+                "default": null,
+                "description": "Filter by focused state.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "label": {
+                "default": null,
+                "description": "Logical label of the element.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "label_exact": {
+                "default": null,
+                "description": "Whether the label match must be exact.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "long_clickable": {
+                "default": null,
+                "description": "Filter by long-clickability.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "resource_id": {
+                "default": null,
+                "description": "Resource ID of the element.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "scrollable": {
+                "default": null,
+                "description": "Filter by scrollability.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "selected": {
+                "default": null,
+                "description": "Filter by selection state.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "text": {
+                "default": null,
+                "description": "Text content of the element.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "text_exact": {
+                "default": null,
+                "description": "Whether the text match must be exact.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              }
+            },
+            "type": "object"
+          },
+          "UiSelectorInput": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/UiSelector",
+                "description": "A structured selector definition."
+              },
+              {
+                "description": "Text shorthand for common selector patterns.",
+                "type": "string"
+              }
+            ],
+            "description": "Allows either a fully defined selector or a text-based shorthand."
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "Arguments for sending text input to the currently focused element.",
+        "properties": {
+          "expect_focus_selector": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/UiSelectorInput"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional selector that must be focused before dispatching text."
+          },
+          "serial": {
+            "default": null,
+            "description": "ADB serial of the target device.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "text": {
+            "description": "Text to dispatch to the focused field.",
+            "type": "string"
+          },
+          "timeout_secs": {
+            "default": null,
+            "description": "Timeout in seconds for dispatch and verification.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "wait_for_selector": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/UiSelectorInput"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional selector to verify after text dispatch."
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "title": "TextArgs",
+        "type": "object"
+      },
+      "name": "android.input.text"
+    },
+    {
+      "description": "Capture the current UI hierarchy, optionally pair it with a screenshot, and return a normalized UI tree.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "Arguments for inspecting the current UI hierarchy and screenshot.",
+        "properties": {
+          "hierarchy_filename": {
+            "default": null,
+            "description": "Path to save the extracted UI hierarchy.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "include_screenshot": {
+            "default": true,
+            "description": "Whether to include a screenshot of the current state.",
+            "type": "boolean"
+          },
+          "screenshot_filename": {
+            "default": null,
+            "description": "Path to save the screenshot.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "serial": {
+            "default": null,
+            "description": "ADB serial of the target device.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "title": "InspectUiArgs",
+        "type": "object"
+      },
+      "name": "android.inspect_ui"
+    },
+    {
+      "description": "Install an APK onto the target device.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "Arguments for installing an APK onto a device.",
+        "properties": {
+          "apk_path": {
+            "description": "Absolute or relative path to the APK file on the host.",
+            "type": "string"
+          },
+          "reinstall": {
+            "default": false,
+            "description": "Whether to replace an existing installation in place.",
+            "type": "boolean"
+          },
+          "serial": {
+            "default": null,
+            "description": "ADB serial of the target device.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "apk_path"
+        ],
+        "title": "InstallApkArgs",
+        "type": "object"
+      },
+      "name": "android.install_apk"
+    },
+    {
+      "description": "Launch an installed Android app by package name and optional activity.",
+      "inputSchema": {
+        "$defs": {
+          "UiSelector": {
+            "description": "Defines the criteria for selecting a UI element in the Android accessibility tree.",
+            "properties": {
+              "checked": {
+                "default": null,
+                "description": "Filter by checked state.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "clickable": {
+                "default": null,
+                "description": "Filter by clickability.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "content_desc": {
+                "default": null,
+                "description": "Content description attribute.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "enabled": {
+                "default": null,
+                "description": "Filter by enabled state.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "focusable": {
+                "default": null,
+                "description": "Filter by focusability.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "focused": {
+                "default": null,
+                "description": "Filter by focused state.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "label": {
+                "default": null,
+                "description": "Logical label of the element.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "label_exact": {
+                "default": null,
+                "description": "Whether the label match must be exact.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "long_clickable": {
+                "default": null,
+                "description": "Filter by long-clickability.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "resource_id": {
+                "default": null,
+                "description": "Resource ID of the element.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "scrollable": {
+                "default": null,
+                "description": "Filter by scrollability.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "selected": {
+                "default": null,
+                "description": "Filter by selection state.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "text": {
+                "default": null,
+                "description": "Text content of the element.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "text_exact": {
+                "default": null,
+                "description": "Whether the text match must be exact.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              }
+            },
+            "type": "object"
+          },
+          "UiSelectorInput": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/UiSelector",
+                "description": "A structured selector definition."
+              },
+              {
+                "description": "Text shorthand for common selector patterns.",
+                "type": "string"
+              }
+            ],
+            "description": "Allows either a fully defined selector or a text-based shorthand."
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "Arguments for launching an installed Android app and optionally waiting for readiness.",
+        "properties": {
+          "activity": {
+            "default": null,
+            "description": "Optional fully qualified activity name to launch directly.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "package_name": {
+            "description": "Android package name to launch.",
+            "type": "string"
+          },
+          "serial": {
+            "default": null,
+            "description": "ADB serial of the target device.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "timeout_secs": {
+            "default": null,
+            "description": "Timeout in seconds for launch and post-launch verification.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "wait_for_activity": {
+            "default": null,
+            "description": "Optional activity name expected after launch.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "wait_for_package": {
+            "default": null,
+            "description": "Optional package name expected after launch.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "wait_for_selector": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/UiSelectorInput"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional selector to verify after launch."
+          }
+        },
+        "required": [
+          "package_name"
+        ],
+        "title": "LaunchAppArgs",
+        "type": "object"
+      },
+      "name": "android.launch_app"
+    },
+    {
+      "description": "Launch a named AVD in the background.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "Arguments for launching an Android Virtual Device (AVD).",
+        "properties": {
+          "avd_name": {
+            "description": "Name of the AVD to launch.",
+            "type": "string"
+          },
+          "extra_args": {
+            "default": [],
+            "description": "Additional arguments passed directly to the emulator binary.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "gpu": {
+            "default": null,
+            "description": "Hardware acceleration/GPU configuration.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "grpc_port": {
+            "default": null,
+            "description": "Optional port for the emulator's gRPC control service.",
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "no_window": {
+            "default": false,
+            "description": "Launch the emulator without a UI window.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "avd_name"
+        ],
+        "title": "LaunchAvdArgs",
+        "type": "object"
+      },
+      "name": "android.launch_avd"
+    },
+    {
+      "description": "Launch a named AVD, wait for its emulator serial to appear, and verify boot readiness.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "Arguments for launching an AVD and awaiting successful boot.",
+        "properties": {
+          "avd_name": {
+            "description": "Name of the AVD to launch.",
+            "type": "string"
+          },
+          "expected_serial": {
+            "default": null,
+            "description": "Expected ADB serial for the booted emulator.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "extra_args": {
+            "default": [],
+            "description": "Additional arguments passed directly to the emulator binary.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "gpu": {
+            "default": null,
+            "description": "Hardware acceleration/GPU configuration.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "grpc_port": {
+            "default": null,
+            "description": "Optional port for the emulator's gRPC control service.",
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "no_window": {
+            "default": false,
+            "description": "Launch the emulator without a UI window.",
+            "type": "boolean"
+          },
+          "timeout_secs": {
+            "default": null,
+            "description": "Timeout in seconds to wait for boot completion.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "avd_name"
+        ],
+        "title": "LaunchAvdAndWaitArgs",
+        "type": "object"
+      },
+      "name": "android.launch_avd_and_wait"
+    },
+    {
+      "annotations": {
+        "readOnlyHint": true
+      },
+      "description": "List known local Android virtual devices.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "EmptyArgs",
+        "type": "object"
+      },
+      "name": "android.list_avds"
+    },
+    {
+      "annotations": {
+        "readOnlyHint": true
+      },
+      "description": "List adb-visible Android devices.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "serial": {
+            "default": null,
+            "description": "ADB serial of the target device.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "title": "SerialArgs",
+        "type": "object"
+      },
+      "name": "android.list_devices"
+    },
+    {
+      "description": "Swipe the viewport until a semantic UI selector becomes visible or the swipe budget is exhausted.",
+      "inputSchema": {
+        "$defs": {
+          "UiSelector": {
+            "description": "Defines the criteria for selecting a UI element in the Android accessibility tree.",
+            "properties": {
+              "checked": {
+                "default": null,
+                "description": "Filter by checked state.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "clickable": {
+                "default": null,
+                "description": "Filter by clickability.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "content_desc": {
+                "default": null,
+                "description": "Content description attribute.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "enabled": {
+                "default": null,
+                "description": "Filter by enabled state.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "focusable": {
+                "default": null,
+                "description": "Filter by focusability.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "focused": {
+                "default": null,
+                "description": "Filter by focused state.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "label": {
+                "default": null,
+                "description": "Logical label of the element.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "label_exact": {
+                "default": null,
+                "description": "Whether the label match must be exact.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "long_clickable": {
+                "default": null,
+                "description": "Filter by long-clickability.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "resource_id": {
+                "default": null,
+                "description": "Resource ID of the element.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "scrollable": {
+                "default": null,
+                "description": "Filter by scrollability.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "selected": {
+                "default": null,
+                "description": "Filter by selection state.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "text": {
+                "default": null,
+                "description": "Text content of the element.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "text_exact": {
+                "default": null,
+                "description": "Whether the text match must be exact.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              }
+            },
+            "type": "object"
+          },
+          "UiSelectorInput": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/UiSelector",
+                "description": "A structured selector definition."
+              },
+              {
+                "description": "Text shorthand for common selector patterns.",
+                "type": "string"
+              }
+            ],
+            "description": "Allows either a fully defined selector or a text-based shorthand."
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "Arguments for scrolling until a matching element becomes visible.",
+        "properties": {
+          "direction": {
+            "default": null,
+            "description": "Scroll direction such as `up`, `down`, `left`, or `right`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "hierarchy_filename": {
+            "default": null,
+            "description": "Optional path to save the final hierarchy snapshot.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "match_index": {
+            "default": null,
+            "description": "The index to match if multiple elements satisfy the selector.",
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "max_swipes": {
+            "default": null,
+            "description": "Maximum number of swipe attempts before giving up.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "selector": {
+            "$ref": "#/$defs/UiSelectorInput",
+            "description": "Selector for the element that should become visible."
+          },
+          "serial": {
+            "default": null,
+            "description": "ADB serial of the target device.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "selector"
+        ],
+        "title": "ScrollUntilVisibleArgs",
+        "type": "object"
+      },
+      "name": "android.scroll_until_visible"
+    },
+    {
+      "description": "Find a semantic UI element and tap its center point.",
+      "inputSchema": {
+        "$defs": {
+          "UiSelector": {
+            "description": "Defines the criteria for selecting a UI element in the Android accessibility tree.",
+            "properties": {
+              "checked": {
+                "default": null,
+                "description": "Filter by checked state.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "clickable": {
+                "default": null,
+                "description": "Filter by clickability.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "content_desc": {
+                "default": null,
+                "description": "Content description attribute.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "enabled": {
+                "default": null,
+                "description": "Filter by enabled state.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "focusable": {
+                "default": null,
+                "description": "Filter by focusability.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "focused": {
+                "default": null,
+                "description": "Filter by focused state.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "label": {
+                "default": null,
+                "description": "Logical label of the element.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "label_exact": {
+                "default": null,
+                "description": "Whether the label match must be exact.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "long_clickable": {
+                "default": null,
+                "description": "Filter by long-clickability.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "resource_id": {
+                "default": null,
+                "description": "Resource ID of the element.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "scrollable": {
+                "default": null,
+                "description": "Filter by scrollability.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "selected": {
+                "default": null,
+                "description": "Filter by selection state.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "text": {
+                "default": null,
+                "description": "Text content of the element.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "text_exact": {
+                "default": null,
+                "description": "Whether the text match must be exact.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              }
+            },
+            "type": "object"
+          },
+          "UiSelectorInput": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/UiSelector",
+                "description": "A structured selector definition."
+              },
+              {
+                "description": "Text shorthand for common selector patterns.",
+                "type": "string"
+              }
+            ],
+            "description": "Allows either a fully defined selector or a text-based shorthand."
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "Arguments for tapping on a UI element.",
+        "properties": {
+          "allow_verification_failure": {
+            "default": false,
+            "description": "Whether to allow the tool to succeed even if verification fails.",
+            "type": "boolean"
+          },
+          "hierarchy_filename": {
+            "default": null,
+            "description": "Optional path to save the hierarchy.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "match_index": {
+            "default": null,
+            "description": "The index to match if multiple elements are found.",
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "retry_with_adb_on_no_change": {
+            "default": true,
+            "description": "Whether to retry the operation using ADB if UI does not change.",
+            "type": "boolean"
+          },
+          "selector": {
+            "$ref": "#/$defs/UiSelectorInput",
+            "description": "The selector defining the element to tap."
+          },
+          "serial": {
+            "default": null,
+            "description": "ADB serial of the target device.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "timeout_secs": {
+            "default": null,
+            "description": "Timeout in seconds for the operation.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "wait_for_selector": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/UiSelectorInput"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional selector to verify success after the tap."
+          },
+          "wait_until_absent": {
+            "default": false,
+            "description": "Whether to wait for the element to disappear after the tap.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "selector"
+        ],
+        "title": "TapElementArgs",
+        "type": "object"
+      },
+      "name": "android.tap_element"
+    },
+    {
+      "description": "Find a semantic UI element, tap it, and send text input.",
+      "inputSchema": {
+        "$defs": {
+          "UiSelector": {
+            "description": "Defines the criteria for selecting a UI element in the Android accessibility tree.",
+            "properties": {
+              "checked": {
+                "default": null,
+                "description": "Filter by checked state.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "clickable": {
+                "default": null,
+                "description": "Filter by clickability.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "content_desc": {
+                "default": null,
+                "description": "Content description attribute.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "enabled": {
+                "default": null,
+                "description": "Filter by enabled state.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "focusable": {
+                "default": null,
+                "description": "Filter by focusability.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "focused": {
+                "default": null,
+                "description": "Filter by focused state.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "label": {
+                "default": null,
+                "description": "Logical label of the element.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "label_exact": {
+                "default": null,
+                "description": "Whether the label match must be exact.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "long_clickable": {
+                "default": null,
+                "description": "Filter by long-clickability.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "resource_id": {
+                "default": null,
+                "description": "Resource ID of the element.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "scrollable": {
+                "default": null,
+                "description": "Filter by scrollability.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "selected": {
+                "default": null,
+                "description": "Filter by selection state.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "text": {
+                "default": null,
+                "description": "Text content of the element.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "text_exact": {
+                "default": null,
+                "description": "Whether the text match must be exact.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              }
+            },
+            "type": "object"
+          },
+          "UiSelectorInput": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/UiSelector",
+                "description": "A structured selector definition."
+              },
+              {
+                "description": "Text shorthand for common selector patterns.",
+                "type": "string"
+              }
+            ],
+            "description": "Allows either a fully defined selector or a text-based shorthand."
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "hierarchy_filename": {
+            "default": null,
+            "description": "Optional path to save the hierarchy captured during verification.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "match_index": {
+            "default": null,
+            "description": "The index to match if multiple elements satisfy the selector.",
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "selector": {
+            "$ref": "#/$defs/UiSelectorInput",
+            "description": "Selector for the element that should receive the text."
+          },
+          "serial": {
+            "default": null,
+            "description": "ADB serial of the target device.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "text": {
+            "description": "Text value that should be set into the target field.",
+            "type": "string"
+          },
+          "timeout_secs": {
+            "default": null,
+            "description": "Timeout in seconds for focus, dispatch, and text verification.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "selector",
+          "text"
+        ],
+        "title": "TypeIntoElementArgs",
+        "type": "object"
+      },
+      "name": "android.type_into_element"
+    },
+    {
+      "annotations": {
+        "readOnlyHint": true
+      },
+      "description": "Wait until sys.boot_completed=1 and package manager is responsive.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "Arguments for waiting until an emulator reports boot completion.",
+        "properties": {
+          "serial": {
+            "default": null,
+            "description": "ADB serial of the target device.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "timeout_secs": {
+            "default": null,
+            "description": "Timeout in seconds to wait for boot completion.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "title": "WaitForBootArgs",
+        "type": "object"
+      },
+      "name": "android.wait_for_boot"
+    },
+    {
+      "description": "Wait until the UI hierarchy and top window state stop changing, then return a paired observation bundle.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "Arguments for waiting until the UI state has stabilized.",
+        "properties": {
+          "hierarchy_filename": {
+            "default": null,
+            "description": "Optional path to save the hierarchy if inspection is desired.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "include_screenshot": {
+            "default": true,
+            "description": "Whether to include a screenshot.",
+            "type": "boolean"
+          },
+          "poll_interval_ms": {
+            "default": null,
+            "description": "Interval in milliseconds to poll for stability.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "screenshot_filename": {
+            "default": null,
+            "description": "Path to save the screenshot.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "serial": {
+            "default": null,
+            "description": "ADB serial of the target device.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "stable_polls": {
+            "default": null,
+            "description": "Number of consecutive stable polls required.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "timeout_secs": {
+            "default": null,
+            "description": "Timeout in seconds to wait for stabilization.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "title": "WaitForStableUiArgs",
+        "type": "object"
+      },
+      "name": "android.wait_for_stable_ui"
+    },
+    {
+      "description": "Wait until a semantic UI selector is present or absent in the current hierarchy.",
+      "inputSchema": {
+        "$defs": {
+          "UiSelector": {
+            "description": "Defines the criteria for selecting a UI element in the Android accessibility tree.",
+            "properties": {
+              "checked": {
+                "default": null,
+                "description": "Filter by checked state.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "clickable": {
+                "default": null,
+                "description": "Filter by clickability.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "content_desc": {
+                "default": null,
+                "description": "Content description attribute.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "enabled": {
+                "default": null,
+                "description": "Filter by enabled state.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "focusable": {
+                "default": null,
+                "description": "Filter by focusability.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "focused": {
+                "default": null,
+                "description": "Filter by focused state.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "label": {
+                "default": null,
+                "description": "Logical label of the element.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "label_exact": {
+                "default": null,
+                "description": "Whether the label match must be exact.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "long_clickable": {
+                "default": null,
+                "description": "Filter by long-clickability.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "resource_id": {
+                "default": null,
+                "description": "Resource ID of the element.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "scrollable": {
+                "default": null,
+                "description": "Filter by scrollability.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "selected": {
+                "default": null,
+                "description": "Filter by selection state.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "text": {
+                "default": null,
+                "description": "Text content of the element.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "text_exact": {
+                "default": null,
+                "description": "Whether the text match must be exact.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              }
+            },
+            "type": "object"
+          },
+          "UiSelectorInput": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/UiSelector",
+                "description": "A structured selector definition."
+              },
+              {
+                "description": "Text shorthand for common selector patterns.",
+                "type": "string"
+              }
+            ],
+            "description": "Allows either a fully defined selector or a text-based shorthand."
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "Arguments for waiting for a UI element to appear or disappear.",
+        "properties": {
+          "absent": {
+            "default": false,
+            "description": "Wait for the selector to be absent instead of present.",
+            "type": "boolean"
+          },
+          "hierarchy_filename": {
+            "default": null,
+            "description": "Optional path to save the hierarchy.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "match_index": {
+            "default": null,
+            "description": "The index to match if multiple elements are found.",
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "selector": {
+            "$ref": "#/$defs/UiSelectorInput",
+            "description": "The selector defining the UI element to wait for."
+          },
+          "serial": {
+            "default": null,
+            "description": "ADB serial of the target device.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "timeout_secs": {
+            "default": null,
+            "description": "Timeout in seconds for the operation.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "selector"
+        ],
+        "title": "WaitUiElementArgs",
+        "type": "object"
+      },
+      "name": "android.wait_for_ui_element"
+    },
+    {
+      "annotations": {
+        "readOnlyHint": true
+      },
+      "description": "Read the current active-build metadata for the hosted interactive session.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "EmptyArgs",
+        "type": "object"
+      },
+      "name": "interactive_session.get_current_build"
+    },
+    {
+      "annotations": {
+        "readOnlyHint": true
+      },
+      "description": "Report hosted interactive-session configuration, live session root, and active build metadata.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "EmptyArgs",
+        "type": "object"
+      },
+      "name": "interactive_session.get_status"
+    },
+    {
+      "description": "Download a reusable interactive build artifact from a GitHub Actions run, install it into the live session, and relaunch the app.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "artifact_name": {
+            "type": "string"
+          },
+          "launch_after_install": {
+            "default": true,
+            "type": "boolean"
+          },
+          "repository": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "serial": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "timeout_secs": {
+            "default": null,
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "workflow_run_id": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "workflow_run_id",
+          "artifact_name"
+        ],
+        "title": "InteractiveSessionInstallBuildArgs",
+        "type": "object"
+      },
+      "name": "interactive_session.install_build_from_run"
+    },
+    {
+      "description": "Relaunch the current active build inside the live hosted interactive session.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "serial": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "timeout_secs": {
+            "default": null,
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "title": "InteractiveSessionRelaunchArgs",
+        "type": "object"
+      },
+      "name": "interactive_session.relaunch_current_build"
+    },
+    {
+      "description": "Launch Solar Lab, open search, focus Earth, and capture step-by-step artifacts.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "activity": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "package_name": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "serial": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "title": "SolarLabScenarioArgs",
+        "type": "object"
+      },
+      "name": "solarlab.scenario.stage_first_focus_earth"
+    },
+    {
+      "description": "Launch Solar Lab, open immersive view, return to sandbox, and capture artifacts.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "activity": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "package_name": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "serial": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "title": "SolarLabScenarioArgs",
+        "type": "object"
+      },
+      "name": "solarlab.scenario.stage_first_immersive_roundtrip"
+    },
+    {
+      "description": "Send a narrow semantic action into the Solar Lab app and optionally capture post-action screenshot and UI artifacts.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "action": {
+            "type": "string"
+          },
+          "activity": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "body_query": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "capture_state": {
+            "default": true,
+            "type": "boolean"
+          },
+          "package_name": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "serial": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "title": "SolarLabSemanticActionArgs",
+        "type": "object"
+      },
+      "name": "solarlab.semantic_action"
+    }
+  ],
+  "version": 1
+}

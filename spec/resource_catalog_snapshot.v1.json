@@ -1,0 +1,294 @@
+{
+  "payload": {
+    "reads": {
+      "about": "# Android Computer Use MCP\n\nPurpose:\n- Provide a structured Android execution substrate for emulator lifecycle, app control, observation, semantic UI interaction, raw input fallback, and Solar Lab scenarios.\n\nCurrent posture:\n- Hosted interactive-session tools can reuse a live runner-backed emulator without rebuilding or rebooting it for each new APK.\n- Semantic Android tools are the preferred interaction lane.\n- Raw input tools remain available as fallback when semantic selection is insufficient.\n- Solar Lab scenarios are first-class tools rather than private hand-assembled scripts.\n\nContract:\n- Public tool exposure is governed by explicit tool inventory registration.\n- Discovery resources are read-only and intended for cold-start orientation.\n- Tool schema and resource catalog snapshots guard the public contract.\n",
+      "help": "# Android Computer Use MCP help\n\nRecommended interaction order:\n1. interactive_session.get_status when working against a hosted runner-backed session.\n2. android.health or android.list_devices to understand the current harness state.\n3. android.wait_for_boot if a device may still be starting.\n4. interactive_session.install_build_from_run to swap a fresh remote-built APK into a live hosted session.\n5. android.launch_app or a Solar Lab scenario to reach the target surface.\n6. android.wait_for_stable_ui before acting through semantic UI tools.\n7. android.tap_element or android.type_into_element for semantic interaction.\n8. android.input.* only when semantic tools are insufficient.\n\nGuidance:\n- Prefer semantic UI tools over raw input whenever a selector can describe the target.\n- Prefer scenario tools for durable Solar Lab flows instead of rebuilding them ad hoc.\n- Use observation tools when you need artifacts or structured state, not just one action.\n\nHosted usage notes:\n- This server works well as a runner-backed Android substrate over Streamable HTTP.\n- interactive_session.* tools exist to avoid restarting the hosted runner for each new build.\n- Discovery resources exist so a fresh agent can orient without local repo context.\n",
+      "scenario_catalog": {
+        "domain": "solarlab",
+        "notes": [
+          "Scenario tools are the preferred entry points for durable Solar Lab validation flows.",
+          "Use solarlab.semantic_action for bounded domain actions when a full scenario is too broad."
+        ],
+        "scenarios": [
+          {
+            "description": "Launch Solar Lab, open search, focus Earth, and capture step-by-step artifacts.",
+            "group": "solarlab-scenarios",
+            "name": "solarlab.scenario.stage_first_focus_earth",
+            "read_only": false,
+            "use_when": "Use this to run a durable Stage First Solar Lab scenario rather than reassembling the flow by hand."
+          },
+          {
+            "description": "Launch Solar Lab, open immersive view, return to sandbox, and capture artifacts.",
+            "group": "solarlab-scenarios",
+            "name": "solarlab.scenario.stage_first_immersive_roundtrip",
+            "read_only": false,
+            "use_when": "Use this to validate the immersive roundtrip flow with consistent artifact capture."
+          },
+          {
+            "description": "Send a narrow semantic action into the Solar Lab app and optionally capture post-action screenshot and UI artifacts.",
+            "group": "solarlab-scenarios",
+            "name": "solarlab.semantic_action",
+            "read_only": false,
+            "use_when": "Use this for narrow Solar Lab domain actions when a full scenario would be too broad."
+          }
+        ]
+      },
+      "tool_catalog": {
+        "fallback_lane": "raw-input",
+        "groups": {
+          "app-control": 2,
+          "emulator-lifecycle": 4,
+          "interactive-session": 4,
+          "observation": 5,
+          "raw-input": 4,
+          "semantic-ui": 5,
+          "solarlab-scenarios": 3,
+          "status": 2
+        },
+        "preferred_lane": "semantic-ui-first",
+        "server": "android-computer-use-mcp",
+        "tools": [
+          {
+            "description": "Report hosted interactive-session configuration, live session root, and active build metadata.",
+            "group": "interactive-session",
+            "name": "interactive_session.get_status",
+            "read_only": true,
+            "use_when": "Use this first when you need to understand the current hosted runner-backed session before switching builds."
+          },
+          {
+            "description": "Read the current active-build metadata for the hosted interactive session.",
+            "group": "interactive-session",
+            "name": "interactive_session.get_current_build",
+            "read_only": true,
+            "use_when": "Use this when you want the exact build currently installed without changing live session state."
+          },
+          {
+            "description": "Download a reusable interactive build artifact from a GitHub Actions run, install it into the live session, and relaunch the app.",
+            "group": "interactive-session",
+            "name": "interactive_session.install_build_from_run",
+            "read_only": false,
+            "use_when": "Use this to swap a newly built APK into an already-live hosted session instead of restarting the runner."
+          },
+          {
+            "description": "Relaunch the current active build inside the live hosted interactive session.",
+            "group": "interactive-session",
+            "name": "interactive_session.relaunch_current_build",
+            "read_only": false,
+            "use_when": "Use this for a cheap retry loop when the active build is already installed and only needs relaunch."
+          },
+          {
+            "description": "Report SDK paths, known AVDs, and attached Android devices.",
+            "group": "status",
+            "name": "android.health",
+            "read_only": true,
+            "use_when": "Use this first to understand the local Android harness posture before taking action."
+          },
+          {
+            "description": "List known local Android virtual devices.",
+            "group": "emulator-lifecycle",
+            "name": "android.list_avds",
+            "read_only": true,
+            "use_when": "Use this when you need to choose or verify an AVD name before launch."
+          },
+          {
+            "description": "List adb-visible Android devices.",
+            "group": "status",
+            "name": "android.list_devices",
+            "read_only": true,
+            "use_when": "Use this when you need the current device serials or want to confirm device visibility."
+          },
+          {
+            "description": "Launch a named AVD in the background.",
+            "group": "emulator-lifecycle",
+            "name": "android.launch_avd",
+            "read_only": false,
+            "use_when": "Use this to start an emulator when no suitable device is already running."
+          },
+          {
+            "description": "Launch a named AVD, wait for its emulator serial to appear, and verify boot readiness.",
+            "group": "emulator-lifecycle",
+            "name": "android.launch_avd_and_wait",
+            "read_only": false,
+            "use_when": "Use this when you want one bounded boot flow instead of separate launch and boot checks."
+          },
+          {
+            "description": "Wait until sys.boot_completed=1 and package manager is responsive.",
+            "group": "emulator-lifecycle",
+            "name": "android.wait_for_boot",
+            "read_only": true,
+            "use_when": "Use this after launch when the device exists but may not be ready for app work yet."
+          },
+          {
+            "description": "Install an APK onto the target device.",
+            "group": "app-control",
+            "name": "android.install_apk",
+            "read_only": false,
+            "use_when": "Use this when the app under test is not already installed or needs updating."
+          },
+          {
+            "description": "Launch an installed Android app by package name and optional activity.",
+            "group": "app-control",
+            "name": "android.launch_app",
+            "read_only": false,
+            "use_when": "Use this to bring an app to the foreground before semantic UI interaction."
+          },
+          {
+            "description": "Capture a PNG screenshot from the device and save it locally.",
+            "group": "observation",
+            "name": "android.capture_screenshot",
+            "read_only": false,
+            "use_when": "Use this when a visual artifact is more important than the normalized UI tree."
+          },
+          {
+            "description": "Dump the current UI hierarchy XML and save it locally.",
+            "group": "observation",
+            "name": "android.dump_ui_hierarchy",
+            "read_only": false,
+            "use_when": "Use this when you need raw hierarchy XML for debugging or later parsing."
+          },
+          {
+            "description": "Capture the current UI hierarchy, optionally pair it with a screenshot, and return a normalized UI tree.",
+            "group": "observation",
+            "name": "android.inspect_ui",
+            "read_only": false,
+            "use_when": "Use this for a rich one-shot observation of the current Android state."
+          },
+          {
+            "description": "Wait until the UI hierarchy and top window state stop changing, then return a paired observation bundle.",
+            "group": "observation",
+            "name": "android.wait_for_stable_ui",
+            "read_only": false,
+            "use_when": "Use this before acting when the UI may still be animating or transitioning."
+          },
+          {
+            "description": "Find the first normalized UI element matching a semantic selector in the current hierarchy.",
+            "group": "semantic-ui",
+            "name": "android.find_ui_element",
+            "read_only": false,
+            "use_when": "Use this to inspect whether a target control is present and how it resolved before acting."
+          },
+          {
+            "description": "Wait until a semantic UI selector is present or absent in the current hierarchy.",
+            "group": "semantic-ui",
+            "name": "android.wait_for_ui_element",
+            "read_only": false,
+            "use_when": "Use this when a UI transition is expected and success depends on a selector appearing or disappearing."
+          },
+          {
+            "description": "Find a semantic UI element and tap its center point.",
+            "group": "semantic-ui",
+            "name": "android.tap_element",
+            "read_only": false,
+            "use_when": "Use this as the default interaction path when you can describe the target semantically."
+          },
+          {
+            "description": "Find a semantic UI element, tap it, and send text input.",
+            "group": "semantic-ui",
+            "name": "android.type_into_element",
+            "read_only": false,
+            "use_when": "Use this for text entry into a known field when semantic targeting is available."
+          },
+          {
+            "description": "Swipe the viewport until a semantic UI selector becomes visible or the swipe budget is exhausted.",
+            "group": "semantic-ui",
+            "name": "android.scroll_until_visible",
+            "read_only": false,
+            "use_when": "Use this when the target probably exists off-screen and semantic scrolling is preferable to raw swipes."
+          },
+          {
+            "description": "Capture recent logcat output and save it locally.",
+            "group": "observation",
+            "name": "android.collect_logcat",
+            "read_only": false,
+            "use_when": "Use this after a failure or suspicious behavior when app/runtime logs matter."
+          },
+          {
+            "description": "Send a tap input event to the device.",
+            "group": "raw-input",
+            "name": "android.input.tap",
+            "read_only": false,
+            "use_when": "Use this only when semantic selection is insufficient and you already know the screen coordinates."
+          },
+          {
+            "description": "Send text input to the device.",
+            "group": "raw-input",
+            "name": "android.input.text",
+            "read_only": false,
+            "use_when": "Use this when raw keyboard-style entry is required after focus is already established."
+          },
+          {
+            "description": "Send a swipe gesture to the device.",
+            "group": "raw-input",
+            "name": "android.input.swipe",
+            "read_only": false,
+            "use_when": "Use this only when semantic scrolling is insufficient or you need an exact gesture path."
+          },
+          {
+            "description": "Send a keyevent to the device.",
+            "group": "raw-input",
+            "name": "android.input.keyevent",
+            "read_only": false,
+            "use_when": "Use this for bounded low-level actions like Back or Enter when semantic tools are not the right fit."
+          },
+          {
+            "description": "Launch Solar Lab, open search, focus Earth, and capture step-by-step artifacts.",
+            "group": "solarlab-scenarios",
+            "name": "solarlab.scenario.stage_first_focus_earth",
+            "read_only": false,
+            "use_when": "Use this to run a durable Stage First Solar Lab scenario rather than reassembling the flow by hand."
+          },
+          {
+            "description": "Launch Solar Lab, open immersive view, return to sandbox, and capture artifacts.",
+            "group": "solarlab-scenarios",
+            "name": "solarlab.scenario.stage_first_immersive_roundtrip",
+            "read_only": false,
+            "use_when": "Use this to validate the immersive roundtrip flow with consistent artifact capture."
+          },
+          {
+            "description": "Send a narrow semantic action into the Solar Lab app and optionally capture post-action screenshot and UI artifacts.",
+            "group": "solarlab-scenarios",
+            "name": "solarlab.semantic_action",
+            "read_only": false,
+            "use_when": "Use this for narrow Solar Lab domain actions when a full scenario would be too broad."
+          }
+        ]
+      }
+    },
+    "resources": [
+      {
+        "description": "Purpose, scope, and current harness posture.",
+        "mimeType": "text/markdown",
+        "name": "about",
+        "size": 827,
+        "title": "Android Computer Use MCP",
+        "uri": "android-computer-use-mcp://about"
+      },
+      {
+        "description": "Recommended interaction loops and lane guidance.",
+        "mimeType": "text/markdown",
+        "name": "help",
+        "size": 1245,
+        "title": "Android Computer Use MCP help",
+        "uri": "android-computer-use-mcp://help"
+      },
+      {
+        "description": "Structured inventory of public Android and Solar Lab tools.",
+        "mimeType": "application/json",
+        "name": "tool-catalog",
+        "size": 9461,
+        "title": "Android tool catalog",
+        "uri": "android-computer-use-mcp://tool-catalog"
+      },
+      {
+        "description": "Structured Stage First scenario entry points and notes.",
+        "mimeType": "application/json",
+        "name": "scenario-catalog",
+        "size": 1331,
+        "title": "Solar Lab scenario catalog",
+        "uri": "android-computer-use-mcp://scenario-catalog"
+      }
+    ]
+  },
+  "schema": "android_computer_use_mcp_resource_catalog",
+  "version": 1
+}

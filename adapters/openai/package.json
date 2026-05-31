@@ -1,0 +1,18 @@
+{
+  "name": "@sednalabs/android-computer-use-mcp-openai",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "description": "OpenAI Responses and code-execution adapter helpers for android-computer-use-mcp.",
+  "main": "./index.js",
+  "bin": {
+    "openai-android-loop": "./bin/openai-android-loop.mjs"
+  },
+  "exports": {
+    ".": "./index.js"
+  },
+  "scripts": {
+    "test": "node --test ../../docs/examples/*.test.mjs ./index.test.mjs ./mcp_streamable_http_client.test.mjs ./openai_file_broker.test.mjs ./responses_loop_driver.test.mjs"
+  }
+}

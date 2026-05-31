@@ -1,0 +1,18 @@
+{
+  "name": "@sednalabs/android-computer-use-mcp-codex",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "description": "Codex-oriented bridge helpers for android-computer-use-mcp.",
+  "main": "./index.js",
+  "bin": {
+    "codex-android-observe": "./bin/codex-android-observe.mjs"
+  },
+  "exports": {
+    ".": "./index.js"
+  },
+  "scripts": {
+    "test": "node --test ./index.test.mjs ./codex_thread_items.test.mjs"
+  }
+}
