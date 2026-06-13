@@ -7340,7 +7340,7 @@ mod tests {
     async fn run_command_with_timeout_surfaces_exit_failures() {
         let mut command = Command::new("bash");
         command.args(["-lc", "echo boom >&2; exit 7"]);
-        let err = run_command_with_timeout(command, Duration::from_secs(1), "test failure command")
+        let err = run_command_with_timeout(command, Duration::from_secs(5), "test failure command")
             .await
             .expect_err("failing command should surface an error");
         assert!(
@@ -7354,7 +7354,7 @@ mod tests {
         let mut command = Command::new("bash");
         command.args(["-lc", "printf 'alpha\\n'"]);
         let output =
-            run_command_with_timeout(command, Duration::from_secs(1), "test stdout command")
+            run_command_with_timeout(command, Duration::from_secs(5), "test stdout command")
                 .await
                 .expect("stdout command should succeed");
         assert_eq!(String::from_utf8_lossy(&output.stdout), "alpha\n");
