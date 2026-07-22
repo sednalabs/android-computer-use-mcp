@@ -1088,7 +1088,6 @@ name = "mcp-toolkit-testing"
 version = "0.1.0"
 source = "git+https://github.com/sednalabs/mcp-toolkit-rs?rev=1cf322071d84e27fe3002ee53198353af0ea6513#1cf322071d84e27fe3002ee53198353af0ea6513"
 dependencies = [
- "http",
  "mcp-toolkit-core",
  "mcp-toolkit-http",
  "serde",
