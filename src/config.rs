@@ -222,8 +222,14 @@ fn load_interactive_session_config() -> Result<Option<InteractiveSessionConfig>>
         "ANDROID_COMPUTER_USE_MCP_INTERACTIVE_SESSION_GITHUB_REPOSITORY",
         "",
     )?;
-    let app_package = env_setting("ANDROID_COMPUTER_USE_MCP_INTERACTIVE_SESSION_APP_PACKAGE", "")?;
-    let app_activity = env_setting("ANDROID_COMPUTER_USE_MCP_INTERACTIVE_SESSION_APP_ACTIVITY", "")?;
+    let app_package = env_setting(
+        "ANDROID_COMPUTER_USE_MCP_INTERACTIVE_SESSION_APP_PACKAGE",
+        "",
+    )?;
+    let app_activity = env_setting(
+        "ANDROID_COMPUTER_USE_MCP_INTERACTIVE_SESSION_APP_ACTIVITY",
+        "",
+    )?;
     if github_repository.is_empty() || app_package.is_empty() || app_activity.is_empty() {
         return Err(anyhow!(
             "interactive session config requires repository, app package, and app activity when enabled"
@@ -274,8 +280,9 @@ fn load_streamable_http_config() -> Result<StreamableHttpConfig> {
         allowed_hosts,
         max_sessions: usize::try_from(max_sessions.max(1))
             .map_err(|_| anyhow!("ANDROID_COMPUTER_USE_MCP_HTTP_MAX_SESSIONS must be positive"))?,
-        channel_capacity: usize::try_from(channel_capacity.max(1))
-            .map_err(|_| anyhow!("ANDROID_COMPUTER_USE_MCP_HTTP_CHANNEL_CAPACITY must be positive"))?,
+        channel_capacity: usize::try_from(channel_capacity.max(1)).map_err(|_| {
+            anyhow!("ANDROID_COMPUTER_USE_MCP_HTTP_CHANNEL_CAPACITY must be positive")
+        })?,
         allow_resume,
     })
 }
@@ -380,7 +387,10 @@ mod tests {
         unsafe {
             env::set_var("ANDROID_COMPUTER_USE_MCP_TMP_EMPTY", "   ");
         }
-        assert_eq!(env_optional_path("ANDROID_COMPUTER_USE_MCP_TMP_EMPTY"), None);
+        assert_eq!(
+            env_optional_path("ANDROID_COMPUTER_USE_MCP_TMP_EMPTY"),
+            None
+        );
         unsafe {
             env::remove_var("ANDROID_COMPUTER_USE_MCP_TMP_EMPTY");
         }

@@ -252,14 +252,17 @@ impl AndroidEmulatorMcp {
         &self,
         args: &InteractiveSessionInstallBuildArgs,
     ) -> Result<serde_json::Value, McpError> {
-        let native_v1_requested = args.contract_version.as_deref()
-            == Some(ANDROID_PROVIDER_EXECUTION_CONTRACT_VERSION);
+        let native_v1_requested =
+            args.contract_version.as_deref() == Some(ANDROID_PROVIDER_EXECUTION_CONTRACT_VERSION);
         if args.artifact_name.trim().is_empty() {
             if native_v1_requested {
                 return Ok(native_validation_failure_response(
                     None,
                     None,
-                    args.install.as_ref().map(|install| install.launch_after_install).unwrap_or(false),
+                    args.install
+                        .as_ref()
+                        .map(|install| install.launch_after_install)
+                        .unwrap_or(false),
                     "artifact_name must not be empty",
                 ));
             }
@@ -274,7 +277,10 @@ impl AndroidEmulatorMcp {
                 return Ok(native_validation_failure_response(
                     None,
                     None,
-                    args.install.as_ref().map(|install| install.launch_after_install).unwrap_or(false),
+                    args.install
+                        .as_ref()
+                        .map(|install| install.launch_after_install)
+                        .unwrap_or(false),
                     &err.to_string(),
                 ));
             }
@@ -286,7 +292,10 @@ impl AndroidEmulatorMcp {
                 return Ok(native_validation_failure_response(
                     None,
                     None,
-                    args.install.as_ref().map(|install| install.launch_after_install).unwrap_or(false),
+                    args.install
+                        .as_ref()
+                        .map(|install| install.launch_after_install)
+                        .unwrap_or(false),
                     &err.to_string(),
                 ));
             }
@@ -295,7 +304,12 @@ impl AndroidEmulatorMcp {
         let launch_after_install = match normalized_launch_after_install(args, compatibility_mode) {
             Ok(launch_after_install) => launch_after_install,
             Err(err) if compatibility_mode == "native-v1" => {
-                return Ok(native_validation_failure_response(None, None, false, &err.to_string()));
+                return Ok(native_validation_failure_response(
+                    None,
+                    None,
+                    false,
+                    &err.to_string(),
+                ));
             }
             Err(err) => return Err(err),
         };
@@ -571,7 +585,8 @@ impl AndroidEmulatorMcp {
     ) -> Result<serde_json::Value, McpError> {
         let config = self.interactive_session_config()?;
         let serial = self.resolve_serial_for_tools(serial_hint).await?;
-        let build_dir = resolve_bundle_dir(config, manifest, artifact_sha256, manifest_sha256).await?;
+        let build_dir =
+            resolve_bundle_dir(config, manifest, artifact_sha256, manifest_sha256).await?;
         let apk_path = manifest_apk_path(&build_dir, manifest)?;
         let mut previous_app_state = if mode.launches_app() {
             Some(
@@ -838,16 +853,10 @@ fn active_build_relaunch_identity<'a>(
         )
     })?;
     let artifact_sha256 = active_build.artifact_sha256.as_deref().ok_or_else(|| {
-        McpError::invalid_params(
-            "active build state is missing its artifact digest",
-            None,
-        )
+        McpError::invalid_params("active build state is missing its artifact digest", None)
     })?;
     let manifest_sha256 = active_build.manifest_sha256.as_deref().ok_or_else(|| {
-        McpError::invalid_params(
-            "active build state is missing its manifest digest",
-            None,
-        )
+        McpError::invalid_params("active build state is missing its manifest digest", None)
     })?;
     if let Some(serial) = requested_serial
         && serial != resolved_target.device_serial
@@ -1412,7 +1421,10 @@ fn github_client(token: &str) -> Result<reqwest::Client, McpError> {
         HeaderValue::from_str(&format!("Bearer {token}"))
             .map_err(|err| McpError::internal_error(err.to_string(), None))?,
     );
-    headers.insert(USER_AGENT, HeaderValue::from_static("android-computer-use-mcp"));
+    headers.insert(
+        USER_AGENT,
+        HeaderValue::from_static("android-computer-use-mcp"),
+    );
     headers.insert(
         "X-GitHub-Api-Version",
         HeaderValue::from_static(GITHUB_API_VERSION),
@@ -1530,16 +1542,17 @@ async fn resolve_bundle_dir(
             .await
             .map_err(|err| McpError::internal_error(err.to_string(), None))?;
         let candidate: BuildManifest = serde_json::from_slice(&manifest_bytes)
-        .map_err(|err| McpError::internal_error(err.to_string(), None))?;
+            .map_err(|err| McpError::internal_error(err.to_string(), None))?;
         if candidate != *manifest || sha256_prefixed(&manifest_bytes) != expected_manifest_sha256 {
             continue;
         }
         let Some(build_dir) = manifest_path.parent() else {
             continue;
         };
-        let cached_artifact_sha256 = fs::read_to_string(build_dir.join(CACHED_ARTIFACT_SHA256_FILE))
-            .await
-            .map_err(|err| McpError::internal_error(err.to_string(), None))?;
+        let cached_artifact_sha256 =
+            fs::read_to_string(build_dir.join(CACHED_ARTIFACT_SHA256_FILE))
+                .await
+                .map_err(|err| McpError::internal_error(err.to_string(), None))?;
         if cached_artifact_sha256.trim() != expected_artifact_sha256 {
             continue;
         }
@@ -1622,13 +1635,13 @@ mod tests {
         BuildManifest, DownloadedBuildBundle, ExpectedBuildProvenance,
         InteractiveSessionInstallBuildArgs, InteractiveSessionInstallOptions,
         ResolvedAndroidExecutionTarget, active_build_matches_downloaded,
-        active_build_relaunch_identity,
-        adb_install_failed_due_to_signature_mismatch, adb_install_succeeded, compatibility_mode,
-        finish_install_build_from_run_response, install_download_failure_response,
-        install_failed_receipt, install_launch_lifecycle_receipt, install_receipt_response,
-        install_terminal_receipt, install_terminal_receipt_with_effects,
-        native_validation_failure_response, normalized_launch_after_install,
-        observed_build_matches_requested, provenance_mismatch_receipt, reused_active_build_result,
+        active_build_relaunch_identity, adb_install_failed_due_to_signature_mismatch,
+        adb_install_succeeded, compatibility_mode, finish_install_build_from_run_response,
+        install_download_failure_response, install_failed_receipt,
+        install_launch_lifecycle_receipt, install_receipt_response, install_terminal_receipt,
+        install_terminal_receipt_with_effects, native_validation_failure_response,
+        normalized_launch_after_install, observed_build_matches_requested,
+        provenance_mismatch_receipt, reused_active_build_result,
     };
 
     fn expected_build() -> ExpectedBuildProvenance {
@@ -1769,7 +1782,10 @@ mod tests {
         )
         .expect_err("native installs must not accept the legacy launch field");
 
-        assert!(err.to_string().contains("must not use launch_after_install"));
+        assert!(
+            err.to_string()
+                .contains("must not use launch_after_install")
+        );
     }
 
     #[test]
@@ -1890,10 +1906,22 @@ mod tests {
             true,
         );
 
-        assert_eq!(response["install_receipt"]["status"], json!("reused_existing_build"));
-        assert_eq!(response["install_receipt"]["install_performed"], json!(false));
-        assert_eq!(response["install_receipt"]["reused_existing_build"], json!(true));
-        assert_eq!(response["install_receipt"]["launch"]["performed"], json!(true));
+        assert_eq!(
+            response["install_receipt"]["status"],
+            json!("reused_existing_build")
+        );
+        assert_eq!(
+            response["install_receipt"]["install_performed"],
+            json!(false)
+        );
+        assert_eq!(
+            response["install_receipt"]["reused_existing_build"],
+            json!(true)
+        );
+        assert_eq!(
+            response["install_receipt"]["launch"]["performed"],
+            json!(true)
+        );
     }
 
     #[test]
@@ -1905,10 +1933,16 @@ mod tests {
             "a native v1 install requires install.launch_after_install",
         );
 
-        assert_eq!(response["contract_version"], json!(ANDROID_PROVIDER_EXECUTION_CONTRACT_VERSION));
+        assert_eq!(
+            response["contract_version"],
+            json!(ANDROID_PROVIDER_EXECUTION_CONTRACT_VERSION)
+        );
         assert_eq!(response["compatibility_mode"], json!("native-v1"));
         assert_eq!(response["operation_kind"], json!("install_build_from_run"));
-        assert_eq!(response["install_receipt"]["status"], json!("invalid_request"));
+        assert_eq!(
+            response["install_receipt"]["status"],
+            json!("invalid_request")
+        );
         assert_eq!(response["error"]["kind"], json!("invalid_request"));
         assert_eq!(response["error"]["retryability"], json!("do_not_replay"));
     }
@@ -2061,10 +2095,13 @@ mod tests {
         );
 
         assert_eq!(response["error"]["kind"], json!("lifecycle_failed"));
-        assert_eq!(response["error"]["persistence_errors"], json!([{
-            "phase": "install_history",
-            "message": "history volume is read-only",
-        }]));
+        assert_eq!(
+            response["error"]["persistence_errors"],
+            json!([{
+                "phase": "install_history",
+                "message": "history volume is read-only",
+            }])
+        );
     }
 
     #[test]
