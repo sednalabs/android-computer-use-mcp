@@ -509,11 +509,9 @@ pub(crate) fn find_interactive_ui_node(
         if !interactive_selector_matches(node, &normalized, selector) {
             continue;
         }
-        let interactive_target = node
-            .ancestors()
-            .find_map(|candidate| {
-                interactive_bounds_from_node(candidate).map(|bounds| (candidate, bounds))
-            });
+        let interactive_target = node.ancestors().find_map(|candidate| {
+            interactive_bounds_from_node(candidate).map(|bounds| (candidate, bounds))
+        });
         let (resolved, interactive_bounds) = match interactive_target {
             Some((interactive_node, bounds)) => {
                 (normalized_ui_node_from_xml(interactive_node), Some(bounds))

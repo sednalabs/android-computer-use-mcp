@@ -18,6 +18,9 @@ test("provider manifest describes the generic Android computer-use capability", 
     defaultSerial: "emulator-5554",
     defaultPackageName: "com.example.app",
     defaultActivity: ".MainActivity",
+    environmentId: "environment-1",
+    providerInstanceId: "provider-1",
+    sessionId: "session-1",
     sessionRoot: "dist/interactive-session",
     artifactRoot: "dist/interactive-session/codex-bridge-runs",
     buildManifestPath: "dist/interactive-build-manifest.json",
@@ -45,6 +48,11 @@ test("provider manifest describes the generic Android computer-use capability", 
   assert.equal(manifest.environment.scope, "environment");
   assert.equal(manifest.environment.mcpUrl, "https://android.example/mcp");
   assert.equal(manifest.environment.defaultPackageName, "com.example.app");
+  assert.deepEqual(manifest.environment.executionIdentity, {
+    environmentId: "environment-1",
+    providerInstanceId: "provider-1",
+    sessionId: "session-1",
+  });
   assert.deepEqual(manifest.environment.device, {
     serial: "emulator-5554",
     orientation: "portrait",
@@ -89,7 +97,7 @@ test("provider manifest validator returns a stable proof summary", () => {
 
   assert.deepEqual(validateCodexAndroidProviderManifest(manifest), {
     ok: true,
-    schemaVersion: 4,
+    schemaVersion: 5,
     provider: {
       family: "android",
       adapter: "android",
@@ -106,6 +114,11 @@ test("provider manifest validator returns a stable proof summary", () => {
       defaultActivity: ".MainActivity",
       artifactRoot: "dist/interactive-session/codex-bridge-runs",
       buildManifestPath: "dist/interactive-build-manifest.json",
+      executionIdentity: {
+        environmentId: "local",
+        providerInstanceId: "android-computer-use-mcp",
+        sessionId: "default",
+      },
       capabilityGroups: ["appControl", "posture", "rawInput"],
     },
     policy: {
@@ -230,6 +243,31 @@ test("provider manifest validator rejects non-string optional summary fields", (
   assert.throws(
     () => validateCodexAndroidProviderManifest(manifest),
     /environment\.defaultPackageName must be a string or null/,
+  );
+});
+
+test("provider manifest validator rejects an incomplete execution identity", () => {
+  const manifest = createCodexAndroidProviderManifest({
+    mcpUrl: "https://android.example/mcp",
+  });
+  manifest.environment.executionIdentity.sessionId = "";
+
+  assert.throws(
+    () => validateCodexAndroidProviderManifest(manifest),
+    /environment\.executionIdentity\.sessionId must be a non-empty string/,
+  );
+});
+
+test("provider manifest validator requires v4 manifests to be regenerated", () => {
+  const manifest = createCodexAndroidProviderManifest({
+    mcpUrl: "https://android.example/mcp",
+  });
+  manifest.schemaVersion = 4;
+  delete manifest.environment.executionIdentity;
+
+  assert.throws(
+    () => validateCodexAndroidProviderManifest(manifest),
+    /schemaVersion 4 is incompatible with schemaVersion 5 execution identity; regenerate the manifest before validation or use/,
   );
 });
 

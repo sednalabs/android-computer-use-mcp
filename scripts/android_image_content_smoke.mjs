@@ -143,6 +143,29 @@ async function callToolRaw(name, args = {}) {
   });
 }
 
+function sleep(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function callToolWithTransientHierarchyRetry(name, args = {}) {
+  const attempts = 3;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await callToolRaw(name, args);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!message.includes("UI hierarchy dump timed out") || attempt === attempts) {
+        throw error;
+      }
+      console.warn(
+        `${name} hierarchy capture timed out; retrying ${attempt + 1}/${attempts}`,
+      );
+      await sleep(1000);
+    }
+  }
+  throw new Error(`${name} hierarchy retry loop did not return a result`);
+}
+
 async function main() {
   await rpc("initialize", {
     protocolVersion: "2025-06-18",
@@ -199,7 +222,7 @@ async function main() {
   results.push(
     assertPngImageContent(
       "android.wait_for_stable_ui",
-      await callToolRaw("android.wait_for_stable_ui", {
+      await callToolWithTransientHierarchyRetry("android.wait_for_stable_ui", {
         serial,
         timeout_secs: 20,
         poll_interval_ms: 500,

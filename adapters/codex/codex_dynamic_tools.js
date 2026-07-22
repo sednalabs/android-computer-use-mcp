@@ -543,7 +543,16 @@ function normalizeMultiTouchDuration(value) {
 
 function normalizeInstallBuildFromRunArgs(args) {
   const source = requireObject(args, "arguments");
-  return {
+  const contractVersion = optionalString(
+    source.contract_version ?? source.contractVersion,
+    "contract_version",
+  );
+  const target = source.target == null ? null : requireObject(source.target, "target");
+  const install = source.install == null ? null : requireObject(source.install, "install");
+  if (install && !contractVersion) {
+    throw new Error("install requires contract_version");
+  }
+  const normalized = {
     workflow_run_id: requirePositiveInteger(
       source.workflow_run_id ?? source.workflowRunId,
       "workflow_run_id",
@@ -553,16 +562,32 @@ function normalizeInstallBuildFromRunArgs(args) {
       "artifact_name",
     ),
     repository: optionalString(source.repository, "repository"),
-    launch_after_install: optionalBoolean(
-      source.launch_after_install ?? source.launchAfterInstall,
-      true,
-      "launch_after_install",
-    ),
     serial: optionalString(source.serial, "serial"),
     timeout_secs: optionalPositiveInteger(
       source.timeout_secs ?? source.timeoutSecs,
       "timeout_secs",
     ),
+  };
+  if (!contractVersion) {
+    return {
+      ...normalized,
+      launch_after_install: optionalBoolean(
+        source.launch_after_install ?? source.launchAfterInstall,
+        true,
+        "launch_after_install",
+      ),
+    };
+  }
+  if (!install || typeof install.launch_after_install !== "boolean") {
+    throw new Error("native install requires install.launch_after_install as a boolean");
+  }
+  return {
+    ...normalized,
+    contract_version: contractVersion,
+    target,
+    install: {
+      launch_after_install: install.launch_after_install,
+    },
   };
 }
 
@@ -1255,11 +1280,16 @@ export function createCodexAndroidDynamicToolHost({
 
   function outcomeFromInstall({ result, observeWarning }) {
     if (result?.ok === false || result?.postcondition?.satisfied === false) {
+      const providerRetryability = result?.error?.retryability;
       return createOutcome({
         tool: TOOL_ANDROID_INSTALL_BUILD_FROM_RUN,
         status: "postcondition_failed",
-        retryability: "observe_then_retry",
-        reason: result?.postcondition?.note ?? "Android build install completed but the requested outcome was not satisfied",
+        retryability: providerRetryability === "do_not_replay"
+          ? "do_not_replay"
+          : "observe_then_retry",
+        reason: result?.error?.message
+          ?? result?.postcondition?.note
+          ?? "Android build install completed but the requested outcome was not satisfied",
         postconditionSatisfied: result?.postcondition?.satisfied ?? false,
         observeDegraded: Boolean(observeWarning),
       });
@@ -2027,6 +2057,19 @@ export function createCodexAndroidDynamicToolHost({
               artifact_name: { type: "string" },
               repository: { type: "string" },
               launch_after_install: { type: "boolean" },
+              contract_version: {
+                type: "string",
+                const: "android-provider-execution/v1",
+              },
+              target: { type: "object" },
+              install: {
+                type: "object",
+                properties: {
+                  launch_after_install: { type: "boolean" },
+                },
+                required: ["launch_after_install"],
+                additionalProperties: false,
+              },
               serial: { type: "string" },
               timeout_secs: { type: "integer" },
               post_observe_scope: {
@@ -2035,6 +2078,24 @@ export function createCodexAndroidDynamicToolHost({
               },
             },
             required: ["workflow_run_id", "artifact_name"],
+            allOf: [{
+              if: { required: ["contract_version"] },
+              then: {
+                properties: {
+                  launch_after_install: { type: "null" },
+                  target: {
+                    type: "object",
+                    required: ["expected_build"],
+                  },
+                },
+                required: ["target", "install"],
+              },
+              else: {
+                properties: {
+                  install: { type: "null" },
+                },
+              },
+            }],
             additionalProperties: false,
           },
           deferLoading: false,

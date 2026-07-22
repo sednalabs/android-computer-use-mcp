@@ -203,7 +203,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::AndroidEmulatorMcp;
-    use crate::config::{Config, StreamableHttpConfig};
+    use crate::config::{Config, ProviderExecutionIdentity, StreamableHttpConfig};
     use crate::tool_surface::build_tool_inventory;
     use mcp_toolkit_core::tool_inventory::{ToolInventoryPolicy, ToolOperation};
 
@@ -224,6 +224,11 @@ mod tests {
                 allow_resume: true,
             },
             interactive_session: None,
+            execution_identity: ProviderExecutionIdentity {
+                environment_id: "test-environment".to_string(),
+                provider_instance_id: "test-provider".to_string(),
+                session_id: "test-session".to_string(),
+            },
         }
     }
 

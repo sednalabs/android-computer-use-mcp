@@ -254,6 +254,63 @@ test("getToolLoadingPlan exposes eager bootstrap tools and deferred semantic too
   assert.deepEqual(plan.solarlab.tools, [...ANDROID_TOOL_LOADING_PLAN.solarlab.tools]);
 });
 
+test("installBuildFromRun preserves the native execution contract at the MCP boundary", async () => {
+  const calls = [];
+  const runtime = createAndroidEmulatorRuntime({
+    defaultSerial: "emulator-5554",
+    callMcp: async (toolName, args) => {
+      calls.push({ toolName, args });
+      return { ok: true, serial: "emulator-5554" };
+    },
+  });
+
+  await runtime.installBuildFromRun({
+    workflow_run_id: 42,
+    artifact_name: "android-build",
+    contract_version: "android-provider-execution/v1",
+    target: {
+      environment_id: "environment-1",
+      provider_instance_id: "provider-1",
+      session_id: "session-1",
+      device_serial: "emulator-5554",
+      expected_build: {
+        repository: "example/android-app",
+        commit_sha: "abcdef0123456789",
+        workflow_run_id: 42,
+        artifact_name: "android-build",
+        artifact_sha256: "sha256:artifact",
+      },
+    },
+    install: { launch_after_install: false },
+  });
+
+  assert.deepEqual(calls, [{
+    toolName: "interactive_session.install_build_from_run",
+    args: {
+      workflow_run_id: 42,
+      artifact_name: "android-build",
+      repository: null,
+      serial: "emulator-5554",
+      timeout_secs: null,
+      contract_version: "android-provider-execution/v1",
+      target: {
+        environment_id: "environment-1",
+        provider_instance_id: "provider-1",
+        session_id: "session-1",
+        device_serial: "emulator-5554",
+        expected_build: {
+          repository: "example/android-app",
+          commit_sha: "abcdef0123456789",
+          workflow_run_id: 42,
+          artifact_name: "android-build",
+          artifact_sha256: "sha256:artifact",
+        },
+      },
+      install: { launch_after_install: false },
+    },
+  }]);
+});
+
 test("deferred semantic tool calls invoke ensureToolsAvailable before MCP dispatch", async () => {
   const calls = [];
   const ensures = [];

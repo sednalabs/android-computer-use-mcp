@@ -1,8 +1,9 @@
 # Codex Bridge Helpers
 
 This package is the Codex-facing companion to `android-computer-use-mcp`.
-This is the reusable Android computer-use harness boundary: optional scenario
-apps can prove the contract, but they do not own the generic tool surface.
+Despite the historical MCP name, this is the reusable Android computer-use
+harness boundary: Solar Lab is a proving app, not the owner of the generic
+tool contract.
 
 The native Codex harness path is the command-backed dynamic-tool host:
 
@@ -130,6 +131,8 @@ identifies:
 - native Codex tool names: `android_observe`, `android_step`, and
   `android_install_build_from_run`
 - MCP transport URL and serial, when available
+- exact environment, provider-instance, and session identifiers for rejecting
+  stale hosted targets
 - session, artifact, and active-build manifest paths
 - default package/activity hints for app-focused sessions
 - optional device metadata and capability groups for app control, posture, and
@@ -138,6 +141,12 @@ identifies:
   step execution, and exclusive build-install execution
 - outcome taxonomy for model-facing action status and retryability in manifest
   schema v2 and later
+
+Manifest schema v5 is intentionally incompatible with persisted schema v4
+manifests because v5 adds the exact execution identity required before a
+mutating call. Regenerate a v4 manifest before validation or use; this metadata
+migration is separate from the legacy tool-input translation supported by
+`android_install_build_from_run`.
 
 Solar Lab sessions can publish this manifest as proof that a hosted Android
 runtime is available, but the manifest does not make Solar Lab the generic

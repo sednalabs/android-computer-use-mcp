@@ -43,7 +43,7 @@
           "raw-input": 8,
           "semantic-ui": 5,
           "solarlab-scenarios": 3,
-          "status": 3
+          "status": 4
         },
         "preferred_lane": "semantic-ui-first",
         "server": "android-computer-use-mcp",
@@ -63,7 +63,7 @@
             "use_when": "Use this when you want the exact build currently installed without changing live session state."
           },
           {
-            "description": "Download a reusable interactive build artifact from a GitHub Actions run, install it into the live session, and relaunch the app.",
+            "description": "Download a reusable interactive build artifact from a GitHub Actions run, install it into the live session, and optionally relaunch the app.",
             "group": "interactive-session",
             "name": "interactive_session.install_build_from_run",
             "read_only": false,
@@ -96,6 +96,13 @@
             "name": "android.list_devices",
             "read_only": true,
             "use_when": "Use this when you need the current device serials or want to confirm device visibility."
+          },
+          {
+            "description": "Resolve one exact Android provider, session, and device target.",
+            "group": "status",
+            "name": "android.resolve_target",
+            "read_only": true,
+            "use_when": "Use this before a target-bound Android operation to reject a stale or mismatched provider session."
           },
           {
             "description": "Launch a named AVD in the background.",
@@ -352,7 +359,7 @@
         "description": "Structured inventory of public Android and Solar Lab tools.",
         "mimeType": "application/json",
         "name": "tool-catalog",
-        "size": 12846,
+        "size": 13167,
         "title": "Android tool catalog",
         "uri": "android-computer-use-mcp://tool-catalog"
       },

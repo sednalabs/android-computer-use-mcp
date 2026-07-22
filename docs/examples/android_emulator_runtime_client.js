@@ -389,18 +389,28 @@ export function createAndroidEmulatorRuntime({
       workflow_run_id,
       artifact_name,
       repository = null,
-      launch_after_install = true,
+      launch_after_install = null,
+      contract_version = null,
+      target = null,
+      install = null,
       serial = null,
       timeout_secs = null,
     } = {}) {
-      const result = await callMcp("interactive_session.install_build_from_run", {
+      const args = {
         workflow_run_id,
         artifact_name,
         repository,
-        launch_after_install,
         serial: serial ?? state.currentSerial,
         timeout_secs,
-      });
+      };
+      if (contract_version !== null) {
+        args.contract_version = contract_version;
+        args.target = target;
+        args.install = install;
+      } else {
+        args.launch_after_install = launch_after_install ?? true;
+      }
+      const result = await callMcp("interactive_session.install_build_from_run", args);
       state.currentSerial = result?.serial ?? state.currentSerial;
       return throwIfNotOk(result, "installBuildFromRun did not report success");
     },

@@ -273,12 +273,9 @@ fn swipe_step_count(duration_ms: u64) -> u32 {
 }
 
 fn multi_touch_step_count(duration_ms: u64) -> u32 {
-    let steps = duration_ms.saturating_add(MULTI_TOUCH_STEP_INTERVAL_MS - 1)
-        / MULTI_TOUCH_STEP_INTERVAL_MS;
-    steps.clamp(
-        MULTI_TOUCH_MIN_STEPS as u64,
-        MULTI_TOUCH_MAX_STEPS as u64,
-    ) as u32
+    let steps =
+        duration_ms.saturating_add(MULTI_TOUCH_STEP_INTERVAL_MS - 1) / MULTI_TOUCH_STEP_INTERVAL_MS;
+    steps.clamp(MULTI_TOUCH_MIN_STEPS as u64, MULTI_TOUCH_MAX_STEPS as u64) as u32
 }
 
 fn multi_touch_step_interval(duration_ms: u64, steps: u32) -> u64 {
@@ -315,12 +312,7 @@ fn multi_touch_frames(paths: &[MultiTouchPath], duration_ms: u64) -> Vec<Vec<Tou
             .iter()
             .enumerate()
             .map(|(identifier, path)| {
-                touch_with_identifier(
-                    path.x2,
-                    path.y2,
-                    identifier as i32,
-                    TOUCH_PRESSURE_UP,
-                )
+                touch_with_identifier(path.x2, path.y2, identifier as i32, TOUCH_PRESSURE_UP)
             })
             .collect(),
     );

@@ -15,6 +15,10 @@ use std::str::FromStr;
 
 use anyhow::{Result, anyhow};
 use clap::Parser;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+pub const ANDROID_PROVIDER_EXECUTION_CONTRACT_VERSION: &str = "android-provider-execution/v1";
 
 #[derive(Debug, Parser)]
 pub struct Cli {
@@ -75,6 +79,66 @@ pub struct Config {
     pub use_sg_kvm: bool,
     pub streamable_http: StreamableHttpConfig,
     pub interactive_session: Option<InteractiveSessionConfig>,
+    pub execution_identity: ProviderExecutionIdentity,
+}
+
+/// Stable identity for the one Android provider session served by this process.
+///
+/// Operators running more than one hosted candidate must configure distinct
+/// values. The local defaults remain a single, explicit provider tuple rather
+/// than an implicit "current device" selection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ProviderExecutionIdentity {
+    pub environment_id: String,
+    pub provider_instance_id: String,
+    pub session_id: String,
+}
+
+/// Optional app identity supplied with an Android execution target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AndroidAppTarget {
+    pub package_name: String,
+    #[serde(default)]
+    pub activity: Option<String>,
+}
+
+/// Complete GitHub build identity requested for an Android installation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ExpectedBuildProvenance {
+    pub repository: String,
+    pub commit_sha: String,
+    pub workflow_run_id: u64,
+    pub artifact_name: String,
+    pub artifact_sha256: String,
+}
+
+/// A caller-supplied exact Android target. Omitted fields may be resolved only
+/// from this process's single configured provider session.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, JsonSchema)]
+pub struct AndroidExecutionTarget {
+    #[serde(default)]
+    pub environment_id: Option<String>,
+    #[serde(default)]
+    pub provider_instance_id: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub device_serial: Option<String>,
+    #[serde(default)]
+    pub app: Option<AndroidAppTarget>,
+    #[serde(default)]
+    pub expected_build: Option<ExpectedBuildProvenance>,
+}
+
+/// Provider-observed execution target returned with every resolution receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ResolvedAndroidExecutionTarget {
+    pub environment_id: String,
+    pub provider_instance_id: String,
+    pub session_id: String,
+    pub device_serial: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app: Option<AndroidAppTarget>,
 }
 
 #[derive(Debug, Clone)]
@@ -117,6 +181,7 @@ impl Config {
         let use_sg_kvm = env_flag("ANDROID_COMPUTER_USE_MCP_USE_SG_KVM", false)?;
         let streamable_http = load_streamable_http_config()?;
         let interactive_session = load_interactive_session_config()?;
+        let execution_identity = load_execution_identity()?;
 
         ensure_file(&adb_path, "adb")?;
         ensure_file(&emulator_path, "emulator")?;
@@ -132,8 +197,20 @@ impl Config {
             use_sg_kvm,
             streamable_http,
             interactive_session,
+            execution_identity,
         })
     }
+}
+
+fn load_execution_identity() -> Result<ProviderExecutionIdentity> {
+    Ok(ProviderExecutionIdentity {
+        environment_id: env_setting("ANDROID_COMPUTER_USE_MCP_ENVIRONMENT_ID", "local")?,
+        provider_instance_id: env_setting(
+            "ANDROID_COMPUTER_USE_MCP_PROVIDER_INSTANCE_ID",
+            "android-computer-use-mcp",
+        )?,
+        session_id: env_setting("ANDROID_COMPUTER_USE_MCP_SESSION_ID", "default")?,
+    })
 }
 
 fn load_interactive_session_config() -> Result<Option<InteractiveSessionConfig>> {

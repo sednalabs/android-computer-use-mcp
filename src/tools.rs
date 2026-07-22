@@ -28,6 +28,10 @@ use tokio::process::Command;
 use tokio::time::{sleep, timeout};
 
 use crate::McpError;
+use crate::config::{
+    ANDROID_PROVIDER_EXECUTION_CONTRACT_VERSION, AndroidAppTarget, AndroidExecutionTarget,
+    ProviderExecutionIdentity, ResolvedAndroidExecutionTarget,
+};
 use crate::discovery;
 use crate::grpc_backend;
 use crate::interactive_session::{
@@ -46,8 +50,7 @@ use crate::ui::{
 use crate::verification::{
     InternalNodeTracker, TapVerification, TapVerificationRequest, TextVerification,
     TextVerificationRequest, ToolPostconditionEvidenceSource, ToolPostconditionRequest,
-    ToolPostconditionResult,
-    VerifiedTextDispatchRequest, ensure_action_outcome_satisfied,
+    ToolPostconditionResult, VerifiedTextDispatchRequest, ensure_action_outcome_satisfied,
     ensure_tool_postcondition_satisfied, tap_verification_fingerprint, tap_verification_json,
     tap_verification_summary, text_verification_json, text_verification_summary,
     tool_postcondition_json, tracker_matches_node,
@@ -72,8 +75,7 @@ const MAX_MULTI_TOUCH_POINTERS: usize = 5;
 const DEFAULT_SOLARLAB_ACK_TIMEOUT_SECS: u64 = 8;
 const DEFAULT_SOLARLAB_ACK_POLL_MS: u64 = 400;
 const SOLARLAB_FOCUS_ACK_MARKER: &str = "solarlab semantic focus acknowledged";
-const SOLARLAB_SEMANTIC_REQUEST_ID_EXTRA: &str =
-    "com.sednalabs.solarlab.extra.SEMANTIC_REQUEST_ID";
+const SOLARLAB_SEMANTIC_REQUEST_ID_EXTRA: &str = "com.sednalabs.solarlab.extra.SEMANTIC_REQUEST_ID";
 const DEFAULT_ADB_COMMAND_TIMEOUT_SECS: u64 = 20;
 const DEFAULT_EMULATOR_COMMAND_TIMEOUT_SECS: u64 = 20;
 pub(crate) const DEFAULT_ACTION_TIMEOUT_SECS: u64 = 5;
@@ -137,6 +139,19 @@ pub struct LaunchAvdAndWaitArgs {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SerialArgs {
     /// ADB serial of the target device.
+    #[serde(default)]
+    pub serial: Option<String>,
+}
+
+/// Resolve and validate the exact Android provider session for a call.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ResolveAndroidTargetArgs {
+    /// Optional exact session target. Omitted fields resolve only from this
+    /// provider process's one configured identity tuple.
+    #[serde(default)]
+    pub target: Option<AndroidExecutionTarget>,
+    /// Compatibility serial hint. When both this and target.device_serial are
+    /// supplied, they must identify the same device.
     #[serde(default)]
     pub serial: Option<String>,
 }
@@ -838,6 +853,25 @@ impl AndroidEmulatorMcp {
     }
 
     #[tool(
+        name = "android.resolve_target",
+        description = "Resolve one exact Android provider/session/device target and reject a mismatched identity.",
+        annotations(read_only_hint = true)
+    )]
+    async fn android_resolve_target(
+        &self,
+        Parameters(args): Parameters<ResolveAndroidTargetArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let resolved_target = self
+            .resolve_android_execution_target(args.target.as_ref(), args.serial.as_deref())
+            .await?;
+        Ok(CallToolResult::structured(json!({
+            "ok": true,
+            "contract_version": ANDROID_PROVIDER_EXECUTION_CONTRACT_VERSION,
+            "resolved_target": resolved_target,
+        })))
+    }
+
+    #[tool(
         name = "interactive_session.get_status",
         description = "Report hosted interactive-session configuration, live session root, and active build metadata.",
         annotations(read_only_hint = true)
@@ -1066,32 +1100,31 @@ impl AndroidEmulatorMcp {
             .wait_for_package
             .as_deref()
             .or(Some(args.package_name.as_str()));
-        let postcondition = match ToolPostconditionEvidenceSource::for_launch(
-            wait_for_selector.is_some(),
-        ) {
-            ToolPostconditionEvidenceSource::UiHierarchy => {
-                self.wait_for_tool_postcondition(ToolPostconditionRequest {
-                    serial: &serial,
-                    selector: wait_for_selector.as_ref(),
-                    match_index: None,
-                    wait_for_activity,
-                    wait_for_package,
-                    deadline,
-                    include_screenshot: false,
-                    artifact_prefix: "launch-app-postcondition",
-                })
-                .await?
-            }
-            ToolPostconditionEvidenceSource::WindowState => {
-                self.wait_for_window_state_postcondition(
-                    &serial,
-                    wait_for_activity,
-                    wait_for_package,
-                    deadline,
-                )
-                .await?
-            }
-        };
+        let postcondition =
+            match ToolPostconditionEvidenceSource::for_launch(wait_for_selector.is_some()) {
+                ToolPostconditionEvidenceSource::UiHierarchy => {
+                    self.wait_for_tool_postcondition(ToolPostconditionRequest {
+                        serial: &serial,
+                        selector: wait_for_selector.as_ref(),
+                        match_index: None,
+                        wait_for_activity,
+                        wait_for_package,
+                        deadline,
+                        include_screenshot: false,
+                        artifact_prefix: "launch-app-postcondition",
+                    })
+                    .await?
+                }
+                ToolPostconditionEvidenceSource::WindowState => {
+                    self.wait_for_window_state_postcondition(
+                        &serial,
+                        wait_for_activity,
+                        wait_for_package,
+                        deadline,
+                    )
+                    .await?
+                }
+            };
         ensure_tool_postcondition_satisfied(
             "android.launch_app",
             "postcondition failed after launch",
@@ -3431,10 +3464,50 @@ impl AndroidEmulatorMcp {
         serial: Option<&str>,
     ) -> Result<String, McpError> {
         if let Some(explicit) = serial.map(str::trim).filter(|value| !value.is_empty()) {
-            return Ok(explicit.to_string());
+            let devices = self.list_devices_internal(Some(explicit)).await?;
+            return resolve_explicit_ready_serial(explicit, &devices);
         }
         let devices = self.list_devices_internal(None).await?;
         resolve_serial_from_devices(None, &devices)
+    }
+
+    pub(crate) async fn resolve_android_execution_target(
+        &self,
+        target: Option<&AndroidExecutionTarget>,
+        serial_hint: Option<&str>,
+    ) -> Result<ResolvedAndroidExecutionTarget, McpError> {
+        let target_serial = target
+            .and_then(|target| target.device_serial.as_deref())
+            .map(str::trim)
+            .filter(|serial| !serial.is_empty());
+        let serial_hint = serial_hint
+            .map(str::trim)
+            .filter(|serial| !serial.is_empty());
+        if let (Some(target_serial), Some(serial_hint)) = (target_serial, serial_hint)
+            && target_serial != serial_hint
+        {
+            return Err(McpError::invalid_params(
+                "target.device_serial and serial must match when both are supplied",
+                None,
+            ));
+        }
+        let serial = self
+            .resolve_serial_for_tools(target_serial.or(serial_hint))
+            .await?;
+        let configured_app =
+            self.config
+                .interactive_session
+                .as_ref()
+                .map(|config| AndroidAppTarget {
+                    package_name: config.app_package.clone(),
+                    activity: Some(config.app_activity.clone()),
+                });
+        resolve_android_execution_target(
+            &self.config.execution_identity,
+            target,
+            serial,
+            configured_app,
+        )
     }
 
     async fn spawn_avd_process(&self, request: LaunchRequest) -> Result<EmulatorLaunch, McpError> {
@@ -3930,22 +4003,19 @@ impl AndroidEmulatorMcp {
         y: u32,
     ) -> Result<ActionDispatch, McpError> {
         let grpc_error = if let Some(endpoint) = self.grpc_endpoint_for_serial(serial) {
-            match grpc_backend::send_double_tap(
-                endpoint.port,
-                endpoint.auth_token.as_deref(),
-                x,
-                y,
-            )
-            .await
+            match grpc_backend::send_double_tap(endpoint.port, endpoint.auth_token.as_deref(), x, y)
+                .await
             {
-                Ok(()) => return Ok(ActionDispatch {
-                    backend: "grpc",
-                    output: CommandOutput::default(),
-                    detail: Some(
-                        "sent both taps through one gRPC connection with a bounded interval"
-                            .to_string(),
-                    ),
-                }),
+                Ok(()) => {
+                    return Ok(ActionDispatch {
+                        backend: "grpc",
+                        output: CommandOutput::default(),
+                        detail: Some(
+                            "sent both taps through one gRPC connection with a bounded interval"
+                                .to_string(),
+                        ),
+                    });
+                }
                 Err(err) => Some(err),
             }
         } else {
@@ -4605,9 +4675,7 @@ impl AndroidEmulatorMcp {
                     matcher: matcher.description.clone(),
                     request_id: Some(request_id.to_string()),
                     resolved_body_id: solarlab_semantic_resolved_body_id(
-                        action,
-                        &hierarchy,
-                        request_id,
+                        action, &hierarchy, request_id,
                     ),
                     observed_ui_dump,
                 }));
@@ -5634,8 +5702,7 @@ fn solarlab_semantic_focus_ack_resolved_body_id(
     request_id: &str,
 ) -> Option<String> {
     let hierarchy_lower = hierarchy.to_lowercase();
-    let observed_request_id =
-        solarlab_semantic_ack_field(&hierarchy_lower, "request-id")?;
+    let observed_request_id = solarlab_semantic_ack_field(&hierarchy_lower, "request-id")?;
     let observed_query = solarlab_semantic_ack_field(&hierarchy_lower, "query")?;
     if observed_request_id != normalize_solarlab_semantic_ack_token(request_id)
         || observed_query != normalize_solarlab_semantic_ack_token(body_query)
@@ -5670,12 +5737,8 @@ fn solarlab_semantic_ack_matches(
         SolarLabSemanticCommand::FocusBody { body_query } => {
             if hierarchy_lower.contains(SOLARLAB_FOCUS_ACK_MARKER) {
                 return request_id.is_some_and(|request_id| {
-                    solarlab_semantic_focus_ack_resolved_body_id(
-                        hierarchy,
-                        body_query,
-                        request_id,
-                    )
-                    .is_some()
+                    solarlab_semantic_focus_ack_resolved_body_id(hierarchy, body_query, request_id)
+                        .is_some()
                 });
             }
             hierarchy_lower.contains(&body_query.to_lowercase())
@@ -5796,9 +5859,12 @@ async fn structured_result_with_optional_screenshot(
 }
 
 async fn image_content_from_artifact(path: &Path) -> Result<Content, McpError> {
-    let bytes = fs::read(path)
-        .await
-        .map_err(|err| McpError::internal_error(format!("Failed to read artifact '{}': {}", path.display(), err), None))?;
+    let bytes = fs::read(path).await.map_err(|err| {
+        McpError::internal_error(
+            format!("Failed to read artifact '{}': {}", path.display(), err),
+            None,
+        )
+    })?;
     Ok(Content::image(
         BASE64_STANDARD.encode(bytes),
         guess_artifact_mime_type(path),
@@ -5972,6 +6038,145 @@ fn systemd_run_is_available() -> bool {
         .unwrap_or(false)
 }
 
+fn resolve_android_execution_target(
+    configured_identity: &ProviderExecutionIdentity,
+    requested_target: Option<&AndroidExecutionTarget>,
+    device_serial: String,
+    configured_app: Option<AndroidAppTarget>,
+) -> Result<ResolvedAndroidExecutionTarget, McpError> {
+    let requested_target = requested_target.cloned().unwrap_or_default();
+    require_matching_target_field(
+        "environment_id",
+        requested_target.environment_id.as_deref(),
+        &configured_identity.environment_id,
+    )?;
+    require_matching_target_field(
+        "provider_instance_id",
+        requested_target.provider_instance_id.as_deref(),
+        &configured_identity.provider_instance_id,
+    )?;
+    require_matching_target_field(
+        "session_id",
+        requested_target.session_id.as_deref(),
+        &configured_identity.session_id,
+    )?;
+    require_matching_target_field(
+        "device_serial",
+        requested_target.device_serial.as_deref(),
+        &device_serial,
+    )?;
+
+    let requested_app = requested_target
+        .app
+        .map(normalize_android_app_target)
+        .transpose()?;
+    let app = match (configured_app, requested_app) {
+        (Some(configured_app), Some(requested_app)) => {
+            if configured_app.package_name != requested_app.package_name
+                || configured_app.activity != requested_app.activity
+            {
+                return Err(McpError::invalid_params(
+                    "target.app must match the configured interactive-session app",
+                    None,
+                ));
+            }
+            Some(configured_app)
+        }
+        (Some(configured_app), None) => Some(configured_app),
+        (None, requested_app) => requested_app,
+        (None, None) => None,
+    };
+
+    if let Some(expected_build) = requested_target.expected_build.as_ref() {
+        for (field, value) in [
+            (
+                "target.expected_build.repository",
+                &expected_build.repository,
+            ),
+            (
+                "target.expected_build.commit_sha",
+                &expected_build.commit_sha,
+            ),
+            (
+                "target.expected_build.artifact_name",
+                &expected_build.artifact_name,
+            ),
+            (
+                "target.expected_build.artifact_sha256",
+                &expected_build.artifact_sha256,
+            ),
+        ] {
+            if value.trim().is_empty() {
+                return Err(McpError::invalid_params(
+                    format!("{field} must not be empty"),
+                    None,
+                ));
+            }
+        }
+    }
+
+    Ok(ResolvedAndroidExecutionTarget {
+        environment_id: configured_identity.environment_id.clone(),
+        provider_instance_id: configured_identity.provider_instance_id.clone(),
+        session_id: configured_identity.session_id.clone(),
+        device_serial,
+        app,
+    })
+}
+
+fn require_matching_target_field(
+    field: &str,
+    requested: Option<&str>,
+    resolved: &str,
+) -> Result<(), McpError> {
+    let Some(requested) = requested else {
+        return Ok(());
+    };
+    let requested = requested.trim();
+    if requested.is_empty() {
+        return Err(McpError::invalid_params(
+            format!("target.{field} must not be empty when supplied"),
+            None,
+        ));
+    }
+    if requested != resolved {
+        return Err(McpError::invalid_params(
+            format!("target.{field} does not match the resolved provider target"),
+            None,
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_android_app_target(target: AndroidAppTarget) -> Result<AndroidAppTarget, McpError> {
+    let package_name = target.package_name.trim();
+    if package_name.is_empty() {
+        return Err(McpError::invalid_params(
+            "target.app.package_name must not be empty",
+            None,
+        ));
+    }
+    let activity = target
+        .activity
+        .as_deref()
+        .map(str::trim)
+        .map(|activity| {
+            if activity.is_empty() {
+                Err(McpError::invalid_params(
+                    "target.app.activity must not be empty when supplied",
+                    None,
+                ))
+            } else {
+                Ok(activity.to_string())
+            }
+        })
+        .transpose()?;
+    Ok(AndroidAppTarget {
+        package_name: package_name.to_string(),
+        activity,
+    })
+}
+
 fn resolve_serial_from_devices(
     serial: Option<&str>,
     devices: &[serde_json::Value],
@@ -6003,6 +6208,23 @@ fn resolve_serial_from_devices(
             None,
         )),
     }
+}
+
+fn resolve_explicit_ready_serial(
+    serial: &str,
+    devices: &[serde_json::Value],
+) -> Result<String, McpError> {
+    let ready = devices.iter().any(|device| {
+        device.get("serial").and_then(|value| value.as_str()) == Some(serial)
+            && device.get("state").and_then(|value| value.as_str()) == Some("device")
+    });
+    if ready {
+        return Ok(serial.to_string());
+    }
+    Err(McpError::invalid_params(
+        format!("requested Android serial {serial} is not a ready connected device"),
+        None,
+    ))
 }
 
 fn ready_emulator_serials(devices: &[serde_json::Value]) -> Vec<String> {
@@ -6622,6 +6844,68 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::process::ExitStatusExt;
 
+    fn provider_execution_identity() -> ProviderExecutionIdentity {
+        ProviderExecutionIdentity {
+            environment_id: "environment-1".to_string(),
+            provider_instance_id: "provider-1".to_string(),
+            session_id: "session-1".to_string(),
+        }
+    }
+
+    #[test]
+    fn resolves_an_exact_target_against_the_configured_provider_tuple() {
+        let resolved = resolve_android_execution_target(
+            &provider_execution_identity(),
+            Some(&AndroidExecutionTarget {
+                environment_id: Some("environment-1".to_string()),
+                provider_instance_id: Some("provider-1".to_string()),
+                session_id: Some("session-1".to_string()),
+                device_serial: Some("emulator-5554".to_string()),
+                app: Some(AndroidAppTarget {
+                    package_name: "com.example.app".to_string(),
+                    activity: Some(".MainActivity".to_string()),
+                }),
+                expected_build: None,
+            }),
+            "emulator-5554".to_string(),
+            None,
+        )
+        .expect("exact target should resolve");
+
+        assert_eq!(
+            resolved,
+            ResolvedAndroidExecutionTarget {
+                environment_id: "environment-1".to_string(),
+                provider_instance_id: "provider-1".to_string(),
+                session_id: "session-1".to_string(),
+                device_serial: "emulator-5554".to_string(),
+                app: Some(AndroidAppTarget {
+                    package_name: "com.example.app".to_string(),
+                    activity: Some(".MainActivity".to_string()),
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_a_target_for_another_live_provider_session() {
+        let err = resolve_android_execution_target(
+            &provider_execution_identity(),
+            Some(&AndroidExecutionTarget {
+                session_id: Some("session-old-candidate".to_string()),
+                ..Default::default()
+            }),
+            "emulator-5554".to_string(),
+            None,
+        )
+        .expect_err("stale session target must fail closed");
+
+        assert!(
+            err.to_string()
+                .contains("target.session_id does not match the resolved provider target")
+        );
+    }
+
     #[test]
     fn adb_device_line_is_parsed() {
         let parsed = parse_adb_device_line(
@@ -6638,6 +6922,26 @@ mod tests {
         let resolved = resolve_serial_from_devices(Some(" emulator-5554 "), &[])
             .expect("explicit serial should be accepted");
         assert_eq!(resolved, "emulator-5554");
+    }
+
+    #[test]
+    fn explicit_serial_requires_a_ready_connected_device() {
+        let resolved = resolve_explicit_ready_serial(
+            "emulator-5554",
+            &[json!({ "serial": "emulator-5554", "state": "device" })],
+        )
+        .expect("ready explicit serial should resolve");
+        assert_eq!(resolved, "emulator-5554");
+
+        let err = resolve_explicit_ready_serial(
+            "emulator-5554",
+            &[json!({ "serial": "emulator-5554", "state": "offline" })],
+        )
+        .expect_err("offline explicit serial must not become a resolved target");
+        assert!(
+            err.to_string()
+                .contains("requested Android serial emulator-5554 is not a ready connected device")
+        );
     }
 
     #[test]
@@ -9728,8 +10032,7 @@ mod tests {
         assert!(!output.status.success());
         assert_eq!(output.status.code(), Some(1));
         assert!(
-            String::from_utf8_lossy(&output.stderr)
-                .contains("INSTALL_FAILED_UPDATE_INCOMPATIBLE")
+            String::from_utf8_lossy(&output.stderr).contains("INSTALL_FAILED_UPDATE_INCOMPATIBLE")
         );
     }
 

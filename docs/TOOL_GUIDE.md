@@ -7,7 +7,8 @@ should normally use them.
 ## Recommended Order
 
 1. Discover the harness state with `android.health`, `android.list_devices`, and
-   `android.list_avds`.
+   `android.list_avds`; use `android.resolve_target` when the caller must bind to
+   an exact hosted provider/session/device tuple.
 2. Launch or attach to a device with `android.launch_avd_and_wait` or
    `android.wait_for_boot`.
 3. Discover, install, and launch the target app with `android.list_apps`,
@@ -24,6 +25,8 @@ should normally use them.
   directory state.
 - `android.list_avds` lists Android Virtual Devices known to the configured SDK.
 - `android.list_devices` lists attached or running Android devices.
+- `android.resolve_target` validates an exact environment, provider instance,
+  session, and device target before target-bound operations.
 
 ## Lifecycle
 

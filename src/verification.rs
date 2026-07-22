@@ -1437,7 +1437,11 @@ fn window_state_postcondition_matches(
         })
         .unwrap_or(true);
 
-    (observed_activity, observed_package, activity_ok && package_ok)
+    (
+        observed_activity,
+        observed_package,
+        activity_ok && package_ok,
+    )
 }
 
 fn component_package_name(component: &str) -> Option<String> {
@@ -1517,9 +1521,9 @@ fn bounds_look_like_same_control(original: &UiBounds, candidate: &UiBounds) -> b
 mod tests {
     use super::{
         ToolPostconditionEvidenceSource, ToolPostconditionResult, activity_matches,
-        component_activity_identity, infer_unique_package_name, should_refresh_semantic_observation,
-        should_refresh_tool_postcondition_observation, tool_postcondition_json,
-        window_state_postcondition_matches,
+        component_activity_identity, infer_unique_package_name,
+        should_refresh_semantic_observation, should_refresh_tool_postcondition_observation,
+        tool_postcondition_json, window_state_postcondition_matches,
     };
     use crate::tools::AndroidWindowState;
     use crate::ui::NormalizedUiNode;
@@ -1720,7 +1724,10 @@ mod tests {
         );
 
         assert!(satisfied);
-        assert_eq!(activity.as_deref(), Some("com.sednalabs.solarlab/.MainActivity"));
+        assert_eq!(
+            activity.as_deref(),
+            Some("com.sednalabs.solarlab/.MainActivity")
+        );
         assert_eq!(package.as_deref(), Some("com.sednalabs.solarlab"));
     }
 
@@ -1734,11 +1741,8 @@ mod tests {
             input_method_target: None,
         };
 
-        let (_, package, satisfied) = window_state_postcondition_matches(
-            &window_state,
-            None,
-            Some("com.sednalabs.solarlab"),
-        );
+        let (_, package, satisfied) =
+            window_state_postcondition_matches(&window_state, None, Some("com.sednalabs.solarlab"));
 
         assert!(!satisfied);
         assert_eq!(package.as_deref(), Some("com.android.settings"));

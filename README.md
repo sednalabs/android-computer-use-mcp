@@ -99,11 +99,21 @@ environment variables include:
 - `ANDROID_COMPUTER_USE_MCP_HTTP_MAX_SESSIONS`
 - `ANDROID_COMPUTER_USE_MCP_HTTP_CHANNEL_CAPACITY`
 - `ANDROID_COMPUTER_USE_MCP_HTTP_ALLOW_RESUME`
+- `ANDROID_COMPUTER_USE_MCP_ENVIRONMENT_ID` (defaults to `local`)
+- `ANDROID_COMPUTER_USE_MCP_PROVIDER_INSTANCE_ID` (defaults to
+  `android-computer-use-mcp`)
+- `ANDROID_COMPUTER_USE_MCP_SESSION_ID` (defaults to `default`)
 - `ANDROID_COMPUTER_USE_MCP_INTERACTIVE_SESSION_ROOT`
 - `ANDROID_COMPUTER_USE_MCP_INTERACTIVE_SESSION_GITHUB_REPOSITORY`
 - `ANDROID_COMPUTER_USE_MCP_INTERACTIVE_SESSION_APP_PACKAGE`
 - `ANDROID_COMPUTER_USE_MCP_INTERACTIVE_SESSION_APP_ACTIVITY`
 - `ANDROID_COMPUTER_USE_MCP_INTERACTIVE_SESSION_GITHUB_TOKEN`
+
+For concurrently hosted candidates, give all three execution-identity values
+distinct, stable values before exposing the provider. `android.resolve_target`
+validates a caller-supplied identity and serial against that configured tuple;
+it rejects a stale or different live session instead of silently selecting a
+global current device.
 
 The default HTTP bind address is `127.0.0.1:9526`. Non-loopback bind addresses
 are rejected by configuration validation in this release line.
@@ -113,7 +123,7 @@ are rejected by configuration validation in this release line.
 The committed schema snapshot currently includes these public tool groups:
 
 - Core health and discovery: `android.health`, `android.list_avds`,
-  `android.list_devices`
+  `android.list_devices`, `android.resolve_target`
 - Emulator lifecycle: `android.launch_avd`, `android.launch_avd_and_wait`,
   `android.wait_for_boot`
 - App and device control: `android.install_apk`, `android.launch_app`,
@@ -168,6 +178,11 @@ The Codex adapter in `adapters/codex/` exposes native-shaped `android_observe`,
 provider manifest, and converts results into Codex-compatible raw Responses
 items and `thread/inject_items` payloads. It does not make direct OpenAI API
 calls and does not require `OPENAI_API_KEY`.
+
+Provider manifest schema v5 carries the exact environment, provider-instance,
+and session identity tuple. Persisted v4 manifests must be regenerated before
+validation or use; this metadata migration is separate from the legacy
+tool-input translation retained by `android_install_build_from_run`.
 
 The OpenAI adapter in `adapters/openai/` is a standalone helper layer for direct
 Responses API loops. It packages screenshots as `input_image` content and XML,

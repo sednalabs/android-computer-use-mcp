@@ -20,7 +20,7 @@ pub(crate) struct ToolSurfaceEntry {
     pub(crate) use_when: &'static str,
 }
 
-const TOOL_SURFACE: [ToolSurfaceEntry; 40] = [
+const TOOL_SURFACE: [ToolSurfaceEntry; 41] = [
     ToolSurfaceEntry {
         name: "interactive_session.get_status",
         group: "interactive-session",
@@ -39,7 +39,7 @@ const TOOL_SURFACE: [ToolSurfaceEntry; 40] = [
         name: "interactive_session.install_build_from_run",
         group: "interactive-session",
         read_only: false,
-        description: "Download a reusable interactive build artifact from a GitHub Actions run, install it into the live session, and relaunch the app.",
+        description: "Download a reusable interactive build artifact from a GitHub Actions run, install it into the live session, and optionally relaunch the app.",
         use_when: "Use this to swap a newly built APK into an already-live hosted session instead of restarting the runner.",
     },
     ToolSurfaceEntry {
@@ -69,6 +69,13 @@ const TOOL_SURFACE: [ToolSurfaceEntry; 40] = [
         read_only: true,
         description: "List adb-visible Android devices.",
         use_when: "Use this when you need the current device serials or want to confirm device visibility.",
+    },
+    ToolSurfaceEntry {
+        name: "android.resolve_target",
+        group: "status",
+        read_only: true,
+        description: "Resolve one exact Android provider, session, and device target.",
+        use_when: "Use this before a target-bound Android operation to reject a stale or mismatched provider session.",
     },
     ToolSurfaceEntry {
         name: "android.launch_avd",

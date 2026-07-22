@@ -1,0 +1,118 @@
+name: Android Image Content Smoke
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/android-image-content-smoke.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "build.rs"
+      - "src/**"
+      - "spec/**"
+      - "scripts/android_image_content_smoke.mjs"
+      - "scripts/run_android_image_content_smoke.sh"
+      - "adapters/codex/**"
+      - "adapters/openai/**"
+      - "docs/examples/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-image-content-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  hosted-android-image-content:
+    name: Hosted Android MCP image content smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+
+    steps:
+      - name: Checkout
+        # actions/checkout v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+
+      - name: Run JavaScript adapter contract tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --test \
+            adapters/codex/*.test.mjs \
+            adapters/openai/responses_loop_driver.test.mjs \
+            docs/examples/*.test.mjs
+
+      - name: Install hosted build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Install Android emulator SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdk_root="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=${sdk_root}" >> "${GITHUB_ENV}"
+          echo "ANDROID_SDK_ROOT=${sdk_root}" >> "${GITHUB_ENV}"
+          set +o pipefail
+          yes | "${sdk_root}/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null
+          set -o pipefail
+          "${sdk_root}/cmdline-tools/latest/bin/sdkmanager" "emulator"
+          test -f "${sdk_root}/emulator/lib/emulator_controller.proto"
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Build Android MCP server
+        run: ANDROID_COMPUTER_USE_MCP_SDK_ROOT="${ANDROID_HOME}" cargo build --locked
+
+      - name: Run Android MCP contract tests
+        run: ANDROID_COMPUTER_USE_MCP_SDK_ROOT="${ANDROID_HOME}" cargo test --locked
+
+      - name: Enable KVM for hosted Android smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          test -r /dev/kvm
+          test -w /dev/kvm
+
+      - name: Assert screenshot tools return native image content
+        # reactivecircus/android-emulator-runner v2
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
+        env:
+          ANDROID_COMPUTER_USE_MCP_BIND_ADDR: 127.0.0.1:9526
+          ANDROID_COMPUTER_USE_MCP_ALLOWED_HOSTS: localhost,127.0.0.1,::1
+          ANDROID_COMPUTER_USE_MCP_HTTP_ALLOW_RESUME: "0"
+          MCP_ENDPOINT: http://127.0.0.1:9526/mcp
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_7
+          disable-animations: true
+          disable-linux-hw-accel: false
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot-save -noaudio -no-boot-anim -camera-back none
+          script: sh "${GITHUB_WORKSPACE}/scripts/run_android_image_content_smoke.sh"
+
+      - name: Upload Android image-content smoke artifacts
+        if: always()
+        # actions/upload-artifact v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: android-image-content-smoke-${{ github.run_id }}
+          path: |
+            dist/android-image-content-smoke/**
+            ${{ runner.temp }}/android-mcp-artifacts/**
+            ${{ runner.temp }}/android-computer-use-mcp.log
+          if-no-files-found: ignore

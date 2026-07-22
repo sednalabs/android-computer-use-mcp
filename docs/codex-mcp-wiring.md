@@ -71,6 +71,24 @@ rewritten around toolkit abstractions unless that clearly reduces risk. The
 current loopback runtime uses only a small toolkit seam for bounded local
 session bootstrap.
 
+## Exact hosted target identity
+
+When more than one hosted Android candidate can exist at once, configure a
+stable execution identity before publishing the provider:
+
+```bash
+export ANDROID_COMPUTER_USE_MCP_ENVIRONMENT_ID="<environment-id>"
+export ANDROID_COMPUTER_USE_MCP_PROVIDER_INSTANCE_ID="<provider-instance-id>"
+export ANDROID_COMPUTER_USE_MCP_SESSION_ID="<session-id>"
+```
+
+Callers can use `android.resolve_target` to prove that tuple and the requested
+device serial belong to the live provider before a target-bound action. The
+Codex provider manifest carries the same tuple in schema v5. Persisted v4
+manifests must be regenerated before validation or use; this metadata migration
+does not remove the legacy install-input translation retained for compatible
+callers.
+
 ## Deferred tool-loading note
 
 For large Android sessions, do not assume every Android tool must be eagerly

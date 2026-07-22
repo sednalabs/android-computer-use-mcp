@@ -1,4 +1,4 @@
-export const ANDROID_PROVIDER_MANIFEST_SCHEMA_VERSION = 4;
+export const ANDROID_PROVIDER_MANIFEST_SCHEMA_VERSION = 5;
 export const ANDROID_PROVIDER_MANIFEST_REQUIRED_TOOLS = Object.freeze([
   "android_observe",
   "android_step",
@@ -42,6 +42,9 @@ export function createCodexAndroidProviderManifest({
   defaultSerial = null,
   defaultPackageName = null,
   defaultActivity = null,
+  environmentId = "local",
+  providerInstanceId = "android-computer-use-mcp",
+  sessionId = "default",
   sessionRoot = null,
   artifactRoot = null,
   buildManifestPath = null,
@@ -71,6 +74,11 @@ export function createCodexAndroidProviderManifest({
       buildManifestPath,
       defaultPackageName,
       defaultActivity,
+      executionIdentity: {
+        environmentId,
+        providerInstanceId,
+        sessionId,
+      },
       device,
       capabilities: cloneCapabilities(
         capabilities ?? ANDROID_PROVIDER_MANIFEST_DEFAULT_CAPABILITIES,
@@ -213,6 +221,11 @@ function requireOutcomeTaxonomy(outcomeTaxonomy) {
 export function validateCodexAndroidProviderManifest(manifest) {
   const root = requireObject(manifest, "root");
   if (root.schemaVersion !== ANDROID_PROVIDER_MANIFEST_SCHEMA_VERSION) {
+    if (root.schemaVersion === 4) {
+      throw new Error(
+        "Codex Android provider manifest schemaVersion 4 is incompatible with schemaVersion 5 execution identity; regenerate the manifest before validation or use",
+      );
+    }
     throw new Error(
       `Codex Android provider manifest schemaVersion must be ${ANDROID_PROVIDER_MANIFEST_SCHEMA_VERSION}`,
     );
@@ -267,6 +280,22 @@ export function validateCodexAndroidProviderManifest(manifest) {
     environment.buildManifestPath,
     "environment.buildManifestPath",
   );
+  const executionIdentity = requireObject(
+    environment.executionIdentity,
+    "environment.executionIdentity",
+  );
+  const environmentId = requireString(
+    executionIdentity.environmentId,
+    "environment.executionIdentity.environmentId",
+  );
+  const providerInstanceId = requireString(
+    executionIdentity.providerInstanceId,
+    "environment.executionIdentity.providerInstanceId",
+  );
+  const sessionId = requireString(
+    executionIdentity.sessionId,
+    "environment.executionIdentity.sessionId",
+  );
   requireString(status.generatedAt, "status.generatedAt");
   const capabilities = requireCapabilityGroups(environment.capabilities);
   const outcomeTaxonomy = requireOutcomeTaxonomy(policy.outcomeTaxonomy);
@@ -287,6 +316,11 @@ export function validateCodexAndroidProviderManifest(manifest) {
       defaultActivity,
       artifactRoot,
       buildManifestPath,
+      executionIdentity: {
+        environmentId,
+        providerInstanceId,
+        sessionId,
+      },
       capabilityGroups: Object.keys(capabilities).sort(),
     },
     policy: {

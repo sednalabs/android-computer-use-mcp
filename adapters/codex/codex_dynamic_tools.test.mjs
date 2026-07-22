@@ -323,6 +323,104 @@ test("android_install_build_from_run installs provider-side build and returns fr
   assert.equal(response.metadata.android.outcome.status, "succeeded");
 });
 
+test("android_install_build_from_run preserves native install launch intent and target", async () => {
+  const runtime = createRuntime({
+    async installBuildFromRun(args) {
+      this.calls.push({ fn: "installBuildFromRun", args });
+      return {
+        ok: true,
+        serial: "emulator-5554",
+        installed: true,
+        manifest: {
+          run_id: String(args.workflow_run_id),
+          artifact_name: args.artifact_name,
+        },
+      };
+    },
+  });
+  const host = createCodexAndroidDynamicToolHost({ runtime });
+
+  await host.executeToolCall({
+    tool: "android_install_build_from_run",
+    arguments: {
+      workflow_run_id: 42,
+      artifact_name: "android-build",
+      contract_version: "android-provider-execution/v1",
+      target: {
+        environment_id: "environment-1",
+        provider_instance_id: "provider-1",
+        session_id: "session-1",
+        device_serial: "emulator-5554",
+        expected_build: {
+          repository: "example/android-app",
+          commit_sha: "abcdef0123456789",
+          workflow_run_id: 42,
+          artifact_name: "android-build",
+          artifact_sha256: "sha256:artifact",
+        },
+      },
+      install: { launch_after_install: false },
+    },
+  });
+
+  assert.deepEqual(runtime.calls[0].args, {
+    workflow_run_id: 42,
+    artifact_name: "android-build",
+    repository: null,
+    serial: null,
+    timeout_secs: null,
+    contract_version: "android-provider-execution/v1",
+    target: {
+      environment_id: "environment-1",
+      provider_instance_id: "provider-1",
+      session_id: "session-1",
+      device_serial: "emulator-5554",
+      expected_build: {
+        repository: "example/android-app",
+        commit_sha: "abcdef0123456789",
+        workflow_run_id: 42,
+        artifact_name: "android-build",
+        artifact_sha256: "sha256:artifact",
+      },
+    },
+    install: { launch_after_install: false },
+  });
+});
+
+test("android_install_build_from_run preserves a provider do_not_replay outcome", async () => {
+  const runtime = createRuntime({
+    async installBuildFromRun(args) {
+      this.calls.push({ fn: "installBuildFromRun", args });
+      return {
+        ok: false,
+        serial: "emulator-5554",
+        error: {
+          kind: "build_provenance_mismatch",
+          retryability: "do_not_replay",
+          message: "the requested build does not match the downloaded artifact",
+        },
+      };
+    },
+  });
+  const host = createCodexAndroidDynamicToolHost({
+    runtime,
+    readFile: async (filePath) => filePath.endsWith(".xml") ? "<hierarchy />" : Buffer.from("png"),
+  });
+
+  const response = await host.executeToolCall({
+    tool: "android_install_build_from_run",
+    arguments: {
+      workflow_run_id: 42,
+      artifact_name: "android-build",
+    },
+  });
+
+  assert.equal(response.success, false);
+  assert.equal(response.metadata.android.outcome.status, "postcondition_failed");
+  assert.equal(response.metadata.android.outcome.retryability, "do_not_replay");
+  assert.match(response.metadata.android.outcome.reason, /requested build does not match/);
+});
+
 test("android_observe reports visible soft keyboard from window state", async () => {
   const runtime = createRuntime({
     async waitForStableUi({ hierarchyFilename, screenshotFilename }) {

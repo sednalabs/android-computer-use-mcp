@@ -29,6 +29,9 @@ Options:
   --serial SERIAL             Android serial to target
   --default-package-name PKG  Default app package for launch_app
   --default-activity ACT      Default activity for launch_app
+  --environment-id ID         Exact Android provider environment identity
+  --provider-instance-id ID   Exact Android provider instance identity
+  --session-id ID             Exact Android provider session identity
   --session-root PATH         Hosted-session root for provider manifest output
   --artifact-root PATH        Artifact root for provider manifest output
   --build-manifest PATH       APK/build manifest path for provider manifest output
@@ -63,6 +66,15 @@ function parseArgs(argv) {
         break;
       case "--default-activity":
         parsed.defaultActivity = argv[++index];
+        break;
+      case "--environment-id":
+        parsed.environmentId = argv[++index];
+        break;
+      case "--provider-instance-id":
+        parsed.providerInstanceId = argv[++index];
+        break;
+      case "--session-id":
+        parsed.sessionId = argv[++index];
         break;
       case "--session-root":
         parsed.sessionRoot = argv[++index];
@@ -194,6 +206,12 @@ async function main() {
       defaultSerial,
       defaultPackageName,
       defaultActivity,
+      environmentId: args.environmentId ?? config.environment_id ?? "local",
+      providerInstanceId:
+        args.providerInstanceId ??
+        config.provider_instance_id ??
+        "android-computer-use-mcp",
+      sessionId: args.sessionId ?? config.session_id ?? "default",
       sessionRoot: args.sessionRoot ?? config.session_root ?? null,
       artifactRoot: args.artifactRoot ?? config.artifact_root ?? null,
       buildManifestPath: args.buildManifestPath ?? config.build_manifest_path ?? null,
