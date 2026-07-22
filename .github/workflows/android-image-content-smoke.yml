@@ -12,7 +12,7 @@ on:
       - "build.rs"
       - "src/**"
       - "spec/**"
-      - "scripts/android_image_content_smoke.mjs"
+      - "scripts/android_image_content_smoke*.mjs"
       - "scripts/run_android_image_content_smoke.sh"
       - "adapters/codex/**"
       - "adapters/openai/**"
@@ -44,6 +44,7 @@ jobs:
         run: |
           set -euo pipefail
           node --test \
+            scripts/android_image_content_smoke.test.mjs \
             adapters/codex/*.test.mjs \
             adapters/openai/responses_loop_driver.test.mjs \
             docs/examples/*.test.mjs

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import fs from "node:fs/promises";
+import { pathToFileURL } from "node:url";
 
 const endpoint = process.env.MCP_ENDPOINT ?? "http://127.0.0.1:9526/mcp";
 const serial = process.env.ANDROID_SERIAL ?? "emulator-5554";
@@ -147,23 +148,37 @@ function sleep(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
-async function callToolWithTransientHierarchyRetry(name, args = {}) {
-  const attempts = 3;
+export function isTransientHierarchyTimeout(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    message.includes("UI hierarchy dump timed out") ||
+    (message.includes("uiautomator dump") && message.includes("timed out after"))
+  );
+}
+
+export async function withTransientHierarchyRetry(
+  name,
+  operation,
+  { attempts = 3, retryDelayMs = 1000 } = {},
+) {
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
-      return await callToolRaw(name, args);
+      return await operation();
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (!message.includes("UI hierarchy dump timed out") || attempt === attempts) {
+      if (!isTransientHierarchyTimeout(error) || attempt === attempts) {
         throw error;
       }
       console.warn(
         `${name} hierarchy capture timed out; retrying ${attempt + 1}/${attempts}`,
       );
-      await sleep(1000);
+      await sleep(retryDelayMs);
     }
   }
   throw new Error(`${name} hierarchy retry loop did not return a result`);
+}
+
+async function callToolWithTransientHierarchyRetry(name, args = {}) {
+  return withTransientHierarchyRetry(name, () => callToolRaw(name, args));
 }
 
 async function main() {
@@ -211,7 +226,7 @@ async function main() {
   results.push(
     assertPngImageContent(
       "android.inspect_ui",
-      await callToolRaw("android.inspect_ui", {
+      await callToolWithTransientHierarchyRetry("android.inspect_ui", {
         serial,
         hierarchy_filename: "hosted-smoke-inspect.xml",
         include_screenshot: true,
@@ -248,8 +263,10 @@ async function main() {
   }
 }
 
-try {
-  await main();
-} finally {
-  await closeSession();
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  try {
+    await main();
+  } finally {
+    await closeSession();
+  }
 }
