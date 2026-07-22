@@ -1550,9 +1550,10 @@ async fn resolve_bundle_dir(
             continue;
         };
         let cached_artifact_sha256 =
-            fs::read_to_string(build_dir.join(CACHED_ARTIFACT_SHA256_FILE))
-                .await
-                .map_err(|err| McpError::internal_error(err.to_string(), None))?;
+            match fs::read_to_string(build_dir.join(CACHED_ARTIFACT_SHA256_FILE)).await {
+                Ok(cached_artifact_sha256) => cached_artifact_sha256,
+                Err(_) => continue,
+            };
         if cached_artifact_sha256.trim() != expected_artifact_sha256 {
             continue;
         }
@@ -1632,16 +1633,18 @@ mod tests {
 
     use super::{
         ANDROID_PROVIDER_EXECUTION_CONTRACT_VERSION, ActiveBuildState, AndroidExecutionTarget,
-        BuildManifest, DownloadedBuildBundle, ExpectedBuildProvenance,
-        InteractiveSessionInstallBuildArgs, InteractiveSessionInstallOptions,
-        ResolvedAndroidExecutionTarget, active_build_matches_downloaded,
+        BuildManifest, CACHED_ARTIFACT_SHA256_FILE, DownloadedBuildBundle,
+        ExpectedBuildProvenance, InteractiveSessionConfig, InteractiveSessionInstallBuildArgs,
+        InteractiveSessionInstallOptions, ResolvedAndroidExecutionTarget,
+        active_build_matches_downloaded,
         active_build_relaunch_identity, adb_install_failed_due_to_signature_mismatch,
         adb_install_succeeded, compatibility_mode, finish_install_build_from_run_response,
         install_download_failure_response, install_failed_receipt,
         install_launch_lifecycle_receipt, install_receipt_response, install_terminal_receipt,
         install_terminal_receipt_with_effects, native_validation_failure_response,
         normalized_launch_after_install, observed_build_matches_requested,
-        provenance_mismatch_receipt, reused_active_build_result,
+        provenance_mismatch_receipt, resolve_bundle_dir, reused_active_build_result,
+        sha256_prefixed,
     };
 
     fn expected_build() -> ExpectedBuildProvenance {
@@ -1698,6 +1701,69 @@ mod tests {
             artifact_sha256: "sha256:artifact".to_string(),
             manifest_sha256: "sha256:manifest".to_string(),
         }
+    }
+
+    #[tokio::test]
+    async fn cached_bundle_resolution_skips_a_matching_entry_without_its_artifact_digest() {
+        let downloaded = downloaded_build_bundle();
+        let unique_suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock must be after the Unix epoch")
+            .as_nanos();
+        let session_root = std::env::temp_dir().join(format!(
+            "android-computer-use-mcp-resolve-bundle-{}-{unique_suffix}",
+            std::process::id()
+        ));
+        let build_cache_root = session_root.join("build-cache");
+        let valid_build_dir = build_cache_root.join("valid-build");
+        tokio::fs::create_dir_all(&valid_build_dir)
+            .await
+            .expect("build cache should be created");
+
+        let manifest_bytes =
+            serde_json::to_vec(&downloaded.manifest).expect("manifest should serialize");
+        tokio::fs::write(
+            build_cache_root.join("interactive-build-manifest.json"),
+            &manifest_bytes,
+        )
+        .await
+        .expect("stale matching manifest should be written");
+        tokio::fs::write(
+            valid_build_dir.join("interactive-build-manifest.json"),
+            &manifest_bytes,
+        )
+        .await
+        .expect("valid matching manifest should be written");
+        tokio::fs::write(
+            valid_build_dir.join(CACHED_ARTIFACT_SHA256_FILE),
+            format!("{}\n", downloaded.artifact_sha256),
+        )
+        .await
+        .expect("valid artifact digest should be written");
+
+        let config = InteractiveSessionConfig {
+            session_root: session_root.clone(),
+            github_repository: "example/android-app".to_string(),
+            github_token: None,
+            app_package: downloaded.manifest.package_name.clone(),
+            app_activity: downloaded.manifest.activity_name.clone(),
+        };
+        let manifest_sha256 = sha256_prefixed(&manifest_bytes);
+        let result = resolve_bundle_dir(
+            &config,
+            &downloaded.manifest,
+            Some(&downloaded.artifact_sha256),
+            Some(&manifest_sha256),
+        )
+        .await;
+
+        tokio::fs::remove_dir_all(&session_root)
+            .await
+            .expect("temporary build cache should be removed");
+        assert_eq!(
+            result.expect("the valid matching bundle should still resolve"),
+            valid_build_dir
+        );
     }
 
     fn resolved_target() -> ResolvedAndroidExecutionTarget {
