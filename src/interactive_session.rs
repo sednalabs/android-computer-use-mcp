@@ -1633,18 +1633,17 @@ mod tests {
 
     use super::{
         ANDROID_PROVIDER_EXECUTION_CONTRACT_VERSION, ActiveBuildState, AndroidExecutionTarget,
-        BuildManifest, CACHED_ARTIFACT_SHA256_FILE, DownloadedBuildBundle,
-        ExpectedBuildProvenance, InteractiveSessionConfig, InteractiveSessionInstallBuildArgs,
+        BuildManifest, CACHED_ARTIFACT_SHA256_FILE, DownloadedBuildBundle, ExpectedBuildProvenance,
+        InteractiveSessionConfig, InteractiveSessionInstallBuildArgs,
         InteractiveSessionInstallOptions, ResolvedAndroidExecutionTarget,
-        active_build_matches_downloaded,
-        active_build_relaunch_identity, adb_install_failed_due_to_signature_mismatch,
-        adb_install_succeeded, compatibility_mode, finish_install_build_from_run_response,
-        install_download_failure_response, install_failed_receipt,
-        install_launch_lifecycle_receipt, install_receipt_response, install_terminal_receipt,
-        install_terminal_receipt_with_effects, native_validation_failure_response,
-        normalized_launch_after_install, observed_build_matches_requested,
-        provenance_mismatch_receipt, resolve_bundle_dir, reused_active_build_result,
-        sha256_prefixed,
+        active_build_matches_downloaded, active_build_relaunch_identity,
+        adb_install_failed_due_to_signature_mismatch, adb_install_succeeded, compatibility_mode,
+        finish_install_build_from_run_response, install_download_failure_response,
+        install_failed_receipt, install_launch_lifecycle_receipt, install_receipt_response,
+        install_terminal_receipt, install_terminal_receipt_with_effects,
+        native_validation_failure_response, normalized_launch_after_install,
+        observed_build_matches_requested, provenance_mismatch_receipt, resolve_bundle_dir,
+        reused_active_build_result, sha256_prefixed,
     };
 
     fn expected_build() -> ExpectedBuildProvenance {
@@ -2097,6 +2096,8 @@ mod tests {
                 },
                 "install_receipt": {
                     "status": "installed",
+                    "install_performed": true,
+                    "reused_existing_build": false,
                     "requested_build": {
                         "repository": "example/android-app",
                         "commit_sha": "abcdef0123456789",
@@ -2327,6 +2328,8 @@ mod tests {
                 },
                 "install_receipt": {
                     "status": "installed_launch_failed",
+                    "install_performed": true,
+                    "reused_existing_build": false,
                     "requested_build": {
                         "repository": "example/android-app",
                         "commit_sha": "abcdef0123456789",
@@ -2392,6 +2395,8 @@ mod tests {
             install_terminal_receipt(&expected, &downloaded, true, false, Some("not_running")),
             json!({
                 "status": "installed",
+                "install_performed": true,
+                "reused_existing_build": false,
                 "requested_build": {
                     "repository": "example/android-app",
                     "commit_sha": "abcdef0123456789",
@@ -2425,6 +2430,8 @@ mod tests {
             install_terminal_receipt(&expected, &downloaded, false, false, None),
             json!({
                 "status": "installed",
+                "install_performed": true,
+                "reused_existing_build": false,
                 "requested_build": {
                     "repository": "example/android-app",
                     "commit_sha": "abcdef0123456789",

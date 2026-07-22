@@ -3959,6 +3959,41 @@
           }
         },
         "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "allOf": [
+          {
+            "else": {
+              "properties": {
+                "install": {
+                  "type": "null"
+                }
+              }
+            },
+            "if": {
+              "required": [
+                "contract_version"
+              ]
+            },
+            "then": {
+              "properties": {
+                "contract_version": {
+                  "const": "android-provider-execution/v1"
+                },
+                "launch_after_install": {
+                  "type": "null"
+                },
+                "target": {
+                  "required": [
+                    "expected_build"
+                  ]
+                }
+              },
+              "required": [
+                "target",
+                "install"
+              ]
+            }
+          }
+        ],
         "properties": {
           "artifact_name": {
             "type": "string"
@@ -3982,7 +4017,6 @@
           },
           "launch_after_install": {
             "default": null,
-            "description": "Legacy-only launch flag. Native v1 requests must declare the value in\n`install.launch_after_install` so the receipt never infers intent.",
             "type": [
               "boolean",
               "null"
