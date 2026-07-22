@@ -7,6 +7,7 @@ import { createAndroidEmulatorRuntime } from "../../../docs/examples/android_emu
 import { createMcpStreamableHttpClient } from "../../openai/mcp_streamable_http_client.js";
 import {
   loadCodexAdapterConfig,
+  requiredOptionValue,
   resolveMcpHeaders,
   resolveMcpUrl,
 } from "../cli_common.js";
@@ -48,34 +49,34 @@ function parseArgs(argv) {
     const arg = argv[index];
     switch (arg) {
       case "--config":
-        parsed.configPath = argv[++index];
+        parsed.configPath = requiredOptionValue(argv, index++);
         break;
       case "--mcp-url":
-        parsed.mcpUrl = argv[++index];
+        parsed.mcpUrl = requiredOptionValue(argv, index++);
         break;
       case "--mcp-header":
-        parsed.mcpHeaders.push(argv[++index]);
+        parsed.mcpHeaders.push(requiredOptionValue(argv, index++));
         break;
       case "--serial":
-        parsed.serial = argv[++index];
+        parsed.serial = requiredOptionValue(argv, index++);
         break;
       case "--caption":
-        parsed.caption = argv[++index];
+        parsed.caption = requiredOptionValue(argv, index++);
         break;
       case "--role":
-        parsed.role = argv[++index];
+        parsed.role = requiredOptionValue(argv, index++);
         break;
       case "--mode":
-        parsed.mode = argv[++index];
+        parsed.mode = requiredOptionValue(argv, index++);
         break;
       case "--thread-id":
-        parsed.threadId = argv[++index];
+        parsed.threadId = requiredOptionValue(argv, index++);
         break;
       case "--instant":
         parsed.stable = false;
         break;
       case "--output-json":
-        parsed.outputJson = argv[++index];
+        parsed.outputJson = requiredOptionValue(argv, index++);
         break;
       case "-h":
       case "--help":

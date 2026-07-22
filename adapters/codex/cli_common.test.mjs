@@ -12,9 +12,22 @@ import {
   defaultCodexAdapterConfigPath,
   legacyCodexAdapterConfigPath,
   loadCodexAdapterConfig,
+  requiredOptionValue,
   resolveMcpHeaders,
   resolveMcpUrl,
 } from "./cli_common.js";
+
+test("requiredOptionValue rejects missing values without consuming the next option", () => {
+  assert.throws(
+    () => requiredOptionValue(["--config", "--mcp-url", "https://android.example/mcp"], 0),
+    /Option --config requires a non-option value/,
+  );
+  assert.throws(
+    () => requiredOptionValue(["--config"], 0),
+    /Option --config requires a non-option value/,
+  );
+  assert.equal(requiredOptionValue(["--config", "config.json"], 0), "config.json");
+});
 
 test("defaultCodexAdapterConfigPath points at the standard Codex config location", () => {
   assert.equal(

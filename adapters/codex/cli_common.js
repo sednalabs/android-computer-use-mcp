@@ -36,6 +36,15 @@ export function parseHeaderArgs(headerArgs = []) {
   return headers;
 }
 
+export function requiredOptionValue(argv, optionIndex) {
+  const option = argv[optionIndex];
+  const value = argv[optionIndex + 1];
+  if (value === undefined || value.startsWith("-")) {
+    throw new Error(`Option ${option} requires a non-option value`);
+  }
+  return value;
+}
+
 function accessHeadersFromEnv(env) {
   const clientId =
     env[CF_ACCESS_CLIENT_ID_ENV_VAR] ?? env[LEGACY_CF_ACCESS_CLIENT_ID_ENV_VAR];

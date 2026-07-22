@@ -11,6 +11,7 @@ import {
 } from "../index.js";
 import {
   loadCodexAdapterConfig,
+  requiredOptionValue,
   resolveMcpHeaders,
   resolveMcpUrl,
 } from "../cli_common.js";
@@ -50,43 +51,43 @@ function parseArgs(argv) {
     const arg = argv[index];
     switch (arg) {
       case "--config":
-        parsed.configPath = argv[++index];
+        parsed.configPath = requiredOptionValue(argv, index++);
         break;
       case "--mcp-url":
-        parsed.mcpUrl = argv[++index];
+        parsed.mcpUrl = requiredOptionValue(argv, index++);
         break;
       case "--mcp-header":
-        parsed.mcpHeaders.push(argv[++index]);
+        parsed.mcpHeaders.push(requiredOptionValue(argv, index++));
         break;
       case "--serial":
-        parsed.serial = argv[++index];
+        parsed.serial = requiredOptionValue(argv, index++);
         break;
       case "--default-package-name":
-        parsed.defaultPackageName = argv[++index];
+        parsed.defaultPackageName = requiredOptionValue(argv, index++);
         break;
       case "--default-activity":
-        parsed.defaultActivity = argv[++index];
+        parsed.defaultActivity = requiredOptionValue(argv, index++);
         break;
       case "--environment-id":
-        parsed.environmentId = argv[++index];
+        parsed.environmentId = requiredOptionValue(argv, index++);
         break;
       case "--provider-instance-id":
-        parsed.providerInstanceId = argv[++index];
+        parsed.providerInstanceId = requiredOptionValue(argv, index++);
         break;
       case "--session-id":
-        parsed.sessionId = argv[++index];
+        parsed.sessionId = requiredOptionValue(argv, index++);
         break;
       case "--session-root":
-        parsed.sessionRoot = argv[++index];
+        parsed.sessionRoot = requiredOptionValue(argv, index++);
         break;
       case "--artifact-root":
-        parsed.artifactRoot = argv[++index];
+        parsed.artifactRoot = requiredOptionValue(argv, index++);
         break;
       case "--build-manifest":
-        parsed.buildManifestPath = argv[++index];
+        parsed.buildManifestPath = requiredOptionValue(argv, index++);
         break;
       case "--manifest":
-        parsed.manifestPath = argv[++index];
+        parsed.manifestPath = requiredOptionValue(argv, index++);
         break;
       case "-h":
       case "--help":

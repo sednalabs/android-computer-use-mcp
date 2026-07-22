@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -355,6 +355,18 @@ test("validate-manifest CLI validates stdin manifests directly", () => {
     "android_step",
     "android_install_build_from_run",
   ]);
+});
+
+test("Codex Android tools CLI rejects an option without a value", () => {
+  const cliPath = fileURLToPath(new URL("./bin/codex-android-tools.mjs", import.meta.url));
+  const result = spawnSync(
+    process.execPath,
+    [cliPath, "--config", "--mcp-url", "https://android.example/mcp", "specs"],
+    { encoding: "utf8" },
+  );
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /Option --config requires a non-option value/);
 });
 
 test("provider manifest requires an MCP URL", () => {
