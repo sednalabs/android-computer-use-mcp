@@ -19,6 +19,12 @@ export const ANDROID_TOOL_LOADING_PLAN = Object.freeze({
       "android.wait_for_boot",
       "android.install_apk",
       "android.launch_app",
+      "android.list_apps",
+      "android.terminate_app",
+      "android.uninstall_app",
+      "android.open_url",
+      "android.get_orientation",
+      "android.set_orientation",
     ]),
   }),
   observation: Object.freeze({
@@ -51,12 +57,16 @@ export const ANDROID_TOOL_LOADING_PLAN = Object.freeze({
     loading: "deferred",
     useWhen:
       "Low-level fallback input tools for coordinates, swipes, keyboard events, and break-glass control.",
-    query: "android raw input tap text swipe keyevent coordinates",
+    query: "android raw input tap double tap long press text swipe multi touch pinch keyevent keycombination coordinates",
     tools: Object.freeze([
       "android.input.tap",
+      "android.input.double_tap",
+      "android.input.long_press",
       "android.input.text",
       "android.input.swipe",
+      "android.input.multi_touch",
       "android.input.keyevent",
+      "android.input.keycombination",
     ]),
   }),
   solarlab: Object.freeze({
@@ -375,6 +385,26 @@ export function createAndroidEmulatorRuntime({
       );
     },
 
+    async installBuildFromRun({
+      workflow_run_id,
+      artifact_name,
+      repository = null,
+      launch_after_install = true,
+      serial = null,
+      timeout_secs = null,
+    } = {}) {
+      const result = await callMcp("interactive_session.install_build_from_run", {
+        workflow_run_id,
+        artifact_name,
+        repository,
+        launch_after_install,
+        serial: serial ?? state.currentSerial,
+        timeout_secs,
+      });
+      state.currentSerial = result?.serial ?? state.currentSerial;
+      return throwIfNotOk(result, "installBuildFromRun did not report success");
+    },
+
     async launchApp(
       packageName,
       {
@@ -401,6 +431,99 @@ export function createAndroidEmulatorRuntime({
         },
       );
       return throwIfNotOk(result, "launchApp did not satisfy the requested postcondition");
+    },
+
+    async listApps({ launcherOnly = true } = {}) {
+      return callAndroidTool(
+        "android.list_apps",
+        {
+          serial: state.currentSerial,
+          launcher_only: launcherOnly,
+        },
+        {
+          reason: "discover installed packages before app-control actions",
+        },
+      );
+    },
+
+    async terminateApp(packageName) {
+      const result = await callAndroidTool(
+        "android.terminate_app",
+        {
+          serial: state.currentSerial,
+          package_name: packageName,
+        },
+        {
+          reason: "force-stop an app to reset foreground state",
+        },
+      );
+      return throwIfNotOk(result, "terminateApp did not report success");
+    },
+
+    async uninstallApp(packageName) {
+      const result = await callAndroidTool(
+        "android.uninstall_app",
+        {
+          serial: state.currentSerial,
+          package_name: packageName,
+        },
+        {
+          reason: "uninstall an app from the target device",
+        },
+      );
+      return throwIfNotOk(result, "uninstallApp did not report success");
+    },
+
+    async openUrl(
+      url,
+      {
+        waitForSelector = null,
+        waitForActivity = null,
+        waitForPackage = null,
+        timeoutSecs = 5,
+      } = {},
+    ) {
+      const result = await callAndroidTool(
+        "android.open_url",
+        {
+          serial: state.currentSerial,
+          url,
+          wait_for_selector: waitForSelector,
+          wait_for_activity: waitForActivity,
+          wait_for_package: waitForPackage,
+          timeout_secs: timeoutSecs,
+        },
+        {
+          reason: "open a URL through the Android intent path",
+        },
+      );
+      return throwIfNotOk(result, "openUrl did not satisfy the requested postcondition");
+    },
+
+    async getOrientation() {
+      return callAndroidTool(
+        "android.get_orientation",
+        { serial: state.currentSerial },
+        {
+          reason: "read device orientation before choosing gestures or validation expectations",
+        },
+      );
+    },
+
+    async setOrientation(orientation, { waitForSelector = null, timeoutSecs = 5 } = {}) {
+      const result = await callAndroidTool(
+        "android.set_orientation",
+        {
+          serial: state.currentSerial,
+          orientation,
+          wait_for_selector: waitForSelector,
+          timeout_secs: timeoutSecs,
+        },
+        {
+          reason: "set a known Android orientation before validation",
+        },
+      );
+      return throwIfNotOk(result, "setOrientation did not satisfy the requested postcondition");
     },
 
     async captureScreenshot(label = "android-shot") {
@@ -648,6 +771,56 @@ export function createAndroidEmulatorRuntime({
       return throwIfNotOk(result, "tap did not satisfy the requested postcondition");
     },
 
+    async doubleTap(
+      x,
+      y,
+      {
+        waitForSelector = null,
+        timeoutSecs = 5,
+      } = {},
+    ) {
+      const result = await callAndroidTool(
+        "android.input.double_tap",
+        {
+          serial: state.currentSerial,
+          x,
+          y,
+          wait_for_selector: waitForSelector,
+          timeout_secs: timeoutSecs,
+        },
+        {
+          reason: "fall back to a raw coordinate double tap only when semantic interaction is insufficient",
+        },
+      );
+      return throwIfNotOk(result, "doubleTap did not satisfy the requested postcondition");
+    },
+
+    async longPress(
+      x,
+      y,
+      {
+        durationMs = 500,
+        waitForSelector = null,
+        timeoutSecs = 5,
+      } = {},
+    ) {
+      const result = await callAndroidTool(
+        "android.input.long_press",
+        {
+          serial: state.currentSerial,
+          x,
+          y,
+          duration_ms: durationMs,
+          wait_for_selector: waitForSelector,
+          timeout_secs: timeoutSecs,
+        },
+        {
+          reason: "fall back to a raw coordinate long press only when semantic interaction is insufficient",
+        },
+      );
+      return throwIfNotOk(result, "longPress did not satisfy the requested postcondition");
+    },
+
     async typeText(
       text,
       { expectFocusSelector = null, waitForSelector = null, timeoutSecs = 5 } = {},
@@ -695,6 +868,25 @@ export function createAndroidEmulatorRuntime({
       return throwIfNotOk(result, "swipe did not satisfy the requested postcondition");
     },
 
+    async multiTouch(
+      pointers,
+      { durationMs = 300, timeoutSecs = 5 } = {},
+    ) {
+      const result = await callAndroidTool(
+        "android.input.multi_touch",
+        {
+          serial: state.currentSerial,
+          pointers,
+          duration_ms: durationMs,
+          timeout_secs: timeoutSecs,
+        },
+        {
+          reason: "dispatch every pointer in the same emulator gRPC frame for an atomic gesture",
+        },
+      );
+      return throwIfNotOk(result, "multiTouch did not complete atomically");
+    },
+
     async keyevent(
       keycode,
       { waitForSelector = null, waitForActivity = null, waitForPackage = null, timeoutSecs = 5 } = {},
@@ -714,6 +906,52 @@ export function createAndroidEmulatorRuntime({
         },
       );
       return throwIfNotOk(result, "keyevent did not satisfy the requested postcondition");
+    },
+
+    async keyCombination(
+      keycodes,
+      { waitForSelector = null, waitForActivity = null, waitForPackage = null, timeoutSecs = 5 } = {},
+    ) {
+      const result = await callAndroidTool(
+        "android.input.keycombination",
+        {
+          serial: state.currentSerial,
+          keycodes,
+          wait_for_selector: waitForSelector,
+          wait_for_activity: waitForActivity,
+          wait_for_package: waitForPackage,
+          timeout_secs: timeoutSecs,
+        },
+        {
+          reason: "send a bounded low-level key combination as one fallback action",
+        },
+      );
+      return throwIfNotOk(result, "keyCombination did not satisfy the requested postcondition");
+    },
+
+    async semanticAction(
+      action,
+      {
+        target = null,
+        bodyQuery = null,
+        timeout_secs: timeoutSecs = 5,
+      } = {},
+    ) {
+      const resolvedBodyQuery =
+        bodyQuery ?? (action === "focus_body" && typeof target === "string" ? target : null);
+      const result = await callAndroidTool(
+        "solarlab.semantic_action",
+        {
+          serial: state.currentSerial,
+          action,
+          body_query: resolvedBodyQuery,
+          timeout_secs: timeoutSecs,
+        },
+        {
+          reason: "perform a Solar Lab semantic action through the dedicated semantic tool",
+        },
+      );
+      return throwIfNotOk(result, "semanticAction did not satisfy the requested postcondition");
     },
 
     async runSolarLabScenario(name, options = {}) {

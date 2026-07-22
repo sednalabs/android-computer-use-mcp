@@ -125,7 +125,7 @@ impl ServerHandler for AndroidEmulatorMcp {
                 .build(),
             Implementation::from_build_env(),
             Some(
-                "Local Android computer-use MCP for semantic Android interaction, raw input fallback, and scenario tools."
+                "Local Android computer-use MCP for semantic interaction, raw input fallback, and optional scenario tools."
                     .to_string(),
             ),
         )

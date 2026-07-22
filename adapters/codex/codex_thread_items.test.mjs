@@ -54,11 +54,17 @@ test("contextFromObservation normalizes runtime observation results", async () =
         screenshot_path: "/tmp/current.png",
         hierarchy_path: "/tmp/current.xml",
       },
+      window_state: {
+        input_method_visible: true,
+      },
     }),
     {
       serial: "emulator-5554",
       screenshotPath: "/tmp/current.png",
       uiDumpPath: "/tmp/current.xml",
+      windowState: {
+        input_method_visible: true,
+      },
       lastScenarioResult: null,
     },
   );

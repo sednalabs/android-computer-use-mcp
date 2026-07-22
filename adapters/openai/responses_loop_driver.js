@@ -33,6 +33,7 @@ const DEFAULT_ALLOWED_MCP_TOOLS = Object.freeze([
   "android.input.tap",
   "android.input.text",
   "android.input.swipe",
+  "android.input.multi_touch",
   "android.input.keyevent",
   "solarlab.scenario.stage_first_focus_earth",
   "solarlab.scenario.stage_first_immersive_roundtrip",

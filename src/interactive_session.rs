@@ -417,7 +417,7 @@ async fn install_apk_with_signature_mismatch_fallback(
     manifest: &BuildManifest,
 ) -> Result<InstallOutcome, McpError> {
     let initial = mcp
-        .run_adb(
+        .run_adb_allow_failure(
             serial,
             [
                 "install".to_string(),
@@ -525,10 +525,7 @@ fn github_client(token: &str) -> Result<reqwest::Client, McpError> {
         HeaderValue::from_str(&format!("Bearer {token}"))
             .map_err(|err| McpError::internal_error(err.to_string(), None))?,
     );
-    headers.insert(
-        USER_AGENT,
-        HeaderValue::from_static("android-computer-use-mcp"),
-    );
+    headers.insert(USER_AGENT, HeaderValue::from_static("android-computer-use-mcp"));
     headers.insert(
         "X-GitHub-Api-Version",
         HeaderValue::from_static(GITHUB_API_VERSION),

@@ -20,6 +20,44 @@ use serde_json::json;
 
 use crate::McpError;
 
+const UI_OUTPUT_TEXT_CHAR_LIMIT: usize = 240;
+const UI_VISIBLE_LABEL_CHAR_LIMIT: usize = 96;
+const UI_VISIBLE_NODE_LIMIT: usize = 120;
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub(crate) struct UiNodesForOutput {
+    pub(crate) nodes: Vec<NormalizedUiNode>,
+    pub(crate) total_count: usize,
+    pub(crate) returned_count: usize,
+    pub(crate) compacted_text_fields: usize,
+    pub(crate) text_char_limit: usize,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub(crate) struct VisibleUiForOutput {
+    pub(crate) nodes: Vec<VisibleUiNode>,
+    pub(crate) total_labeled_count: usize,
+    pub(crate) returned_count: usize,
+    pub(crate) label_char_limit: usize,
+    pub(crate) viewport: Option<UiBounds>,
+    pub(crate) clipped_node_count: usize,
+    pub(crate) scrollable_node_count: usize,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub(crate) struct VisibleUiNode {
+    pub(crate) label: String,
+    pub(crate) bounds: UiBounds,
+    pub(crate) resource_id: Option<String>,
+    pub(crate) class_name: Option<String>,
+    pub(crate) enabled: bool,
+    pub(crate) interactive: bool,
+    pub(crate) scrollable: bool,
+    pub(crate) clipped: bool,
+    pub(crate) clip_edges: Vec<String>,
+    pub(crate) visible_fraction_percent: u8,
+}
+
 /// Defines the criteria for selecting a UI element in the Android accessibility tree.
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Default, PartialEq, Eq)]
 pub struct UiSelector {
@@ -97,6 +135,28 @@ pub(crate) struct UiBounds {
 impl UiBounds {
     pub(crate) fn center(self) -> (u32, u32) {
         ((self.left + self.right) / 2, (self.top + self.bottom) / 2)
+    }
+
+    fn area(self) -> u64 {
+        self.right.saturating_sub(self.left) as u64 * self.bottom.saturating_sub(self.top) as u64
+    }
+
+    fn intersection_area(self, other: UiBounds) -> u64 {
+        let left = self.left.max(other.left);
+        let top = self.top.max(other.top);
+        let right = self.right.min(other.right);
+        let bottom = self.bottom.min(other.bottom);
+        if right <= left || bottom <= top {
+            return 0;
+        }
+        (right - left) as u64 * (bottom - top) as u64
+    }
+
+    fn contains(self, other: UiBounds) -> bool {
+        self.left <= other.left
+            && self.top <= other.top
+            && self.right >= other.right
+            && self.bottom >= other.bottom
     }
 }
 
@@ -221,6 +281,204 @@ pub(crate) fn parse_ui_nodes_from_xml(xml: &str) -> Result<Vec<NormalizedUiNode>
         .collect())
 }
 
+pub(crate) fn ui_nodes_for_tool_output(nodes: &[NormalizedUiNode]) -> UiNodesForOutput {
+    let mut compacted_text_fields = 0;
+    let compacted_nodes = nodes
+        .iter()
+        .cloned()
+        .map(|mut node| {
+            let original_text = node.text.clone();
+            let compacted_text = compact_output_text(original_text.clone());
+            if compacted_text != original_text {
+                compacted_text_fields += 1;
+            }
+            node.text = compacted_text;
+
+            let original_label = node.semantic_label.clone();
+            let compacted_label = compact_output_text(original_label.clone());
+            if compacted_label != original_label {
+                compacted_text_fields += 1;
+            }
+            node.semantic_label = compacted_label;
+
+            let original_desc = node.content_desc.clone();
+            let compacted_desc = compact_output_text(original_desc.clone());
+            if compacted_desc != original_desc {
+                compacted_text_fields += 1;
+            }
+            node.content_desc = compacted_desc;
+            node
+        })
+        .collect::<Vec<_>>();
+
+    UiNodesForOutput {
+        total_count: nodes.len(),
+        returned_count: compacted_nodes.len(),
+        compacted_text_fields,
+        text_char_limit: UI_OUTPUT_TEXT_CHAR_LIMIT,
+        nodes: compacted_nodes,
+    }
+}
+
+pub(crate) fn visible_ui_for_tool_output(nodes: &[NormalizedUiNode]) -> VisibleUiForOutput {
+    let mut total_labeled_count = 0;
+    let mut clipped_node_count = 0;
+    let scrollable_node_count = nodes.iter().filter(|node| node.scrollable).count();
+    let mut visible = Vec::new();
+    let viewport = infer_viewport_bounds(nodes);
+
+    for node in nodes {
+        let Some(bounds) = node.bounds else {
+            continue;
+        };
+        let label = if node.scrollable {
+            direct_visible_label_for_node(node)
+                .or_else(|| scrollable_visible_label_for_node(node, bounds, viewport))
+                .or_else(|| visible_label_for_node(node))
+        } else {
+            visible_label_for_node(node)
+        };
+        let Some(label) = label else {
+            continue;
+        };
+        if is_nested_duplicate_visible_label(node, bounds, &label, nodes) {
+            continue;
+        }
+        total_labeled_count += 1;
+        if visible.len() >= UI_VISIBLE_NODE_LIMIT {
+            continue;
+        }
+        let visibility = viewport
+            .map(|viewport| visibility_within_viewport(bounds, viewport))
+            .unwrap_or_default();
+        if visibility.clipped {
+            clipped_node_count += 1;
+        }
+        visible.push(VisibleUiNode {
+            label: compact_visible_label_with_state(&label, node, &visibility),
+            bounds,
+            resource_id: node.resource_id.clone(),
+            class_name: node.class_name.clone(),
+            enabled: node.enabled,
+            interactive: node.clickable || node.focusable || node.long_clickable || node.scrollable,
+            scrollable: node.scrollable,
+            clipped: visibility.clipped,
+            clip_edges: visibility.clip_edges,
+            visible_fraction_percent: visibility.visible_fraction_percent,
+        });
+    }
+
+    VisibleUiForOutput {
+        returned_count: visible.len(),
+        nodes: visible,
+        total_labeled_count,
+        label_char_limit: UI_VISIBLE_LABEL_CHAR_LIMIT,
+        viewport,
+        clipped_node_count,
+        scrollable_node_count,
+    }
+}
+
+fn is_nested_duplicate_visible_label(
+    node: &NormalizedUiNode,
+    bounds: UiBounds,
+    label: &str,
+    nodes: &[NormalizedUiNode],
+) -> bool {
+    if node.clickable || node.focusable || node.long_clickable || node.scrollable {
+        return false;
+    }
+
+    let label_key = visible_label_key(label);
+    if label_key.is_empty() {
+        return false;
+    }
+
+    nodes.iter().any(|candidate| {
+        let Some(candidate_bounds) = candidate.bounds else {
+            return false;
+        };
+        if candidate.scrollable
+            || !(candidate.clickable || candidate.focusable || candidate.long_clickable)
+        {
+            return false;
+        }
+        if candidate_bounds == bounds {
+            return visible_label_for_node(candidate)
+                .is_some_and(|candidate_label| visible_label_key(&candidate_label) == label_key);
+        }
+        candidate_bounds.contains(bounds)
+            && candidate_bounds.area() > bounds.area()
+            && visible_label_for_node(candidate)
+                .is_some_and(|candidate_label| visible_label_key(&candidate_label) == label_key)
+    })
+}
+
+fn visible_label_key(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[derive(Debug)]
+struct ViewportVisibility {
+    clipped: bool,
+    clip_edges: Vec<String>,
+    visible_fraction_percent: u8,
+}
+
+impl Default for ViewportVisibility {
+    fn default() -> Self {
+        Self {
+            clipped: false,
+            clip_edges: Vec::new(),
+            visible_fraction_percent: 100,
+        }
+    }
+}
+
+fn infer_viewport_bounds(nodes: &[NormalizedUiNode]) -> Option<UiBounds> {
+    nodes
+        .iter()
+        .filter_map(|node| node.bounds)
+        .filter(|bounds| bounds.left == 0 && bounds.top == 0)
+        .max_by_key(|bounds| bounds.area())
+        .or_else(|| {
+            nodes
+                .iter()
+                .filter_map(|node| node.bounds)
+                .max_by_key(|bounds| bounds.area())
+        })
+}
+
+fn visibility_within_viewport(bounds: UiBounds, viewport: UiBounds) -> ViewportVisibility {
+    let mut clip_edges = Vec::new();
+    if bounds.left < viewport.left {
+        clip_edges.push("left".to_string());
+    }
+    if bounds.top < viewport.top {
+        clip_edges.push("top".to_string());
+    }
+    if bounds.right > viewport.right {
+        clip_edges.push("right".to_string());
+    }
+    if bounds.bottom > viewport.bottom {
+        clip_edges.push("bottom".to_string());
+    }
+
+    let node_area = bounds.area();
+    let visible_area = bounds.intersection_area(viewport);
+    let visible_fraction_percent = if node_area == 0 {
+        0
+    } else {
+        ((visible_area.saturating_mul(100) + (node_area / 2)) / node_area).min(100) as u8
+    };
+
+    ViewportVisibility {
+        clipped: !clip_edges.is_empty() || visible_fraction_percent < 100,
+        clip_edges,
+        visible_fraction_percent,
+    }
+}
+
 pub(crate) fn matching_nodes(
     nodes: &[NormalizedUiNode],
     selector: &UiSelector,
@@ -251,10 +509,20 @@ pub(crate) fn find_interactive_ui_node(
         if !interactive_selector_matches(node, &normalized, selector) {
             continue;
         }
-        let interactive_bounds = node
+        let interactive_target = node
             .ancestors()
-            .find_map(interactive_bounds_from_node)
-            .or(normalized.bounds);
+            .find_map(|candidate| {
+                interactive_bounds_from_node(candidate).map(|bounds| (candidate, bounds))
+            });
+        let (resolved, interactive_bounds) = match interactive_target {
+            Some((interactive_node, bounds)) => {
+                (normalized_ui_node_from_xml(interactive_node), Some(bounds))
+            }
+            None => {
+                let bounds = normalized.bounds;
+                (normalized, bounds)
+            }
+        };
         if matches
             .iter()
             .any(|existing: &NormalizedUiNode| existing.bounds == interactive_bounds)
@@ -264,7 +532,7 @@ pub(crate) fn find_interactive_ui_node(
         matches.push(NormalizedUiNode {
             center: interactive_bounds.map(UiBounds::center),
             bounds: interactive_bounds,
-            ..normalized
+            ..resolved
         });
     }
     Ok(MatchCandidates { matches })
@@ -276,6 +544,17 @@ pub(crate) fn text_verification_target_selector(node: &NormalizedUiNode) -> UiSe
         clickable: node.clickable.then_some(true),
         focusable: node.focusable.then_some(true),
         long_clickable: node.long_clickable.then_some(true),
+        ..UiSelector::default()
+    }
+}
+
+pub(crate) fn focus_verification_target_selector(node: &NormalizedUiNode) -> UiSelector {
+    UiSelector {
+        text: node.text.clone(),
+        content_desc: node.content_desc.clone(),
+        resource_id: node.resource_id.clone(),
+        focusable: node.focusable.then_some(true),
+        focused: Some(true),
         ..UiSelector::default()
     }
 }
@@ -406,12 +685,17 @@ pub(crate) fn resolve_node_selection(
             }
             index
         }
-        None if match_count == 1 => 0,
         None => {
-            return Err(SelectionFailure::Ambiguous {
-                match_count,
-                candidates,
-            });
+            if match_count == 1 {
+                0
+            } else if let Some(index) = auto_resolve_match_index(&matches) {
+                index
+            } else {
+                return Err(SelectionFailure::Ambiguous {
+                    match_count,
+                    candidates,
+                });
+            }
         }
     };
     Ok(ResolvedNodeSelection {
@@ -420,6 +704,49 @@ pub(crate) fn resolve_node_selection(
         selected_match_index,
         candidates,
     })
+}
+
+fn auto_resolve_match_index(matches: &[NormalizedUiNode]) -> Option<usize> {
+    if matches.len() < 2 {
+        return None;
+    }
+
+    let mut best: Option<(usize, (u8, u8, u8, u8, u8))> = None;
+    let mut best_count = 0usize;
+
+    for (index, node) in matches.iter().enumerate() {
+        let score = (
+            u8::from(node.clickable),
+            u8::from(node.focusable),
+            u8::from(node.long_clickable),
+            u8::from(node.resource_id.is_some()),
+            u8::from(node.center.is_some()),
+        );
+
+        if score == (0, 0, 0, 0, 0) {
+            continue;
+        }
+
+        match best {
+            None => {
+                best = Some((index, score));
+                best_count = 1;
+            }
+            Some((_, best_score)) if score > best_score => {
+                best = Some((index, score));
+                best_count = 1;
+            }
+            Some((_, best_score)) if score == best_score => {
+                best_count += 1;
+            }
+            _ => {}
+        }
+    }
+
+    match (best, best_count) {
+        (Some((index, _)), 1) => Some(index),
+        _ => None,
+    }
 }
 
 pub(crate) fn selection_failure_json(error: &SelectionFailure) -> serde_json::Value {
@@ -694,6 +1021,60 @@ fn normalized_ui_node_from_xml(node: roxmltree::Node<'_, '_>) -> NormalizedUiNod
     }
 }
 
+fn visible_label_for_node(node: &NormalizedUiNode) -> Option<String> {
+    [
+        node.semantic_label.as_deref(),
+        node.text.as_deref(),
+        node.content_desc.as_deref(),
+        node.resource_id
+            .as_deref()
+            .and_then(|resource_id| resource_id.rsplit('/').next()),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+    .find(|value| !value.is_empty())
+    .map(ToOwned::to_owned)
+}
+
+fn direct_visible_label_for_node(node: &NormalizedUiNode) -> Option<String> {
+    [
+        node.text.as_deref(),
+        node.content_desc.as_deref(),
+        node.resource_id
+            .as_deref()
+            .and_then(|resource_id| resource_id.rsplit('/').next()),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+    .find(|value| !value.is_empty())
+    .map(ToOwned::to_owned)
+}
+
+fn scrollable_visible_label_for_node(
+    node: &NormalizedUiNode,
+    bounds: UiBounds,
+    viewport: Option<UiBounds>,
+) -> Option<String> {
+    if !node.scrollable || viewport.is_some_and(|viewport| bounds == viewport) {
+        return None;
+    }
+
+    let class_name = node.class_name.as_deref().unwrap_or_default();
+    let class_name = class_name.to_ascii_lowercase();
+    let label = if class_name.contains("recyclerview") || class_name.contains("listview") {
+        "Scrollable list"
+    } else if class_name.contains("viewpager") {
+        "Scrollable pages"
+    } else if class_name.contains("scrollview") {
+        "Scrollable view"
+    } else {
+        "Scrollable region"
+    };
+    Some(label.to_string())
+}
+
 fn semantic_label_from_xml(node: roxmltree::Node<'_, '_>) -> Option<String> {
     if let Some(text) = non_empty_attr(node, "text") {
         return Some(text);
@@ -730,6 +1111,95 @@ fn non_empty_attr(node: roxmltree::Node<'_, '_>, name: &str) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn compact_output_text(value: Option<String>) -> Option<String> {
+    value.map(|value| {
+        let original_chars = value.chars().count();
+        if original_chars <= UI_OUTPUT_TEXT_CHAR_LIMIT {
+            return value;
+        }
+        let prefix: String = value.chars().take(UI_OUTPUT_TEXT_CHAR_LIMIT).collect();
+        format!("{prefix}... [truncated; original_chars={original_chars}]")
+    })
+}
+
+fn compact_visible_label(value: &str) -> String {
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let original_chars = normalized.chars().count();
+    if original_chars <= UI_VISIBLE_LABEL_CHAR_LIMIT {
+        return normalized;
+    }
+    let prefix = normalized
+        .chars()
+        .take(UI_VISIBLE_LABEL_CHAR_LIMIT)
+        .collect::<String>();
+    format!(
+        "{}... [truncated; original_chars={original_chars}]",
+        prefix.trim_end()
+    )
+}
+
+fn compact_visible_label_with_state(
+    value: &str,
+    node: &NormalizedUiNode,
+    visibility: &ViewportVisibility,
+) -> String {
+    let suffix = visible_label_state_suffix(value, node, visibility);
+    let Some(suffix) = suffix else {
+        return compact_visible_label(value);
+    };
+
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let original_chars = normalized.chars().count();
+    if original_chars + suffix.chars().count() <= UI_VISIBLE_LABEL_CHAR_LIMIT {
+        return format!("{normalized}{suffix}");
+    }
+
+    let marker = format!("... [truncated; original_chars={original_chars}]{suffix}");
+    let marker_chars = marker.chars().count();
+    if marker_chars >= UI_VISIBLE_LABEL_CHAR_LIMIT {
+        return compact_visible_label(&format!("{normalized}{suffix}"));
+    }
+
+    let prefix_chars = UI_VISIBLE_LABEL_CHAR_LIMIT - marker_chars;
+    let prefix = normalized.chars().take(prefix_chars).collect::<String>();
+    format!("{}{}", prefix.trim_end(), marker)
+}
+
+fn visible_label_state_suffix(
+    label: &str,
+    node: &NormalizedUiNode,
+    visibility: &ViewportVisibility,
+) -> Option<String> {
+    let mut tags = Vec::new();
+
+    if !node.enabled {
+        tags.push("disabled".to_string());
+    }
+
+    let lower_label = label.to_ascii_lowercase();
+    if node.scrollable && !lower_label.contains("scrollable") {
+        tags.push("scrollable".to_string());
+    }
+
+    if visibility.clipped {
+        let mut clipped = "clipped".to_string();
+        if !visibility.clip_edges.is_empty() {
+            clipped.push(' ');
+            clipped.push_str(&visibility.clip_edges.join("/"));
+        }
+        if visibility.visible_fraction_percent < 100 {
+            clipped.push_str(&format!(" {}%", visibility.visible_fraction_percent));
+        }
+        tags.push(clipped);
+    }
+
+    if tags.is_empty() {
+        None
+    } else {
+        Some(format!(" [{}]", tags.join("; ")))
+    }
 }
 
 fn bool_attr(node: roxmltree::Node<'_, '_>, name: &str) -> bool {

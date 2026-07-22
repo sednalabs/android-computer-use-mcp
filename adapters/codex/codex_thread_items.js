@@ -34,6 +34,7 @@ export function contextFromObservation(result) {
     serial: result?.serial ?? null,
     screenshotPath: result?.artifacts?.screenshot_path ?? null,
     uiDumpPath: result?.artifacts?.hierarchy_path ?? null,
+    windowState: result?.window_state ?? null,
     lastScenarioResult: null,
   };
 }

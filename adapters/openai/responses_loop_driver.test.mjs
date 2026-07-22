@@ -1,7 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { createOpenAiResponsesLoopDriver } from "./responses_loop_driver.js";
+import {
+  DEFAULT_ALLOWED_MCP_TOOLS,
+  createOpenAiResponsesLoopDriver,
+} from "./responses_loop_driver.js";
+
+test("Responses loop allows atomic multi-touch by default", () => {
+  assert.equal(DEFAULT_ALLOWED_MCP_TOOLS.includes("android.input.multi_touch"), true);
+});
 
 test("Responses loop driver runs a native observe round and prefers file ids for hosted artifacts", async () => {
   const requests = [];

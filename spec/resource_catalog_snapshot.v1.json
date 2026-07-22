@@ -1,7 +1,7 @@
 {
   "payload": {
     "reads": {
-      "about": "# Android Computer Use MCP\n\nPurpose:\n- Provide a structured Android execution substrate for emulator lifecycle, app control, observation, semantic UI interaction, raw input fallback, and Solar Lab scenarios.\n\nCurrent posture:\n- Hosted interactive-session tools can reuse a live runner-backed emulator without rebuilding or rebooting it for each new APK.\n- Semantic Android tools are the preferred interaction lane.\n- Raw input tools remain available as fallback when semantic selection is insufficient.\n- Solar Lab scenarios are first-class tools rather than private hand-assembled scripts.\n\nContract:\n- Public tool exposure is governed by explicit tool inventory registration.\n- Discovery resources are read-only and intended for cold-start orientation.\n- Tool schema and resource catalog snapshots guard the public contract.\n",
+      "about": "# Android Computer Use MCP\n\nPurpose:\n- Provide a structured Android execution substrate for emulator lifecycle, app control, observation, semantic UI interaction, raw input fallback, and Solar Lab scenarios.\n\nCurrent posture:\n- Hosted interactive-session tools can reuse a live runner-backed emulator without rebuilding or rebooting it for each new APK.\n- Semantic Android tools are the preferred interaction lane.\n- Raw input tools remain available as fallback when semantic selection is insufficient.\n- Optional scenario tools provide durable examples above the generic Android surface.\n\nContract:\n- Public tool exposure is governed by explicit tool inventory registration.\n- Discovery resources are read-only and intended for cold-start orientation.\n- Tool schema and resource catalog snapshots guard the public contract.\n",
       "help": "# Android Computer Use MCP help\n\nRecommended interaction order:\n1. interactive_session.get_status when working against a hosted runner-backed session.\n2. android.health or android.list_devices to understand the current harness state.\n3. android.wait_for_boot if a device may still be starting.\n4. interactive_session.install_build_from_run to swap a fresh remote-built APK into a live hosted session.\n5. android.launch_app or a Solar Lab scenario to reach the target surface.\n6. android.wait_for_stable_ui before acting through semantic UI tools.\n7. android.tap_element or android.type_into_element for semantic interaction.\n8. android.input.* only when semantic tools are insufficient.\n\nGuidance:\n- Prefer semantic UI tools over raw input whenever a selector can describe the target.\n- Prefer scenario tools for durable Solar Lab flows instead of rebuilding them ad hoc.\n- Use observation tools when you need artifacts or structured state, not just one action.\n\nHosted usage notes:\n- This server works well as a runner-backed Android substrate over Streamable HTTP.\n- interactive_session.* tools exist to avoid restarting the hosted runner for each new build.\n- Discovery resources exist so a fresh agent can orient without local repo context.\n",
       "scenario_catalog": {
         "domain": "solarlab",
@@ -36,14 +36,14 @@
       "tool_catalog": {
         "fallback_lane": "raw-input",
         "groups": {
-          "app-control": 2,
+          "app-control": 7,
           "emulator-lifecycle": 4,
           "interactive-session": 4,
-          "observation": 5,
-          "raw-input": 4,
+          "observation": 6,
+          "raw-input": 8,
           "semantic-ui": 5,
           "solarlab-scenarios": 3,
-          "status": 2
+          "status": 3
         },
         "preferred_lane": "semantic-ui-first",
         "server": "android-computer-use-mcp",
@@ -133,6 +133,48 @@
             "use_when": "Use this to bring an app to the foreground before semantic UI interaction."
           },
           {
+            "description": "List installed Android apps, optionally limited to launcher-visible apps.",
+            "group": "app-control",
+            "name": "android.list_apps",
+            "read_only": true,
+            "use_when": "Use this when you need package names before launching, terminating, or uninstalling apps."
+          },
+          {
+            "description": "Force-stop an installed Android app by package name.",
+            "group": "app-control",
+            "name": "android.terminate_app",
+            "read_only": false,
+            "use_when": "Use this to reset app state without uninstalling it."
+          },
+          {
+            "description": "Uninstall an Android app by package name.",
+            "group": "app-control",
+            "name": "android.uninstall_app",
+            "read_only": false,
+            "use_when": "Use this only when the app should be removed from the device."
+          },
+          {
+            "description": "Open an http:// or https:// URL on the Android device.",
+            "group": "app-control",
+            "name": "android.open_url",
+            "read_only": false,
+            "use_when": "Use this when the browser or URL intent path is the task under test."
+          },
+          {
+            "description": "Read the device user_rotation setting and normalized orientation class.",
+            "group": "status",
+            "name": "android.get_orientation",
+            "read_only": true,
+            "use_when": "Use this to record orientation before choosing gestures or validation expectations."
+          },
+          {
+            "description": "Set the device user_rotation after disabling accelerometer rotation.",
+            "group": "app-control",
+            "name": "android.set_orientation",
+            "read_only": false,
+            "use_when": "Use this when validation needs a known portrait or landscape posture."
+          },
+          {
             "description": "Capture a PNG screenshot from the device and save it locally.",
             "group": "observation",
             "name": "android.capture_screenshot",
@@ -145,6 +187,13 @@
             "name": "android.dump_ui_hierarchy",
             "read_only": false,
             "use_when": "Use this when you need raw hierarchy XML for debugging or later parsing."
+          },
+          {
+            "description": "Read a previously generated artifact file from the configured artifact directory and return its contents for remote consumers.",
+            "group": "observation",
+            "name": "android.read_artifact",
+            "read_only": true,
+            "use_when": "Use this when a remote consumer needs the bytes or text for a screenshot, UI dump, or other artifact path that was returned earlier."
           },
           {
             "description": "Capture the current UI hierarchy, optionally pair it with a screenshot, and return a normalized UI tree.",
@@ -210,6 +259,20 @@
             "use_when": "Use this only when semantic selection is insufficient and you already know the screen coordinates."
           },
           {
+            "description": "Send a double-tap input event to the device as one bounded gesture.",
+            "group": "raw-input",
+            "name": "android.input.double_tap",
+            "read_only": false,
+            "use_when": "Use this only when a genuine Android double-tap gesture is needed and semantic interaction is insufficient."
+          },
+          {
+            "description": "Send a long-press input event to the device as one bounded gesture.",
+            "group": "raw-input",
+            "name": "android.input.long_press",
+            "read_only": false,
+            "use_when": "Use this only when a genuine Android long-press gesture is needed and semantic interaction is insufficient."
+          },
+          {
             "description": "Send text input to the device.",
             "group": "raw-input",
             "name": "android.input.text",
@@ -224,11 +287,25 @@
             "use_when": "Use this only when semantic scrolling is insufficient or you need an exact gesture path."
           },
           {
+            "description": "Send two to five pointer paths as one atomic emulator gRPC gesture.",
+            "group": "raw-input",
+            "name": "android.input.multi_touch",
+            "read_only": false,
+            "use_when": "Use this for pinch, two-finger pan, or another gesture that must keep every pointer in the same device frame."
+          },
+          {
             "description": "Send a keyevent to the device.",
             "group": "raw-input",
             "name": "android.input.keyevent",
             "read_only": false,
             "use_when": "Use this for bounded low-level actions like Back or Enter when semantic tools are not the right fit."
+          },
+          {
+            "description": "Send a chorded key combination to the device.",
+            "group": "raw-input",
+            "name": "android.input.keycombination",
+            "read_only": false,
+            "use_when": "Use this for computer-use key chords such as Ctrl+C that must be dispatched atomically."
           },
           {
             "description": "Launch Solar Lab, open search, focus Earth, and capture step-by-step artifacts.",
@@ -259,7 +336,7 @@
         "description": "Purpose, scope, and current harness posture.",
         "mimeType": "text/markdown",
         "name": "about",
-        "size": 827,
+        "size": 825,
         "title": "Android Computer Use MCP",
         "uri": "android-computer-use-mcp://about"
       },
@@ -275,7 +352,7 @@
         "description": "Structured inventory of public Android and Solar Lab tools.",
         "mimeType": "application/json",
         "name": "tool-catalog",
-        "size": 9461,
+        "size": 12846,
         "title": "Android tool catalog",
         "uri": "android-computer-use-mcp://tool-catalog"
       },

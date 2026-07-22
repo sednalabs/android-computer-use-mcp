@@ -7,12 +7,13 @@
   "description": "Codex-oriented bridge helpers for android-computer-use-mcp.",
   "main": "./index.js",
   "bin": {
-    "codex-android-observe": "./bin/codex-android-observe.mjs"
+    "codex-android-observe": "./bin/codex-android-observe.mjs",
+    "codex-android-tools": "./bin/codex-android-tools.mjs"
   },
   "exports": {
     ".": "./index.js"
   },
   "scripts": {
-    "test": "node --test ./index.test.mjs ./codex_thread_items.test.mjs"
+    "test": "node --test ./index.test.mjs ./cli_common.test.mjs ./codex_thread_items.test.mjs ./codex_dynamic_tools.test.mjs ./provider_manifest.test.mjs"
   }
 }

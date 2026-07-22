@@ -108,6 +108,85 @@ test("launchApp throws when postcondition is not satisfied", async () => {
   );
 });
 
+test("runtime exposes harvested app control and posture helpers", async () => {
+  const calls = [];
+  const runtime = createAndroidEmulatorRuntime({
+    callMcp: async (toolName, args) => {
+      calls.push({ toolName, args });
+      return { ok: true, postcondition: { satisfied: true } };
+    },
+  });
+  await runtime.setSerial("emulator-5554");
+
+  await runtime.listApps({ launcherOnly: false });
+  await runtime.openUrl("https://example.test", { waitForPackage: "com.android.chrome" });
+  await runtime.setOrientation("landscape", { timeoutSecs: 8 });
+  await runtime.terminateApp("com.example.app");
+
+  assert.deepEqual(
+    calls.map((call) => call.toolName),
+    [
+      "android.list_apps",
+      "android.open_url",
+      "android.set_orientation",
+      "android.terminate_app",
+    ],
+  );
+  assert.equal(calls[0].args.launcher_only, false);
+  assert.equal(calls[1].args.wait_for_package, "com.android.chrome");
+  assert.equal(calls[2].args.orientation, "landscape");
+  assert.equal(calls[2].args.timeout_secs, 8);
+  assert.equal(calls[3].args.package_name, "com.example.app");
+});
+
+test("runtime exposes raw longPress helper", async () => {
+  let longPressCall = null;
+  const runtime = createAndroidEmulatorRuntime({
+    callMcp: async (toolName, args) => {
+      if (toolName === "android.input.long_press") {
+        longPressCall = { toolName, args };
+        return { ok: true, postcondition: { satisfied: true } };
+      }
+      throw new Error(`unexpected tool call: ${toolName}`);
+    },
+  });
+  await runtime.setSerial("emulator-5554");
+
+  await runtime.longPress(120, 240, { durationMs: 900, waitForSelector: { text: "Menu" } });
+
+  assert.equal(longPressCall.toolName, "android.input.long_press");
+  assert.equal(longPressCall.args.x, 120);
+  assert.equal(longPressCall.args.y, 240);
+  assert.equal(longPressCall.args.duration_ms, 900);
+  assert.deepEqual(longPressCall.args.wait_for_selector, { text: "Menu" });
+});
+
+test("runtime exposes atomic multiTouch helper", async () => {
+  let multiTouchCall = null;
+  const runtime = createAndroidEmulatorRuntime({
+    callMcp: async (toolName, args) => {
+      if (toolName === "android.input.multi_touch") {
+        multiTouchCall = { toolName, args };
+        return { ok: true, capability: { status: "supported" } };
+      }
+      throw new Error(`unexpected tool call: ${toolName}`);
+    },
+  });
+  await runtime.setSerial("emulator-5554");
+  const pointers = [
+    { x1: 400, y1: 800, x2: 300, y2: 800 },
+    { x1: 600, y1: 800, x2: 700, y2: 800 },
+  ];
+
+  await runtime.multiTouch(pointers, { durationMs: 420, timeoutSecs: 7 });
+
+  assert.equal(multiTouchCall.toolName, "android.input.multi_touch");
+  assert.equal(multiTouchCall.args.serial, "emulator-5554");
+  assert.deepEqual(multiTouchCall.args.pointers, pointers);
+  assert.equal(multiTouchCall.args.duration_ms, 420);
+  assert.equal(multiTouchCall.args.timeout_secs, 7);
+});
+
 test("typeIntoElement forwards timeout and stores stabilized hierarchy artifact", async () => {
   let typeIntoCall = null;
   const runtime = createAndroidEmulatorRuntime({
@@ -137,6 +216,30 @@ test("typeIntoElement forwards timeout and stores stabilized hierarchy artifact"
   assert.equal(typeIntoCall?.args?.timeout_secs, 9);
   assert.equal(typeIntoCall?.args?.hierarchy_filename, "custom-type.xml");
   assert.equal(runtime.getState().lastUiDumpPath, "/tmp/type-stable.xml");
+});
+
+test("semanticAction maps a focus target to the provider body_query field", async () => {
+  let semanticCall = null;
+  const runtime = createAndroidEmulatorRuntime({
+    callMcp: async (toolName, args) => {
+      if (toolName === "solarlab.semantic_action") {
+        semanticCall = { toolName, args };
+        return { ok: true, acknowledgment: { acknowledged: true } };
+      }
+      throw new Error(`unexpected tool call: ${toolName}`);
+    },
+  });
+  await runtime.setSerial("emulator-5554");
+
+  await runtime.semanticAction("focus_body", { target: "comet", timeout_secs: 9 });
+
+  assert.equal(semanticCall.toolName, "solarlab.semantic_action");
+  assert.deepEqual(semanticCall.args, {
+    serial: "emulator-5554",
+    action: "focus_body",
+    body_query: "comet",
+    timeout_secs: 9,
+  });
 });
 
 test("getToolLoadingPlan exposes eager bootstrap tools and deferred semantic tools", () => {

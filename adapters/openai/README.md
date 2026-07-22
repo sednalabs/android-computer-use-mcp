@@ -7,12 +7,12 @@ It keeps the MCP server as the Android control plane and exposes a small set of
 OpenAI-oriented helpers for:
 
 - persistent Android runtime state
+- Solar Lab review sessions
 - native Responses multimodal items
 - native `function_call_output` and `computer_call_output` envelopes
 - streamable HTTP MCP client helpers for live hosted sessions
 - OpenAI file-upload brokering for `file_id`-backed image and file items
-- a thin Responses loop driver for multimodal Android observation
-- optional app-specific scenario review helpers
+- a thin Responses loop driver for GPT-5.4-style Android observation
 
 The important boundary is:
 
@@ -21,8 +21,8 @@ The important boundary is:
 
 ## Why this exists
 
-Multimodal Responses loops can reason over screenshots returned from a tool
-loop, but the clean contract is through Responses items such as:
+GPT-5.4 can reason natively over screenshots returned from a tool loop, but the
+documented path is through Responses items such as:
 
 - `input_image`
 - `input_file`
@@ -70,7 +70,7 @@ the runner itself to make direct OpenAI Responses API calls:
 
 ## Screenshot fidelity default
 
-Screenshot-return helpers default to `detail: "original"` so the loop receives
-the full-resolution image unless a caller deliberately lowers fidelity. When the
+Screenshot-return helpers default to `detail: "original"` so GPT-5.4 sees the
+full-resolution image unless a caller deliberately lowers fidelity. When the
 host enables upload brokering, image items can also prefer uploaded `file_id`
 references instead of inline data URLs.

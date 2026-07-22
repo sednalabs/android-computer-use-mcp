@@ -1,6 +1,6 @@
 //! # android-computer-use-mcp
 //!
-//! Local Android emulator MCP server for ADB-first automation and artifact capture.
+//! Local Android computer-use MCP server for ADB-first automation and artifact capture.
 //!
 //! ## Rationale
 //! Keep the harness slice small, explicit, and reusable:
