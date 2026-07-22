@@ -77,16 +77,6 @@ jobs:
       - name: Run Android MCP contract tests
         run: ANDROID_COMPUTER_USE_MCP_SDK_ROOT="${ANDROID_HOME}" cargo test --locked
 
-      - name: Enable KVM for hosted Android smoke
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
-          test -r /dev/kvm
-          test -w /dev/kvm
-
       - name: Assert screenshot tools return native image content
         # reactivecircus/android-emulator-runner v2
         uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
@@ -101,7 +91,7 @@ jobs:
           arch: x86_64
           profile: pixel_7
           disable-animations: true
-          disable-linux-hw-accel: false
+          disable-linux-hw-accel: auto
           emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot-save -noaudio -no-boot-anim -camera-back none
           script: sh "${GITHUB_WORKSPACE}/scripts/run_android_image_content_smoke.sh"
 
