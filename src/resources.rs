@@ -97,7 +97,7 @@ fn build_about_text() -> String {
         "- Hosted interactive-session tools can reuse a live runner-backed emulator without rebuilding or rebooting it for each new APK.",
         "- Semantic Android tools are the preferred interaction lane.",
         "- Raw input tools remain available as fallback when semantic selection is insufficient.",
-        "- Solar Lab scenarios are first-class tools rather than private hand-assembled scripts.",
+        "- Optional scenario tools provide durable examples above the generic Android surface.",
         "",
         "Contract:",
         "- Public tool exposure is governed by explicit tool inventory registration.",

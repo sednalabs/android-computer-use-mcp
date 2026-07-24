@@ -12,20 +12,22 @@ backend details such as ADB and emulator gRPC remain implementation details.
 
 ## What It Provides
 
-- Emulator lifecycle tools for AVD discovery, launch, readiness, app install, and
-  app launch.
+- Emulator lifecycle and app-control tools for AVD discovery, launch, readiness,
+  app install, package discovery, app launch/termination, URL intents, and
+  orientation control.
 - Observation tools for screenshots, UIAutomator XML, normalized UI summaries,
   stable-window waits, and logcat capture.
 - Semantic UI tools for selector-based find, wait, tap, text entry, and scrolling
   with verified postconditions.
-- Raw Android input tools for coordinate taps, text, swipes, and key events when
-  semantic selectors are not enough.
+- Raw Android input tools for coordinate taps, double taps, long presses, text,
+  swipes, atomic multi-touch gestures, and key chords when semantic selectors
+  are not enough.
 - Hosted interactive-session helpers for runner-backed APK install and relaunch
   workflows.
 - Optional domain scenario tools that demonstrate how app-specific flows can sit
   on top of the generic Android control surface.
-- Adapter packages for Codex-style thread item packaging and standalone OpenAI
-  Responses loops.
+- Adapter packages for native-shaped Codex Android tools, provider manifests,
+  thread item packaging, and standalone OpenAI Responses loops.
 
 ## Documentation
 
@@ -40,8 +42,10 @@ backend details such as ADB and emulator gRPC remain implementation details.
 - `src/` contains the Rust MCP server, Android tool implementations, local HTTP
   runtime, resources, verification helpers, and tool inventory.
 - `spec/` contains committed MCP schema and resource catalog snapshots.
-- `adapters/codex/` packages Android observations as Codex-compatible raw
-  Responses/thread items without making direct OpenAI API calls.
+- `adapters/codex/` exposes native-shaped observe, step, and hosted-build tools,
+  publishes provider metadata, and packages Android observations as
+  Codex-compatible raw Responses/thread items without making direct OpenAI API
+  calls.
 - `adapters/openai/` contains standalone OpenAI Responses helper utilities,
   Streamable HTTP MCP client helpers, file upload brokering, and a thin loop
   driver.
@@ -95,11 +99,21 @@ environment variables include:
 - `ANDROID_COMPUTER_USE_MCP_HTTP_MAX_SESSIONS`
 - `ANDROID_COMPUTER_USE_MCP_HTTP_CHANNEL_CAPACITY`
 - `ANDROID_COMPUTER_USE_MCP_HTTP_ALLOW_RESUME`
+- `ANDROID_COMPUTER_USE_MCP_ENVIRONMENT_ID` (defaults to `local`)
+- `ANDROID_COMPUTER_USE_MCP_PROVIDER_INSTANCE_ID` (defaults to
+  `android-computer-use-mcp`)
+- `ANDROID_COMPUTER_USE_MCP_SESSION_ID` (defaults to `default`)
 - `ANDROID_COMPUTER_USE_MCP_INTERACTIVE_SESSION_ROOT`
 - `ANDROID_COMPUTER_USE_MCP_INTERACTIVE_SESSION_GITHUB_REPOSITORY`
 - `ANDROID_COMPUTER_USE_MCP_INTERACTIVE_SESSION_APP_PACKAGE`
 - `ANDROID_COMPUTER_USE_MCP_INTERACTIVE_SESSION_APP_ACTIVITY`
 - `ANDROID_COMPUTER_USE_MCP_INTERACTIVE_SESSION_GITHUB_TOKEN`
+
+For concurrently hosted candidates, give all three execution-identity values
+distinct, stable values before exposing the provider. `android.resolve_target`
+validates a caller-supplied identity and serial against that configured tuple;
+it rejects a stale or different live session instead of silently selecting a
+global current device.
 
 The default HTTP bind address is `127.0.0.1:9526`. Non-loopback bind addresses
 are rejected by configuration validation in this release line.
@@ -109,16 +123,22 @@ are rejected by configuration validation in this release line.
 The committed schema snapshot currently includes these public tool groups:
 
 - Core health and discovery: `android.health`, `android.list_avds`,
-  `android.list_devices`
+  `android.list_devices`, `android.resolve_target`
 - Emulator lifecycle: `android.launch_avd`, `android.launch_avd_and_wait`,
-  `android.wait_for_boot`, `android.install_apk`, `android.launch_app`
+  `android.wait_for_boot`
+- App and device control: `android.install_apk`, `android.launch_app`,
+  `android.list_apps`, `android.terminate_app`, `android.uninstall_app`,
+  `android.open_url`, `android.get_orientation`, `android.set_orientation`
 - Observation: `android.capture_screenshot`, `android.dump_ui_hierarchy`,
-  `android.collect_logcat`, `android.inspect_ui`, `android.wait_for_stable_ui`
+  `android.read_artifact`, `android.collect_logcat`, `android.inspect_ui`,
+  `android.wait_for_stable_ui`
 - Semantic UI: `android.find_ui_element`, `android.wait_for_ui_element`,
   `android.tap_element`, `android.type_into_element`,
   `android.scroll_until_visible`
-- Raw input: `android.input.tap`, `android.input.text`, `android.input.swipe`,
-  `android.input.keyevent`
+- Raw input: `android.input.tap`, `android.input.double_tap`,
+  `android.input.long_press`, `android.input.text`, `android.input.swipe`,
+  `android.input.multi_touch`, `android.input.keyevent`,
+  `android.input.keycombination`
 - Hosted interactive session: `interactive_session.get_status`,
   `interactive_session.get_current_build`,
   `interactive_session.install_build_from_run`,
@@ -144,16 +164,25 @@ usable endpoint is discovered or configured:
 - if a `grpc.token` is published, the MCP attaches the required bearer token
 - if `ANDROID_COMPUTER_USE_MCP_EMULATOR_GRPC_PORT` is set, launched emulators include
   `-grpc <port>`
-- if gRPC is unavailable or unhealthy, the MCP falls back to ADB
+- if gRPC is unavailable or unhealthy, single-pointer operations fall back to
+  ADB; atomic multi-touch fails explicitly instead of degrading into sequential
+  gestures
 
 This keeps the tool contract stable while allowing lower-latency local emulator
 control where it is available.
 
 ## Adapter Packages
 
-The Codex adapter in `adapters/codex/` produces Codex-compatible raw Responses
+The Codex adapter in `adapters/codex/` exposes native-shaped `android_observe`,
+`android_step`, and `android_install_build_from_run` operations, produces a
+provider manifest, and converts results into Codex-compatible raw Responses
 items and `thread/inject_items` payloads. It does not make direct OpenAI API
 calls and does not require `OPENAI_API_KEY`.
+
+Provider manifest schema v5 carries the exact environment, provider-instance,
+and session identity tuple. Persisted v4 manifests must be regenerated before
+validation or use; this metadata migration is separate from the legacy
+tool-input translation retained by `android_install_build_from_run`.
 
 The OpenAI adapter in `adapters/openai/` is a standalone helper layer for direct
 Responses API loops. It packages screenshots as `input_image` content and XML,

@@ -1,6 +1,6 @@
 //! # android-computer-use-mcp Main
 //!
-//! Entrypoint for the local loopback Streamable HTTP Android emulator MCP server.
+//! Entrypoint for the local loopback Streamable HTTP Android computer-use MCP server.
 //!
 //! ## Rationale
 //! Start with the smallest reliable long-lived MCP transport surface for local Android UX automation:

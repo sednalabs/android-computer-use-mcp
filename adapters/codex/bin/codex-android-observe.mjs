@@ -6,6 +6,12 @@ import { promises as fs } from "node:fs";
 import { createAndroidEmulatorRuntime } from "../../../docs/examples/android_emulator_runtime_client.js";
 import { createMcpStreamableHttpClient } from "../../openai/mcp_streamable_http_client.js";
 import {
+  loadCodexAdapterConfig,
+  requiredOptionValue,
+  resolveMcpHeaders,
+  resolveMcpUrl,
+} from "../cli_common.js";
+import {
   contextFromObservation,
   createCodexThreadItemsAdapter,
 } from "../index.js";
@@ -43,34 +49,34 @@ function parseArgs(argv) {
     const arg = argv[index];
     switch (arg) {
       case "--config":
-        parsed.configPath = argv[++index];
+        parsed.configPath = requiredOptionValue(argv, index++);
         break;
       case "--mcp-url":
-        parsed.mcpUrl = argv[++index];
+        parsed.mcpUrl = requiredOptionValue(argv, index++);
         break;
       case "--mcp-header":
-        parsed.mcpHeaders.push(argv[++index]);
+        parsed.mcpHeaders.push(requiredOptionValue(argv, index++));
         break;
       case "--serial":
-        parsed.serial = argv[++index];
+        parsed.serial = requiredOptionValue(argv, index++);
         break;
       case "--caption":
-        parsed.caption = argv[++index];
+        parsed.caption = requiredOptionValue(argv, index++);
         break;
       case "--role":
-        parsed.role = argv[++index];
+        parsed.role = requiredOptionValue(argv, index++);
         break;
       case "--mode":
-        parsed.mode = argv[++index];
+        parsed.mode = requiredOptionValue(argv, index++);
         break;
       case "--thread-id":
-        parsed.threadId = argv[++index];
+        parsed.threadId = requiredOptionValue(argv, index++);
         break;
       case "--instant":
         parsed.stable = false;
         break;
       case "--output-json":
-        parsed.outputJson = argv[++index];
+        parsed.outputJson = requiredOptionValue(argv, index++);
         break;
       case "-h":
       case "--help":
@@ -82,25 +88,6 @@ function parseArgs(argv) {
   }
 
   return parsed;
-}
-
-function parseHeaders(headerArgs) {
-  const headers = {};
-  for (const headerArg of headerArgs) {
-    const separator = headerArg.indexOf("=");
-    if (separator <= 0) {
-      throw new Error(`Invalid --mcp-header value: ${headerArg}`);
-    }
-    headers[headerArg.slice(0, separator)] = headerArg.slice(separator + 1);
-  }
-  return headers;
-}
-
-async function loadConfig(configPath) {
-  if (!configPath) {
-    return {};
-  }
-  return JSON.parse(await fs.readFile(configPath, "utf8"));
 }
 
 async function writeJson(filePath, value) {
@@ -115,13 +102,22 @@ async function main() {
     return;
   }
 
-  const config = await loadConfig(args.configPath);
-  const endpoint = args.mcpUrl ?? config.mcp_url;
+  const config = await loadCodexAdapterConfig({
+    configPath: args.configPath,
+  });
+  const endpoint = resolveMcpUrl({
+    explicitUrl: args.mcpUrl,
+    config,
+  });
   if (!endpoint) {
-    throw new Error("codex-android-observe requires --mcp-url or --config with mcp_url");
+    throw new Error(
+      "codex-android-observe requires --mcp-url, a config with mcp_url, or CODEX_ANDROID_MCP_URL/CODEX_ANDROID_MCP_HOSTNAME",
+    );
   }
 
-  const customHeaders = parseHeaders(args.mcpHeaders);
+  const customHeaders = resolveMcpHeaders({
+    headerArgs: args.mcpHeaders,
+  });
   const defaultSerial = args.serial ?? config.default_serial ?? null;
   const caption = args.caption ?? "Hosted Android observation";
   const mode = args.mode ?? "message";

@@ -11,12 +11,24 @@ function createRuntimeStub() {
       calls.push({ fn: "tap", x, y, options });
       return { ok: true };
     },
+    async doubleTap(x, y, options = {}) {
+      calls.push({ fn: "doubleTap", x, y, options });
+      return { ok: true };
+    },
+    async longPress(x, y, options = {}) {
+      calls.push({ fn: "longPress", x, y, options });
+      return { ok: true };
+    },
     async swipe(x1, y1, x2, y2, options = {}) {
       calls.push({ fn: "swipe", x1, y1, x2, y2, options });
       return { ok: true };
     },
     async keyevent(keycode, options = {}) {
       calls.push({ fn: "keyevent", keycode, options });
+      return { ok: true };
+    },
+    async keyCombination(keycodes, options = {}) {
+      calls.push({ fn: "keyCombination", keycodes, options });
       return { ok: true };
     },
     async typeText(text, options = {}) {
@@ -72,6 +84,74 @@ test("executeActionBatch maps click coordinates through the current zoomed regio
     x: 300,
     y: 600,
     options: {},
+  });
+});
+
+test("executeActionBatch uses runtime doubleTap for double_click gestures", async () => {
+  const runtime = createRuntimeStub();
+  const bridge = createAndroidComputerBridge({
+    runtime,
+    deviceWidth: 1000,
+    deviceHeight: 2000,
+    frameWidth: 500,
+    frameHeight: 1000,
+  });
+
+  bridge.setZoomRegion({ left: 100, top: 200, width: 400, height: 800 });
+  await bridge.executeActionBatch([{ type: "double_click", x: 250, y: 500 }]);
+
+  assert.deepEqual(runtime.calls[0], {
+    fn: "doubleTap",
+    x: 300,
+    y: 600,
+    options: {},
+  });
+});
+
+test("executeActionBatch uses runtime longPress for long_press gestures", async () => {
+  const runtime = createRuntimeStub();
+  const bridge = createAndroidComputerBridge({
+    runtime,
+    deviceWidth: 1000,
+    deviceHeight: 2000,
+    frameWidth: 500,
+    frameHeight: 1000,
+  });
+
+  bridge.setZoomRegion({ left: 100, top: 200, width: 400, height: 800 });
+  await bridge.executeActionBatch([
+    { type: "long_press", x: 250, y: 500, duration_ms: 900, timeout_secs: 6 },
+  ]);
+
+  assert.deepEqual(runtime.calls[0], {
+    fn: "longPress",
+    x: 300,
+    y: 600,
+    options: { durationMs: 900, waitForSelector: null, timeoutSecs: 6 },
+  });
+});
+
+test("executeActionBatch uses runtime keyCombination for multi-key keypress actions", async () => {
+  const runtime = createRuntimeStub();
+  const bridge = createAndroidComputerBridge({
+    runtime,
+    deviceWidth: 1000,
+    deviceHeight: 2000,
+  });
+
+  await bridge.executeActionBatch([
+    {
+      type: "keypress",
+      keys: ["Ctrl", "c"],
+      keyMap: { Ctrl: "CTRL_LEFT", c: "C" },
+      keyOptions: { timeoutSecs: 7 },
+    },
+  ]);
+
+  assert.deepEqual(runtime.calls[0], {
+    fn: "keyCombination",
+    keycodes: ["CTRL_LEFT", "C"],
+    options: { timeoutSecs: 7 },
   });
 });
 

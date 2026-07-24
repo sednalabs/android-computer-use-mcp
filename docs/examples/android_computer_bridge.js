@@ -110,9 +110,26 @@ export function createAndroidComputerBridge({
       }
       case "double_click": {
         const point = remapPoint(action.x, action.y);
-        const first = await runtime.tap(point.x, point.y, action.tapOptions ?? {});
-        const second = await runtime.tap(point.x, point.y, action.tapOptions ?? {});
-        return { type: action.type, devicePoint: point, result: { first, second } };
+        const result = typeof runtime.doubleTap === "function"
+          ? await runtime.doubleTap(point.x, point.y, action.tapOptions ?? {})
+          : {
+              first: await runtime.tap(point.x, point.y, action.tapOptions ?? {}),
+              second: await runtime.tap(point.x, point.y, action.tapOptions ?? {}),
+              fallback: "runtime.doubleTap unavailable; dispatched as two tap actions",
+            };
+        return { type: action.type, devicePoint: point, result };
+      }
+      case "long_press": {
+        const point = remapPoint(action.x, action.y);
+        if (typeof runtime.longPress !== "function") {
+          throw new Error("runtime.longPress is unavailable");
+        }
+        const result = await runtime.longPress(point.x, point.y, {
+          durationMs: action.duration_ms ?? 500,
+          waitForSelector: action.wait_for_selector ?? null,
+          timeoutSecs: action.timeout_secs ?? 5,
+        });
+        return { type: action.type, devicePoint: point, result };
       }
       case "drag": {
         const start = remapPoint(action.x1, action.y1);
@@ -148,6 +165,11 @@ export function createAndroidComputerBridge({
       case "keypress": {
         const keys = Array.isArray(action.keys) ? action.keys : [];
         const results = [];
+        if (keys.length > 1 && typeof runtime.keyCombination === "function") {
+          const keycodes = keys.map((key) => action.keyMap?.[key] ?? key);
+          results.push(await runtime.keyCombination(keycodes, action.keyOptions ?? {}));
+          return { type: action.type, keys, result: results };
+        }
         for (const key of keys) {
           if (key.length === 1 && /[ -~]/.test(key)) {
             results.push(await runtime.typeText(key, action.typeOptions ?? {}));

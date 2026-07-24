@@ -78,6 +78,9 @@ jobs:
           file: coverage/rust.xml
           language: Rust
           label: code-coverage/rust
+          # Keep the portable Cobertura artifact available when this optional
+          # repository integration is unavailable.
+          fail-on-error: false
 
       - name: Upload Cobertura report
         # actions/upload-artifact v7

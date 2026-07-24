@@ -18,8 +18,8 @@ use tokio::time::sleep;
 use crate::McpError;
 use crate::server::AndroidEmulatorMcp;
 use crate::tools::{
-    AndroidWindowState, filename_or_timestamp, has_meaningful_observation_budget, remaining_until,
-    remove_artifact_if_exists,
+    AndroidWindowState, filename_or_timestamp, has_meaningful_observation_budget,
+    is_command_timeout_error, remaining_until, remove_artifact_if_exists,
 };
 use crate::ui::{
     NormalizedUiNode, SelectionFailure, SelectorCandidateSummary, UiBounds, UiSelector,
@@ -154,12 +154,36 @@ pub(crate) struct ToolPostconditionRequest<'a> {
     pub(crate) artifact_prefix: &'a str,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolPostconditionEvidenceSource {
+    WindowState,
+    UiHierarchy,
+}
+
+impl ToolPostconditionEvidenceSource {
+    pub(crate) fn for_launch(wait_for_selector_present: bool) -> Self {
+        if wait_for_selector_present {
+            Self::UiHierarchy
+        } else {
+            Self::WindowState
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::WindowState => "window_state",
+            Self::UiHierarchy => "ui_hierarchy",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ToolPostconditionResult {
     pub(crate) requested: bool,
     pub(crate) satisfied: bool,
     pub(crate) timed_out: bool,
     pub(crate) elapsed_ms: u128,
+    pub(crate) evidence_source: Option<ToolPostconditionEvidenceSource>,
     pub(crate) hierarchy_path: Option<String>,
     pub(crate) screenshot_path: Option<String>,
     pub(crate) observed_activity: Option<String>,
@@ -634,6 +658,101 @@ impl AndroidEmulatorMcp {
         })
     }
 
+    pub(crate) async fn wait_for_window_state_postcondition(
+        &self,
+        serial: &str,
+        wait_for_activity: Option<&str>,
+        wait_for_package: Option<&str>,
+        deadline: Instant,
+    ) -> Result<ToolPostconditionResult, McpError> {
+        let requested = wait_for_activity.is_some() || wait_for_package.is_some();
+        if !requested {
+            return Ok(ToolPostconditionResult {
+                requested: false,
+                satisfied: true,
+                timed_out: false,
+                elapsed_ms: 0,
+                evidence_source: None,
+                hierarchy_path: None,
+                screenshot_path: None,
+                observed_activity: None,
+                observed_package: None,
+                node: None,
+                match_count: 0,
+                selected_match_index: None,
+                candidate_summary: Vec::new(),
+            });
+        }
+
+        let poll_interval = Duration::from_millis(250);
+        let started = Instant::now();
+        let mut last_result = ToolPostconditionResult {
+            requested: true,
+            satisfied: false,
+            timed_out: false,
+            elapsed_ms: 0,
+            evidence_source: Some(ToolPostconditionEvidenceSource::WindowState),
+            hierarchy_path: None,
+            screenshot_path: None,
+            observed_activity: None,
+            observed_package: None,
+            node: None,
+            match_count: 0,
+            selected_match_index: None,
+            candidate_summary: Vec::new(),
+        };
+
+        while Instant::now() < deadline {
+            if !has_meaningful_observation_budget(deadline) {
+                break;
+            }
+            let window_state = match tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                self.window_state_internal_with_timeout(serial, remaining_until(deadline)),
+            )
+            .await
+            {
+                Ok(Ok(state)) => state,
+                Ok(Err(error)) if is_command_timeout_error(&error) => break,
+                Ok(Err(error)) => return Err(error),
+                Err(_) => break,
+            };
+            let (observed_activity, observed_package, satisfied) =
+                window_state_postcondition_matches(
+                    &window_state,
+                    wait_for_activity,
+                    wait_for_package,
+                );
+            last_result = ToolPostconditionResult {
+                requested: true,
+                satisfied,
+                timed_out: false,
+                elapsed_ms: started.elapsed().as_millis(),
+                evidence_source: Some(ToolPostconditionEvidenceSource::WindowState),
+                hierarchy_path: None,
+                screenshot_path: None,
+                observed_activity,
+                observed_package,
+                node: None,
+                match_count: 0,
+                selected_match_index: None,
+                candidate_summary: Vec::new(),
+            };
+            if satisfied {
+                return Ok(last_result);
+            }
+
+            if remaining_until(deadline) <= poll_interval {
+                break;
+            }
+            sleep(poll_interval).await;
+        }
+
+        last_result.timed_out = true;
+        last_result.elapsed_ms = started.elapsed().as_millis();
+        Ok(last_result)
+    }
+
     pub(crate) async fn wait_for_tool_postcondition(
         &self,
         request: ToolPostconditionRequest<'_>,
@@ -656,6 +775,7 @@ impl AndroidEmulatorMcp {
                 satisfied: true,
                 timed_out: false,
                 elapsed_ms: 0,
+                evidence_source: None,
                 hierarchy_path: None,
                 screenshot_path: None,
                 observed_activity: None,
@@ -678,6 +798,7 @@ impl AndroidEmulatorMcp {
             satisfied: false,
             timed_out: false,
             elapsed_ms: 0,
+            evidence_source: Some(ToolPostconditionEvidenceSource::UiHierarchy),
             hierarchy_path: None,
             screenshot_path: None,
             observed_activity: None,
@@ -733,24 +854,12 @@ impl AndroidEmulatorMcp {
                 break;
             };
             remove_artifact_if_exists(last_result.hierarchy_path.clone()).await;
-            let observed_activity = observation.window_state.resumed_activity.clone();
-            let observed_package = derive_observed_package(&observation.window_state);
-            let activity_ok = wait_for_activity
-                .map(|wanted| {
-                    observed_activity
-                        .as_deref()
-                        .map(|candidate| activity_matches(candidate, wanted))
-                        .unwrap_or(false)
-                })
-                .unwrap_or(true);
-            let package_ok = wait_for_package
-                .map(|wanted| {
-                    observed_package
-                        .as_deref()
-                        .map(|candidate| candidate.contains(wanted))
-                        .unwrap_or(false)
-                })
-                .unwrap_or(true);
+            let (observed_activity, observed_package, window_state_ok) =
+                window_state_postcondition_matches(
+                    &observation.window_state,
+                    wait_for_activity,
+                    wait_for_package,
+                );
             let (node, match_count, selected_match_index, candidate_summary, selector_ok) =
                 if let Some(selector) = selector {
                     let matches = matching_nodes(&observation.nodes, selector).matches;
@@ -786,12 +895,13 @@ impl AndroidEmulatorMcp {
                 } else {
                     (None, 0, None, Vec::new(), true)
                 };
-            let satisfied = selector_ok && activity_ok && package_ok;
+            let satisfied = selector_ok && window_state_ok;
             last_result = ToolPostconditionResult {
                 requested: true,
                 satisfied,
                 timed_out: false,
                 elapsed_ms: started.elapsed().as_millis(),
+                evidence_source: Some(ToolPostconditionEvidenceSource::UiHierarchy),
                 hierarchy_path: Some(observation.hierarchy_path.display().to_string()),
                 screenshot_path: observation
                     .screenshot_path
@@ -871,6 +981,7 @@ pub(crate) fn tool_postcondition_json(result: &ToolPostconditionResult) -> serde
         "satisfied": result.satisfied,
         "timed_out": result.timed_out,
         "elapsed_ms": result.elapsed_ms,
+        "evidence_source": result.evidence_source.map(ToolPostconditionEvidenceSource::as_str),
         "artifacts": {
             "hierarchy_path": result.hierarchy_path,
             "screenshot_path": result.screenshot_path,
@@ -1302,6 +1413,37 @@ pub(crate) fn derive_observed_package(window_state: &AndroidWindowState) -> Opti
     .find_map(component_package_name)
 }
 
+fn window_state_postcondition_matches(
+    window_state: &AndroidWindowState,
+    wait_for_activity: Option<&str>,
+    wait_for_package: Option<&str>,
+) -> (Option<String>, Option<String>, bool) {
+    let observed_activity = window_state.resumed_activity.clone();
+    let observed_package = derive_observed_package(window_state);
+    let activity_ok = wait_for_activity
+        .map(|wanted| {
+            observed_activity
+                .as_deref()
+                .map(|candidate| activity_matches(candidate, wanted))
+                .unwrap_or(false)
+        })
+        .unwrap_or(true);
+    let package_ok = wait_for_package
+        .map(|wanted| {
+            observed_package
+                .as_deref()
+                .map(|candidate| candidate.contains(wanted))
+                .unwrap_or(false)
+        })
+        .unwrap_or(true);
+
+    (
+        observed_activity,
+        observed_package,
+        activity_ok && package_ok,
+    )
+}
+
 fn component_package_name(component: &str) -> Option<String> {
     let package = component.split('/').next()?.trim();
     (!package.is_empty()).then(|| package.to_string())
@@ -1378,10 +1520,14 @@ fn bounds_look_like_same_control(original: &UiBounds, candidate: &UiBounds) -> b
 #[cfg(test)]
 mod tests {
     use super::{
-        activity_matches, component_activity_identity, infer_unique_package_name,
+        ToolPostconditionEvidenceSource, ToolPostconditionResult, activity_matches,
+        component_activity_identity, infer_unique_package_name,
         should_refresh_semantic_observation, should_refresh_tool_postcondition_observation,
+        tool_postcondition_json, window_state_postcondition_matches,
     };
+    use crate::tools::AndroidWindowState;
     use crate::ui::NormalizedUiNode;
+    use serde_json::json;
 
     fn node_with_package(package_name: Option<&str>) -> NormalizedUiNode {
         NormalizedUiNode {
@@ -1559,5 +1705,113 @@ mod tests {
             "com.sednalabs.solarlab/.SearchActivity",
             "com.sednalabs.solarlab.MainActivity"
         ));
+    }
+
+    #[test]
+    fn window_state_postcondition_accepts_matching_resumed_activity_and_package() {
+        let window_state = AndroidWindowState {
+            current_focus: Some("com.sednalabs.solarlab/.MainActivity".to_string()),
+            focused_app: Some("com.sednalabs.solarlab/.MainActivity".to_string()),
+            resumed_activity: Some("com.sednalabs.solarlab/.MainActivity".to_string()),
+            input_method_visible: false,
+            input_method_target: None,
+        };
+
+        let (activity, package, satisfied) = window_state_postcondition_matches(
+            &window_state,
+            Some(".MainActivity"),
+            Some("com.sednalabs.solarlab"),
+        );
+
+        assert!(satisfied);
+        assert_eq!(
+            activity.as_deref(),
+            Some("com.sednalabs.solarlab/.MainActivity")
+        );
+        assert_eq!(package.as_deref(), Some("com.sednalabs.solarlab"));
+    }
+
+    #[test]
+    fn window_state_postcondition_rejects_a_wrong_resumed_package() {
+        let window_state = AndroidWindowState {
+            current_focus: Some("com.android.settings/.Settings".to_string()),
+            focused_app: Some("com.android.settings/.Settings".to_string()),
+            resumed_activity: Some("com.android.settings/.Settings".to_string()),
+            input_method_visible: false,
+            input_method_target: None,
+        };
+
+        let (_, package, satisfied) =
+            window_state_postcondition_matches(&window_state, None, Some("com.sednalabs.solarlab"));
+
+        assert!(!satisfied);
+        assert_eq!(package.as_deref(), Some("com.android.settings"));
+
+        let missing_window_state = AndroidWindowState {
+            current_focus: None,
+            focused_app: None,
+            resumed_activity: None,
+            input_method_visible: false,
+            input_method_target: None,
+        };
+        let (_, package, satisfied) = window_state_postcondition_matches(
+            &missing_window_state,
+            None,
+            Some("com.sednalabs.solarlab"),
+        );
+        assert!(!satisfied);
+        assert_eq!(package, None);
+    }
+
+    #[test]
+    fn launch_postcondition_uses_hierarchy_only_for_selector_proof() {
+        assert_eq!(
+            ToolPostconditionEvidenceSource::for_launch(false),
+            ToolPostconditionEvidenceSource::WindowState
+        );
+        assert_eq!(
+            ToolPostconditionEvidenceSource::for_launch(true),
+            ToolPostconditionEvidenceSource::UiHierarchy
+        );
+    }
+
+    #[test]
+    fn window_state_postcondition_serializes_readiness_without_ui_artifacts() {
+        let result = ToolPostconditionResult {
+            requested: true,
+            satisfied: true,
+            timed_out: false,
+            elapsed_ms: 42,
+            evidence_source: Some(ToolPostconditionEvidenceSource::WindowState),
+            hierarchy_path: None,
+            screenshot_path: None,
+            observed_activity: Some("com.sednalabs.solarlab/.MainActivity".to_string()),
+            observed_package: Some("com.sednalabs.solarlab".to_string()),
+            node: None,
+            match_count: 0,
+            selected_match_index: None,
+            candidate_summary: Vec::new(),
+        };
+
+        assert_eq!(
+            tool_postcondition_json(&result),
+            json!({
+                "requested": true,
+                "satisfied": true,
+                "timed_out": false,
+                "elapsed_ms": 42,
+                "evidence_source": "window_state",
+                "artifacts": {
+                    "hierarchy_path": null,
+                    "screenshot_path": null,
+                },
+                "observed_activity": "com.sednalabs.solarlab/.MainActivity",
+                "observed_package": "com.sednalabs.solarlab",
+                "match_count": 0,
+                "selected_match_index": null,
+                "candidate_summary": [],
+                "node": null,
+            })
+        );
     }
 }

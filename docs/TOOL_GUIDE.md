@@ -7,11 +7,12 @@ should normally use them.
 ## Recommended Order
 
 1. Discover the harness state with `android.health`, `android.list_devices`, and
-   `android.list_avds`.
+   `android.list_avds`; use `android.resolve_target` when the caller must bind to
+   an exact hosted provider/session/device tuple.
 2. Launch or attach to a device with `android.launch_avd_and_wait` or
    `android.wait_for_boot`.
-3. Install and launch the target app with `android.install_apk` and
-   `android.launch_app`.
+3. Discover, install, and launch the target app with `android.list_apps`,
+   `android.install_apk`, and `android.launch_app`.
 4. Observe with `android.wait_for_stable_ui` or `android.inspect_ui`.
 5. Act with semantic tools such as `android.tap_element` and
    `android.type_into_element`.
@@ -24,6 +25,8 @@ should normally use them.
   directory state.
 - `android.list_avds` lists Android Virtual Devices known to the configured SDK.
 - `android.list_devices` lists attached or running Android devices.
+- `android.resolve_target` validates an exact environment, provider instance,
+  session, and device target before target-bound operations.
 
 ## Lifecycle
 
@@ -33,11 +36,22 @@ should normally use them.
 - `android.install_apk` installs an APK on a target device.
 - `android.launch_app` launches a package/activity and verifies requested
   postconditions when supplied.
+- `android.list_apps` lists installed packages, optionally limited to
+  launcher-visible apps.
+- `android.terminate_app` force-stops a package without uninstalling it.
+- `android.uninstall_app` removes a package from the target device.
+- `android.open_url` opens an HTTP or HTTPS URL through an Android intent.
+- `android.get_orientation` reports the current user rotation and normalized
+  orientation.
+- `android.set_orientation` disables automatic rotation and applies a requested
+  portrait or landscape posture.
 
 ## Observation
 
 - `android.capture_screenshot` writes a PNG artifact.
 - `android.dump_ui_hierarchy` writes a UIAutomator XML artifact.
+- `android.read_artifact` returns a previously generated artifact as bounded text
+  or base64 content for remote adapter use.
 - `android.collect_logcat` writes a logcat artifact.
 - `android.inspect_ui` captures a paired screenshot/UI dump with normalized UI
   state.
@@ -66,13 +80,22 @@ nodes are valid targets.
 ## Raw Input
 
 - `android.input.tap`
+- `android.input.double_tap`
+- `android.input.long_press`
 - `android.input.text`
 - `android.input.swipe`
+- `android.input.multi_touch`
 - `android.input.keyevent`
+- `android.input.keycombination`
 
 Raw input is useful for fallback control, but it should not be the first choice
 when a stable semantic selector exists. Raw actions can include postcondition
 checks so callers do not treat dispatch alone as proof of success.
+
+`android.input.multi_touch` is deliberately gRPC-only: a sequential ADB fallback
+would not preserve pointer atomicity. Double taps and key combinations are also
+dispatched as bounded device operations so timing-sensitive gestures and chords
+are not reconstructed as slow caller-side loops.
 
 ## Hosted Interactive Sessions
 
