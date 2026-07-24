@@ -3,26 +3,31 @@ import test from "node:test";
 
 import {
   isTransientHierarchyTimeout,
-  withTransientHierarchyRetry,
+  isTransientScreenshotTimeout,
+  withTransientObservationRetry,
 } from "./android_image_content_smoke.mjs";
 
-const rawAdbTimeout =
+const rawHierarchyTimeout =
   'tools/call failed: {"code":-32603,"message":"adb -s emulator-5554 exec-out uiautomator dump /dev/tty timed out after 20000 ms"}';
+const rawScreenshotTimeout =
+  'tools/call failed: {"code":-32603,"message":"adb -s emulator-5554 exec-out screencap -p timed out after 20000 ms"}';
 
-test("recognizes both hierarchy timeout messages emitted by the MCP server", () => {
-  assert.equal(isTransientHierarchyTimeout(new Error(rawAdbTimeout)), true);
+test("recognizes transient hierarchy and screenshot timeout messages", () => {
+  assert.equal(isTransientHierarchyTimeout(new Error(rawHierarchyTimeout)), true);
   assert.equal(isTransientHierarchyTimeout(new Error("UI hierarchy dump timed out")), true);
+  assert.equal(isTransientScreenshotTimeout(new Error(rawScreenshotTimeout)), true);
   assert.equal(isTransientHierarchyTimeout(new Error("unrelated request timed out after 20000 ms")), false);
+  assert.equal(isTransientScreenshotTimeout(new Error("unrelated request timed out after 20000 ms")), false);
 });
 
-test("retries a transient raw uiautomator timeout", async () => {
+test("retries transient observation timeouts", async () => {
   let attempts = 0;
-  const result = await withTransientHierarchyRetry(
-    "android.inspect_ui",
+  const result = await withTransientObservationRetry(
+    "android.capture_screenshot",
     async () => {
       attempts += 1;
       if (attempts === 1) {
-        throw new Error(rawAdbTimeout);
+        throw new Error(rawScreenshotTimeout);
       }
       return "ready";
     },
@@ -36,7 +41,7 @@ test("retries a transient raw uiautomator timeout", async () => {
 test("does not retry an unrelated failure", async () => {
   let attempts = 0;
   await assert.rejects(
-    withTransientHierarchyRetry(
+    withTransientObservationRetry(
       "android.inspect_ui",
       async () => {
         attempts += 1;

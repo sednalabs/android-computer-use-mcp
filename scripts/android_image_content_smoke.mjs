@@ -156,7 +156,16 @@ export function isTransientHierarchyTimeout(error) {
   );
 }
 
-export async function withTransientHierarchyRetry(
+export function isTransientScreenshotTimeout(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes("exec-out screencap -p") && message.includes("timed out after");
+}
+
+export function isTransientObservationTimeout(error) {
+  return isTransientHierarchyTimeout(error) || isTransientScreenshotTimeout(error);
+}
+
+export async function withTransientObservationRetry(
   name,
   operation,
   { attempts = 3, retryDelayMs = 1000 } = {},
@@ -165,20 +174,20 @@ export async function withTransientHierarchyRetry(
     try {
       return await operation();
     } catch (error) {
-      if (!isTransientHierarchyTimeout(error) || attempt === attempts) {
+      if (!isTransientObservationTimeout(error) || attempt === attempts) {
         throw error;
       }
       console.warn(
-        `${name} hierarchy capture timed out; retrying ${attempt + 1}/${attempts}`,
+        `${name} observation capture timed out; retrying ${attempt + 1}/${attempts}`,
       );
       await sleep(retryDelayMs);
     }
   }
-  throw new Error(`${name} hierarchy retry loop did not return a result`);
+  throw new Error(`${name} observation retry loop did not return a result`);
 }
 
-async function callToolWithTransientHierarchyRetry(name, args = {}) {
-  return withTransientHierarchyRetry(name, () => callToolRaw(name, args));
+async function callToolWithTransientObservationRetry(name, args = {}) {
+  return withTransientObservationRetry(name, () => callToolRaw(name, args));
 }
 
 async function main() {
@@ -217,7 +226,7 @@ async function main() {
   results.push(
     assertPngImageContent(
       "android.capture_screenshot",
-      await callToolRaw("android.capture_screenshot", {
+      await callToolWithTransientObservationRetry("android.capture_screenshot", {
         serial,
         filename: "hosted-smoke-capture.png",
       }),
@@ -226,7 +235,7 @@ async function main() {
   results.push(
     assertPngImageContent(
       "android.inspect_ui",
-      await callToolWithTransientHierarchyRetry("android.inspect_ui", {
+      await callToolWithTransientObservationRetry("android.inspect_ui", {
         serial,
         hierarchy_filename: "hosted-smoke-inspect.xml",
         include_screenshot: true,
@@ -237,7 +246,7 @@ async function main() {
   results.push(
     assertPngImageContent(
       "android.wait_for_stable_ui",
-      await callToolWithTransientHierarchyRetry("android.wait_for_stable_ui", {
+      await callToolWithTransientObservationRetry("android.wait_for_stable_ui", {
         serial,
         timeout_secs: 20,
         poll_interval_ms: 500,
