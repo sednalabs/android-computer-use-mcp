@@ -88,7 +88,7 @@ jobs:
           MCP_ENDPOINT: http://127.0.0.1:9526/mcp
         with:
           api-level: 35
-          target: google_apis
+          target: aosp_atd
           arch: x86_64
           profile: pixel_7
           emulator-boot-timeout: 1200

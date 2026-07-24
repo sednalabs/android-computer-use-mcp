@@ -161,8 +161,20 @@ export function isTransientScreenshotTimeout(error) {
   return message.includes("exec-out screencap -p") && message.includes("timed out after");
 }
 
+export function isTransientHierarchyProcessFailure(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    message.includes("uiautomator dump") &&
+    (message.includes("exit status 137") || message.toLowerCase().includes("killed"))
+  );
+}
+
 export function isTransientObservationTimeout(error) {
-  return isTransientHierarchyTimeout(error) || isTransientScreenshotTimeout(error);
+  return (
+    isTransientHierarchyTimeout(error) ||
+    isTransientScreenshotTimeout(error) ||
+    isTransientHierarchyProcessFailure(error)
+  );
 }
 
 export function isTransientBootReadinessFailure(error) {
@@ -203,7 +215,7 @@ export async function withTransientObservationRetry(
     name,
     operation,
     isTransientObservationTimeout,
-    "observation capture timed out",
+    "observation capture failed transiently",
     options,
   );
 }
