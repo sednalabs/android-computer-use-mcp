@@ -165,25 +165,60 @@ export function isTransientObservationTimeout(error) {
   return isTransientHierarchyTimeout(error) || isTransientScreenshotTimeout(error);
 }
 
-export async function withTransientObservationRetry(
+export function isTransientBootReadinessFailure(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    message.includes("shell pm path android") &&
+    (message.includes("Broken pipe") || message.includes("Failure calling service package"))
+  );
+}
+
+async function withTransientRetry(
   name,
   operation,
+  isTransient,
+  failureKind,
   { attempts = 3, retryDelayMs = 1000 } = {},
 ) {
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
       return await operation();
     } catch (error) {
-      if (!isTransientObservationTimeout(error) || attempt === attempts) {
+      if (!isTransient(error) || attempt === attempts) {
         throw error;
       }
-      console.warn(
-        `${name} observation capture timed out; retrying ${attempt + 1}/${attempts}`,
-      );
+      console.warn(`${name} ${failureKind}; retrying ${attempt + 1}/${attempts}`);
       await sleep(retryDelayMs);
     }
   }
-  throw new Error(`${name} observation retry loop did not return a result`);
+  throw new Error(`${name} retry loop did not return a result`);
+}
+
+export async function withTransientObservationRetry(
+  name,
+  operation,
+  options = {},
+) {
+  return withTransientRetry(
+    name,
+    operation,
+    isTransientObservationTimeout,
+    "observation capture timed out",
+    options,
+  );
+}
+
+export async function withTransientBootReadinessRetry(
+  operation,
+  options = {},
+) {
+  return withTransientRetry(
+    "android.wait_for_boot",
+    operation,
+    isTransientBootReadinessFailure,
+    "package-manager readiness probe failed transiently",
+    options,
+  );
 }
 
 async function callToolWithTransientObservationRetry(name, args = {}) {
@@ -217,10 +252,12 @@ async function main() {
   const health = structuredContent(await callToolRaw("android.health", {}));
   console.log(`android.health devices=${JSON.stringify(health?.devices ?? [])}`);
 
-  await callToolRaw("android.wait_for_boot", {
-    serial,
-    timeout_secs: 120,
-  });
+  await withTransientBootReadinessRetry(() =>
+    callToolRaw("android.wait_for_boot", {
+      serial,
+      timeout_secs: 120,
+    }),
+  );
 
   const results = [];
   results.push(
