@@ -15,8 +15,9 @@ use std::process::{Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::CallToolResult;
+use rmcp::model::{CallToolResult, Content};
 use rmcp::tool;
 use rmcp::tool_router;
 use schemars::JsonSchema;
@@ -853,7 +854,7 @@ impl AndroidEmulatorMcp {
 
     #[tool(
         name = "android.capture_screenshot",
-        description = "Capture a PNG screenshot from the device and save it locally."
+        description = "Capture a PNG screenshot, save it as an artifact, and return it as MCP image content."
     )]
     async fn android_capture_screenshot(
         &self,
@@ -862,18 +863,21 @@ impl AndroidEmulatorMcp {
         let serial = self
             .resolve_serial_for_tools(args.serial.as_deref())
             .await?;
-        let (path, backend_used) = self
+        let (path, backend_used, screenshot_bytes) = self
             .capture_screenshot_internal(
                 &serial,
                 filename_or_timestamp(args.filename, "capture-screenshot", "png"),
             )
             .await?;
-        Ok(CallToolResult::structured(json!({
-            "ok": true,
-            "serial": serial,
-            "path": path,
-            "backend_used": backend_used,
-        })))
+        observation_result_with_optional_screenshot(
+            json!({
+                "ok": true,
+                "serial": serial,
+                "path": path,
+                "backend_used": backend_used,
+            }),
+            Some(screenshot_bytes),
+        )
     }
 
     #[tool(
@@ -899,7 +903,7 @@ impl AndroidEmulatorMcp {
 
     #[tool(
         name = "android.inspect_ui",
-        description = "Capture the current UI hierarchy, optionally pair it with a screenshot, and return a normalized UI tree."
+        description = "Capture the current UI hierarchy and normalized tree, optionally attaching the screenshot as MCP image content."
     )]
     async fn android_inspect_ui(
         &self,
@@ -916,24 +920,28 @@ impl AndroidEmulatorMcp {
                 filename_or_timestamp(args.screenshot_filename, "inspect-ui", "png"),
             )
             .await?;
-        Ok(CallToolResult::structured(json!({
-            "ok": true,
-            "serial": serial,
-            "artifacts": {
-                "hierarchy_path": observation.hierarchy_path,
-                "screenshot_path": observation.screenshot_path,
-                "screenshot_backend": observation.screenshot_backend,
-            },
-            "current_focus": observation.window_state.current_focus,
-            "window_state": observation.window_state,
-            "node_count": observation.nodes.len(),
-            "nodes": observation.nodes,
-        })))
+        let screenshot_bytes = observation.screenshot_bytes;
+        observation_result_with_optional_screenshot(
+            json!({
+                "ok": true,
+                "serial": serial,
+                "artifacts": {
+                    "hierarchy_path": observation.hierarchy_path,
+                    "screenshot_path": observation.screenshot_path,
+                    "screenshot_backend": observation.screenshot_backend,
+                },
+                "current_focus": observation.window_state.current_focus,
+                "window_state": observation.window_state,
+                "node_count": observation.nodes.len(),
+                "nodes": observation.nodes,
+            }),
+            screenshot_bytes,
+        )
     }
 
     #[tool(
         name = "android.wait_for_stable_ui",
-        description = "Wait until the UI hierarchy and top window state stop changing, then return a paired observation bundle."
+        description = "Wait for a stable UI and return its structured observation, optionally attaching the screenshot as MCP image content."
     )]
     async fn android_wait_for_stable_ui(
         &self,
@@ -963,24 +971,28 @@ impl AndroidEmulatorMcp {
             })
             .await?;
 
-        Ok(CallToolResult::structured(json!({
-            "ok": stable_result.stabilized,
-            "serial": serial,
-            "stabilized": stable_result.stabilized,
-            "timed_out": stable_result.timed_out,
-            "elapsed_ms": stable_result.elapsed_ms,
-            "stable_polls_required": stable_result.stable_polls_required,
-            "stable_polls_observed": stable_result.stable_polls_observed,
-            "artifacts": {
-                "hierarchy_path": stable_result.observation.hierarchy_path,
-                "screenshot_path": stable_result.observation.screenshot_path,
-                "screenshot_backend": stable_result.observation.screenshot_backend,
-            },
-            "current_focus": stable_result.observation.window_state.current_focus,
-            "window_state": stable_result.observation.window_state,
-            "node_count": stable_result.observation.nodes.len(),
-            "nodes": stable_result.observation.nodes,
-        })))
+        let screenshot_bytes = stable_result.observation.screenshot_bytes;
+        observation_result_with_optional_screenshot(
+            json!({
+                "ok": stable_result.stabilized,
+                "serial": serial,
+                "stabilized": stable_result.stabilized,
+                "timed_out": stable_result.timed_out,
+                "elapsed_ms": stable_result.elapsed_ms,
+                "stable_polls_required": stable_result.stable_polls_required,
+                "stable_polls_observed": stable_result.stable_polls_observed,
+                "artifacts": {
+                    "hierarchy_path": stable_result.observation.hierarchy_path,
+                    "screenshot_path": stable_result.observation.screenshot_path,
+                    "screenshot_backend": stable_result.observation.screenshot_backend,
+                },
+                "current_focus": stable_result.observation.window_state.current_focus,
+                "window_state": stable_result.observation.window_state,
+                "node_count": stable_result.observation.nodes.len(),
+                "nodes": stable_result.observation.nodes,
+            }),
+            screenshot_bytes,
+        )
     }
 
     #[tool(
@@ -2416,6 +2428,7 @@ pub(crate) struct UiObservation {
     pub(crate) nodes: Vec<NormalizedUiNode>,
     pub(crate) screenshot_path: Option<PathBuf>,
     pub(crate) screenshot_backend: Option<&'static str>,
+    pub(crate) screenshot_bytes: Option<Vec<u8>>,
     pub(crate) window_state: AndroidWindowState,
 }
 
@@ -3546,9 +3559,12 @@ impl AndroidEmulatorMcp {
         scenario: &str,
         step: &str,
     ) -> Result<serde_json::Value, McpError> {
-        let (screenshot, screenshot_backend) = self
-            .capture_screenshot_internal(serial, format!("{scenario}-{step}.png"))
-            .await?;
+        let (screenshot, screenshot_backend) = {
+            let (path, backend, _screenshot_bytes) = self
+                .capture_screenshot_internal(serial, format!("{scenario}-{step}.png"))
+                .await?;
+            (path, backend)
+        };
         let ui_dump = self
             .dump_ui_hierarchy_internal(serial, format!("{scenario}-{step}.xml"))
             .await?;
@@ -3662,7 +3678,7 @@ impl AndroidEmulatorMcp {
         &self,
         serial: &str,
         filename: String,
-    ) -> Result<(PathBuf, &'static str), McpError> {
+    ) -> Result<(PathBuf, &'static str, Vec<u8>), McpError> {
         self.capture_screenshot_internal_with_timeout(
             serial,
             filename,
@@ -3676,7 +3692,7 @@ impl AndroidEmulatorMcp {
         serial: &str,
         filename: String,
         timeout_duration: Duration,
-    ) -> Result<(PathBuf, &'static str), McpError> {
+    ) -> Result<(PathBuf, &'static str, Vec<u8>), McpError> {
         let path = self
             .artifact_path("screenshots", Some(filename), Some("png"))
             .await?;
@@ -3685,10 +3701,10 @@ impl AndroidEmulatorMcp {
                 grpc_backend::capture_screenshot_png(endpoint.port, endpoint.auth_token.as_deref())
                     .await
         {
-            fs::write(&path, png_bytes)
+            fs::write(&path, &png_bytes)
                 .await
                 .map_err(|err| McpError::internal_error(err.to_string(), None))?;
-            return Ok((path, "grpc"));
+            return Ok((path, "grpc", png_bytes));
         }
         let mut command = Command::new(&self.config.adb_path);
         command
@@ -3701,10 +3717,11 @@ impl AndroidEmulatorMcp {
             &format!("adb -s {serial} exec-out screencap -p"),
         )
         .await?;
-        fs::write(&path, output.stdout)
+        let png_bytes = output.stdout;
+        fs::write(&path, &png_bytes)
             .await
             .map_err(|err| McpError::internal_error(err.to_string(), None))?;
-        Ok((path, "adb"))
+        Ok((path, "adb", png_bytes))
     }
 
     async fn dump_ui_hierarchy_internal(
@@ -3933,21 +3950,21 @@ impl AndroidEmulatorMcp {
             .await
             .map_err(|err| McpError::internal_error(err.to_string(), None))?;
         let nodes = parse_ui_nodes_from_xml(&hierarchy_xml)?;
-        let (screenshot_path, screenshot_backend) = if include_screenshot {
+        let (screenshot_path, screenshot_backend, screenshot_bytes) = if include_screenshot {
             let screenshot_timeout = deadline
                 .map(|deadline| require_remaining_budget(deadline, "screenshot capture"))
                 .transpose()?
                 .unwrap_or(Duration::from_secs(DEFAULT_ADB_COMMAND_TIMEOUT_SECS));
-            let (path, backend) = self
+            let (path, backend, bytes) = self
                 .capture_screenshot_internal_with_timeout(
                     serial,
                     screenshot_filename,
                     screenshot_timeout,
                 )
                 .await?;
-            (Some(path), Some(backend))
+            (Some(path), Some(backend), Some(bytes))
         } else {
-            (None, None)
+            (None, None, None)
         };
         let window_state_timeout = deadline
             .map(|deadline| require_remaining_budget(deadline, "window-state capture"))
@@ -3962,6 +3979,7 @@ impl AndroidEmulatorMcp {
             nodes,
             screenshot_path,
             screenshot_backend,
+            screenshot_bytes,
             window_state,
         })
     }
@@ -4961,6 +4979,27 @@ fn extract_component_token(line: &str) -> Option<String> {
         })
 }
 
+fn observation_result_with_optional_screenshot(
+    value: serde_json::Value,
+    screenshot_bytes: Option<Vec<u8>>,
+) -> Result<CallToolResult, McpError> {
+    let Some(bytes) = screenshot_bytes else {
+        return Ok(CallToolResult::structured(value));
+    };
+
+    let receipt = serde_json::to_string(&value).map_err(|err| {
+        McpError::internal_error(
+            format!("Failed to serialize Android observation receipt: {err}"),
+            None,
+        )
+    })?;
+    // Codex prefers structured_content and drops accompanying image content.
+    Ok(CallToolResult::success(vec![
+        Content::text(receipt),
+        Content::image(BASE64_STANDARD.encode(bytes), "image/png"),
+    ]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4970,6 +5009,46 @@ mod tests {
     use mcp_toolkit_testing::assert_tool_schema_snapshot;
     #[cfg(unix)]
     use std::os::unix::process::ExitStatusExt;
+
+    #[test]
+    fn mcp_observation_includes_typed_screenshot_and_json_text_receipt() {
+        let result = observation_result_with_optional_screenshot(
+            json!({"ok": true, "serial": "emulator-5554"}),
+            Some(b"png-bytes".to_vec()),
+        )
+        .expect("screenshot image content should be attached");
+
+        assert!(result.structured_content.is_none());
+        assert_eq!(result.content.len(), 2);
+        let receipt = serde_json::to_value(&result.content[0])
+            .expect("JSON receipt should serialize for assertion");
+        assert_eq!(receipt["type"], "text");
+        let receipt: serde_json::Value = serde_json::from_str(
+            receipt["text"]
+                .as_str()
+                .expect("text receipt should contain JSON"),
+        )
+        .expect("JSON receipt should parse");
+        assert_eq!(receipt, json!({"ok": true, "serial": "emulator-5554"}));
+        let image = serde_json::to_value(&result.content[1])
+            .expect("image content should serialize for assertion");
+        assert_eq!(image["type"], "image");
+        assert_eq!(image["mimeType"], "image/png");
+        assert_eq!(image["data"], BASE64_STANDARD.encode(b"png-bytes"));
+
+        let without_screenshot = observation_result_with_optional_screenshot(
+            json!({"ok": true, "serial": "emulator-5554"}),
+            None,
+        )
+        .expect("structured result should remain available without a screenshot");
+        assert_eq!(
+            without_screenshot
+                .structured_content
+                .as_ref()
+                .expect("no-image response should retain structured receipt"),
+            &json!({"ok": true, "serial": "emulator-5554"})
+        );
+    }
 
     #[test]
     fn adb_device_line_is_parsed() {
