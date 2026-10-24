@@ -115,8 +115,12 @@ function assertBootReadiness(output) {
 }
 
 function assertScreenshotReceipt(output) {
-  const text = output.filter((item) => item.type === "input_text").map((item) => item.text).join("\n");
-  const receipt = JSON.parse(text);
+  const receipts = output
+    .filter((item) => item.type === "input_text")
+    .map((item) => item.text)
+    .filter((text) => text.trimStart().startsWith("{"));
+  assert.equal(receipts.length, 1, "Android screenshot receipt was not preserved as one text item.");
+  const receipt = JSON.parse(receipts[0]);
   assert.equal(receipt.ok, true, "Android screenshot receipt did not report success.");
   assert.equal(receipt.serial, "emulator-5554", "Android screenshot receipt did not identify the target emulator.");
   assert.equal(typeof receipt.path, "string", "Android screenshot receipt did not preserve its artifact path.");
