@@ -70,6 +70,20 @@ function assertTypedPng(output) {
   return png.length;
 }
 
+function callOutput(body, callId) {
+  const call = body.input?.find((item) => item.type === "function_call_output" && item.call_id === callId);
+  assert.ok(call, `Missing model-facing output for ${callId}.`);
+  if (Array.isArray(call.output)) return call.output;
+  assert.equal(typeof call.output, "string", `Unexpected model-facing output shape for ${callId}.`);
+  return [{ type: "input_text", text: call.output }];
+}
+
+function assertBootReadiness(output) {
+  const text = output.filter((item) => item.type === "input_text").map((item) => item.text).join("\n");
+  assert.match(text, /"ok"\s*:\s*true/, "Android boot tool did not report readiness.");
+  assert.match(text, /"serial"\s*:\s*"emulator-5554"/, "Android boot result did not identify the target emulator.");
+}
+
 let api;
 let codex;
 let apiFailure;
@@ -118,16 +132,15 @@ try {
           timeout_secs: 120,
         });
       } else if (requestCount === 2) {
-        const call = body.input?.find((item) => item.type === "function_call_output" && item.call_id === "android-mcp-call-1");
-        assert.ok(call && Array.isArray(call.output), "Missing model-facing Android boot-readiness result.");
+        const output = callOutput(body, "android-mcp-call-1");
+        assertBootReadiness(output);
         stream = toolCall("android-mcp-response-2", "android-mcp-call-2", "android_capture_screenshot", {
           serial: "emulator-5554",
           filename: "codex-consumer-screenshot.png",
         });
       } else if (requestCount === 3) {
-        const call = body.input?.find((item) => item.type === "function_call_output" && item.call_id === "android-mcp-call-2");
-        assert.ok(call && Array.isArray(call.output), "Missing model-facing Android MCP tool output.");
-        const imageBytes = assertTypedPng(call.output);
+        const output = callOutput(body, "android-mcp-call-2");
+        const imageBytes = assertTypedPng(output);
         stream = finalMessage("android-mcp-response-3");
         response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
         response.end(stream);
