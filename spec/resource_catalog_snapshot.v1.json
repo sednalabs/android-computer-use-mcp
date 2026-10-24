@@ -133,7 +133,7 @@
             "use_when": "Use this to bring an app to the foreground before semantic UI interaction."
           },
           {
-            "description": "Capture a PNG screenshot from the device and save it locally.",
+            "description": "Capture a PNG screenshot, save it as an artifact, and return it as MCP image content.",
             "group": "observation",
             "name": "android.capture_screenshot",
             "read_only": false,
@@ -147,14 +147,14 @@
             "use_when": "Use this when you need raw hierarchy XML for debugging or later parsing."
           },
           {
-            "description": "Capture the current UI hierarchy, optionally pair it with a screenshot, and return a normalized UI tree.",
+            "description": "Capture the current UI hierarchy and normalized tree, optionally attaching the screenshot as MCP image content.",
             "group": "observation",
             "name": "android.inspect_ui",
             "read_only": false,
             "use_when": "Use this for a rich one-shot observation of the current Android state."
           },
           {
-            "description": "Wait until the UI hierarchy and top window state stop changing, then return a paired observation bundle.",
+            "description": "Wait for a stable UI and return its structured observation, optionally attaching the screenshot as MCP image content.",
             "group": "observation",
             "name": "android.wait_for_stable_ui",
             "read_only": false,
