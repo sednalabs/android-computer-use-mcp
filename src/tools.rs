@@ -15,8 +15,8 @@ use std::process::{Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use rmcp::handler::server::wrapper::Parameters;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content};
 use rmcp::tool;
 use rmcp::tool_router;
@@ -869,12 +869,15 @@ impl AndroidEmulatorMcp {
                 filename_or_timestamp(args.filename, "capture-screenshot", "png"),
             )
             .await?;
-        structured_result_with_optional_screenshot(json!({
-            "ok": true,
-            "serial": serial,
-            "path": path.clone(),
-            "backend_used": backend_used,
-        }), Some(&path))
+        structured_result_with_optional_screenshot(
+            json!({
+                "ok": true,
+                "serial": serial,
+                "path": path.clone(),
+                "backend_used": backend_used,
+            }),
+            Some(&path),
+        )
         .await
     }
 
@@ -919,19 +922,22 @@ impl AndroidEmulatorMcp {
             )
             .await?;
         let screenshot_path = observation.screenshot_path.clone();
-        structured_result_with_optional_screenshot(json!({
-            "ok": true,
-            "serial": serial,
-            "artifacts": {
-                "hierarchy_path": observation.hierarchy_path,
-                "screenshot_path": observation.screenshot_path,
-                "screenshot_backend": observation.screenshot_backend,
-            },
-            "current_focus": observation.window_state.current_focus,
-            "window_state": observation.window_state,
-            "node_count": observation.nodes.len(),
-            "nodes": observation.nodes,
-        }), screenshot_path.as_deref())
+        structured_result_with_optional_screenshot(
+            json!({
+                "ok": true,
+                "serial": serial,
+                "artifacts": {
+                    "hierarchy_path": observation.hierarchy_path,
+                    "screenshot_path": observation.screenshot_path,
+                    "screenshot_backend": observation.screenshot_backend,
+                },
+                "current_focus": observation.window_state.current_focus,
+                "window_state": observation.window_state,
+                "node_count": observation.nodes.len(),
+                "nodes": observation.nodes,
+            }),
+            screenshot_path.as_deref(),
+        )
         .await
     }
 
@@ -968,24 +974,27 @@ impl AndroidEmulatorMcp {
             .await?;
 
         let screenshot_path = stable_result.observation.screenshot_path.clone();
-        structured_result_with_optional_screenshot(json!({
-            "ok": stable_result.stabilized,
-            "serial": serial,
-            "stabilized": stable_result.stabilized,
-            "timed_out": stable_result.timed_out,
-            "elapsed_ms": stable_result.elapsed_ms,
-            "stable_polls_required": stable_result.stable_polls_required,
-            "stable_polls_observed": stable_result.stable_polls_observed,
-            "artifacts": {
-                "hierarchy_path": stable_result.observation.hierarchy_path,
-                "screenshot_path": stable_result.observation.screenshot_path,
-                "screenshot_backend": stable_result.observation.screenshot_backend,
-            },
-            "current_focus": stable_result.observation.window_state.current_focus,
-            "window_state": stable_result.observation.window_state,
-            "node_count": stable_result.observation.nodes.len(),
-            "nodes": stable_result.observation.nodes,
-        }), screenshot_path.as_deref())
+        structured_result_with_optional_screenshot(
+            json!({
+                "ok": stable_result.stabilized,
+                "serial": serial,
+                "stabilized": stable_result.stabilized,
+                "timed_out": stable_result.timed_out,
+                "elapsed_ms": stable_result.elapsed_ms,
+                "stable_polls_required": stable_result.stable_polls_required,
+                "stable_polls_observed": stable_result.stable_polls_observed,
+                "artifacts": {
+                    "hierarchy_path": stable_result.observation.hierarchy_path,
+                    "screenshot_path": stable_result.observation.screenshot_path,
+                    "screenshot_backend": stable_result.observation.screenshot_backend,
+                },
+                "current_focus": stable_result.observation.window_state.current_focus,
+                "window_state": stable_result.observation.window_state,
+                "node_count": stable_result.observation.nodes.len(),
+                "nodes": stable_result.observation.nodes,
+            }),
+            screenshot_path.as_deref(),
+        )
         .await
     }
 
