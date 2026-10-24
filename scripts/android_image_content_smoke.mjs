@@ -5,28 +5,44 @@ const pngSignature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a
 
 let sessionId = null;
 let nextId = 1;
+let protocolVersion = null;
 
-async function parsePayload(response) {
+async function parsePayload(response, method) {
   const contentType = response.headers.get("content-type") ?? "";
   const bodyText = await response.text();
+  const normalizedBody = bodyText.replace(/^\uFEFF/, "");
   if (contentType.startsWith("application/json")) {
-    return JSON.parse(bodyText);
+    return JSON.parse(normalizedBody);
   }
   if (contentType.startsWith("text/event-stream")) {
-    const data = bodyText
+    const events = normalizedBody
       .split(/\r?\n\r?\n/)
-      .flatMap((block) =>
+      .map((block) =>
         block
           .split(/\r?\n/)
           .filter((line) => line.startsWith("data:"))
-          .map((line) => line.slice("data:".length).trim()),
-      )[0];
-    if (!data) {
-      throw new Error("MCP event stream did not include a response");
+          .map((line) => line.slice("data:".length).trim())
+          .join("\n"),
+      )
+      .filter(Boolean);
+    for (const data of events) {
+      try {
+        const payload = JSON.parse(data);
+        if (payload?.result || payload?.error) {
+          return payload;
+        }
+      } catch {
+        // Ignore keepalive or non-JSON server events and continue to the response.
+      }
     }
-    return JSON.parse(data);
+    const prefixHex = Buffer.from(normalizedBody).subarray(0, 16).toString("hex");
+    throw new Error(
+      `${method} returned no JSON-RPC response (HTTP ${response.status}, ${contentType}, ${normalizedBody.length} chars, prefix ${prefixHex || "empty"})`,
+    );
   }
-  throw new Error("MCP response used an unsupported content type");
+  throw new Error(
+    `${method} used unsupported response content type (HTTP ${response.status}, ${contentType || "missing"})`,
+  );
 }
 
 async function rpc(method, params) {
@@ -36,6 +52,9 @@ async function rpc(method, params) {
   });
   if (sessionId) {
     headers.set("mcp-session-id", sessionId);
+  }
+  if (protocolVersion && method !== "initialize") {
+    headers.set("mcp-protocol-version", protocolVersion);
   }
 
   const response = await fetch(endpoint, {
@@ -52,11 +71,41 @@ async function rpc(method, params) {
   if (nextSessionId) {
     sessionId = nextSessionId;
   }
-  const payload = await parsePayload(response);
+  const payload = await parsePayload(response, method);
   if (!response.ok || payload?.error) {
     throw new Error(`${method} failed with HTTP ${response.status}`);
   }
+  if (method === "initialize" && typeof payload?.result?.protocolVersion === "string") {
+    protocolVersion = payload.result.protocolVersion;
+  }
   return payload.result;
+}
+
+async function notify(method, params = {}) {
+  const headers = new Headers({
+    accept: "application/json, text/event-stream",
+    "content-type": "application/json",
+  });
+  if (sessionId) {
+    headers.set("mcp-session-id", sessionId);
+  }
+  if (protocolVersion) {
+    headers.set("mcp-protocol-version", protocolVersion);
+  }
+
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      method,
+      params,
+    }),
+  });
+  await response.arrayBuffer();
+  if (!response.ok) {
+    throw new Error(`${method} failed with HTTP ${response.status}`);
+  }
 }
 
 async function callTool(name, args = {}) {
@@ -105,6 +154,7 @@ async function main() {
     capabilities: {},
     clientInfo: { name: "android-image-content-smoke", version: "0.0.0" },
   });
+  await notify("notifications/initialized");
 
   const tools = await rpc("tools/list");
   const toolNames = new Set((tools?.tools ?? []).map((tool) => tool.name));
