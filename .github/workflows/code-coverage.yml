@@ -23,8 +23,6 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: read
-      code-quality: write
-      pull-requests: read
     steps:
       - name: Checkout repository
         # actions/checkout v6
@@ -66,20 +64,14 @@ jobs:
           tool: cargo-llvm-cov
 
       - name: Generate Rust coverage
+        id: generate_rust_coverage
         run: |
           mkdir -p coverage
           cargo llvm-cov --workspace --all-targets --all-features \
             --cobertura --output-path coverage/rust.xml
 
-      - name: Upload Rust coverage to GitHub Code Quality
-        # actions/upload-code-coverage v1
-        uses: actions/upload-code-coverage@abb5995db9e0199b0e2bb9dbd136fce4cb1ec4d3
-        with:
-          file: coverage/rust.xml
-          language: Rust
-          label: code-coverage/rust
-
       - name: Upload Cobertura report
+        if: ${{ always() && steps.generate_rust_coverage.outcome == 'success' }}
         # actions/upload-artifact v7
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
@@ -88,6 +80,7 @@ jobs:
           if-no-files-found: error
 
       - name: Summarize coverage report
+        if: ${{ always() && steps.generate_rust_coverage.outcome == 'success' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -101,4 +94,5 @@ jobs:
               root = ElementTree.parse(report).getroot()
               line_rate = float(root.attrib.get("line-rate", "0"))
               print(f"- `{report}`: {line_rate * 100:.2f}% line coverage")
+          print("- GitHub Code Quality publication: not configured for this repository.")
           PY
