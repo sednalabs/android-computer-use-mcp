@@ -61,12 +61,27 @@ const finalMessage = (responseId) => sse([
 
 function assertTypedPng(output) {
   const images = output.filter((item) => item.type === "input_image");
+  const textPreview = (text) => {
+    try {
+      const parsed = JSON.parse(text);
+      if (parsed && typeof parsed === "object") {
+        if (parsed.type === "image") {
+          return `image-content mime=${parsed.mimeType || parsed.mime_type || "unknown"} dataLength=${typeof parsed.data === "string" ? parsed.data.length : 0}`;
+        }
+        if (typeof parsed.path === "string") parsed.path = "[artifact path]";
+        if (typeof parsed.data === "string") parsed.data = "[binary content omitted]";
+        return JSON.stringify(parsed).slice(0, 120);
+      }
+    } catch {}
+    return text.replace(/\/[^"\s]+/g, "[path]").slice(0, 120);
+  };
   const outputShape = JSON.stringify(output.map((item) => ({
     type: item.type,
     mimeType: item.mimeType,
     detail: item.detail,
     imageUrlLength: typeof item.image_url === "string" ? item.image_url.length : undefined,
     textLength: typeof item.text === "string" ? item.text.length : undefined,
+    textPreview: typeof item.text === "string" ? textPreview(item.text) : undefined,
   })));
   assert.equal(images.length, 1, `Expected one typed screenshot in the model request; received ${outputShape}.`);
   assert.equal(images[0].detail, "high");
