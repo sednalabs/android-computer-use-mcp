@@ -137,7 +137,7 @@
             "group": "observation",
             "name": "android.capture_screenshot",
             "read_only": false,
-            "use_when": "Use this when a visual artifact is more important than the normalized UI tree."
+            "use_when": "Use this when a model-visible visual observation is needed."
           },
           {
             "description": "Dump the current UI hierarchy XML and save it locally.",
