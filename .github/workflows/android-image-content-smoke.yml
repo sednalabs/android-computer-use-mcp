@@ -1,0 +1,84 @@
+name: Android MCP typed image smoke
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/android-image-content-smoke.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "build.rs"
+      - "src/**"
+      - "spec/**"
+      - "scripts/android_image_content_smoke.mjs"
+      - "scripts/run_android_image_content_smoke.sh"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-image-content-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  hosted-android-image-content:
+    name: Hosted Android MCP image content smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install hosted build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Install Android emulator SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdk_root="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=${sdk_root}" >> "${GITHUB_ENV}"
+          echo "ANDROID_SDK_ROOT=${sdk_root}" >> "${GITHUB_ENV}"
+          set +o pipefail
+          yes | "${sdk_root}/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null
+          set -o pipefail
+          "${sdk_root}/cmdline-tools/latest/bin/sdkmanager" "emulator"
+          test -f "${sdk_root}/emulator/lib/emulator_controller.proto"
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Build Android MCP server
+        run: ANDROID_COMPUTER_USE_MCP_SDK_ROOT="${ANDROID_HOME}" cargo build --locked
+
+      - name: Run Android MCP contract tests
+        run: ANDROID_COMPUTER_USE_MCP_SDK_ROOT="${ANDROID_HOME}" cargo test --locked
+
+      - name: Assert observation tools return native image content
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2
+        env:
+          ANDROID_COMPUTER_USE_MCP_BIND_ADDR: 127.0.0.1:9526
+          ANDROID_COMPUTER_USE_MCP_ALLOWED_HOSTS: localhost,127.0.0.1,::1
+          ANDROID_COMPUTER_USE_MCP_HTTP_ALLOW_RESUME: "0"
+          ANDROID_SERIAL: emulator-5554
+          MCP_ENDPOINT: http://127.0.0.1:9526/mcp
+        with:
+          api-level: 35
+          target: aosp_atd
+          arch: x86_64
+          profile: pixel_7
+          emulator-boot-timeout: 1200
+          disable-animations: false
+          disable-linux-hw-accel: auto
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot-save -noaudio -no-boot-anim -camera-back none
+          script: sh "${GITHUB_WORKSPACE}/scripts/run_android_image_content_smoke.sh"

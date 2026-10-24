@@ -109,8 +109,8 @@ const TOOL_SURFACE: [ToolSurfaceEntry; 29] = [
         name: "android.capture_screenshot",
         group: "observation",
         read_only: false,
-        description: "Capture a PNG screenshot from the device and save it locally.",
-        use_when: "Use this when a visual artifact is more important than the normalized UI tree.",
+        description: "Capture a PNG screenshot, save it as an artifact, and return it as MCP image content.",
+        use_when: "Use this when a model-visible visual observation is needed.",
     },
     ToolSurfaceEntry {
         name: "android.dump_ui_hierarchy",
@@ -123,14 +123,14 @@ const TOOL_SURFACE: [ToolSurfaceEntry; 29] = [
         name: "android.inspect_ui",
         group: "observation",
         read_only: false,
-        description: "Capture the current UI hierarchy, optionally pair it with a screenshot, and return a normalized UI tree.",
+        description: "Capture the current UI hierarchy and normalized tree, optionally attaching the screenshot as MCP image content.",
         use_when: "Use this for a rich one-shot observation of the current Android state.",
     },
     ToolSurfaceEntry {
         name: "android.wait_for_stable_ui",
         group: "observation",
         read_only: false,
-        description: "Wait until the UI hierarchy and top window state stop changing, then return a paired observation bundle.",
+        description: "Wait for a stable UI and return its structured observation, optionally attaching the screenshot as MCP image content.",
         use_when: "Use this before acting when the UI may still be animating or transitioning.",
     },
     ToolSurfaceEntry {

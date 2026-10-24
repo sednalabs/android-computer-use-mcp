@@ -2,7 +2,7 @@
   "schema": "mcp_tool_schema_snapshot",
   "tools": [
     {
-      "description": "Capture a PNG screenshot from the device and save it locally.",
+      "description": "Capture a PNG screenshot, save it as an artifact, and return it as MCP image content.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "description": "Arguments for capturing a device screenshot artifact.",
@@ -1111,7 +1111,7 @@
       "name": "android.input.text"
     },
     {
-      "description": "Capture the current UI hierarchy, optionally pair it with a screenshot, and return a normalized UI tree.",
+      "description": "Capture the current UI hierarchy and normalized tree, optionally attaching the screenshot as MCP image content.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "description": "Arguments for inspecting the current UI hierarchy and screenshot.",
@@ -2180,7 +2180,7 @@
       "name": "android.wait_for_boot"
     },
     {
-      "description": "Wait until the UI hierarchy and top window state stop changing, then return a paired observation bundle.",
+      "description": "Wait for a stable UI and return its structured observation, optionally attaching the screenshot as MCP image content.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "description": "Arguments for waiting until the UI state has stabilized.",

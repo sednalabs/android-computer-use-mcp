@@ -11,10 +11,49 @@ Add a block like this to `~/.codex/config.toml`:
 url = "http://127.0.0.1:9526/mcp"
 tool_timeout_sec = 300.0
 enabled = false
+default_tools_approval_mode = "prompt"
+enabled_tools = [
+  "android.health",
+  "android.list_devices",
+  "android.wait_for_boot",
+  "android.capture_screenshot",
+  "android.inspect_ui",
+  "android.wait_for_stable_ui",
+  "android.find_ui_element",
+  "android.wait_for_ui_element",
+  "android.tap_element",
+  "android.type_into_element",
+  "android.input.keyevent",
+  "android.input.swipe",
+  "android.input.tap",
+  "android.input.text",
+  "android.scroll_until_visible",
+  "interactive_session.get_status",
+  "interactive_session.get_current_build",
+  "interactive_session.install_build_from_run",
+]
 ```
 
 Keep `enabled = false` until the operator is ready to turn the server on in
-their active Codex profile.
+their active Codex profile. The allow-list covers a hosted interactive session's
+readiness, visual/selector-driven interaction, and build provenance/install
+flow; add diagnostics or raw input tools only when the use case needs them.
+Prompt approval is retained for observation, input, and build installation while
+qualifying the exact endpoint and session.
+
+For a hosted session, change only the URL to the exact MCP endpoint supplied by
+that session and use its existing access policy. Do not put access tokens in the
+Codex configuration file or public workflow inputs.
+
+## Model-visible screenshots
+
+`android.capture_screenshot` returns the PNG as an MCP image content item while
+preserving its structured serial, backend, and artifact-path receipt.
+`android.inspect_ui` and `android.wait_for_stable_ui` attach the same image item
+when screenshot capture is enabled. Codex can use these namespaced tools through
+its generic MCP configuration; no Codex-specific dynamic-tool adapter is
+required. The artifact paths and hierarchy remain evidence for replay or
+debugging, while the typed image is the model-visible visual observation.
 
 Start the daemon separately from the repository checkout:
 

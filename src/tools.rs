@@ -16,7 +16,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::CallToolResult;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use rmcp::model::{CallToolResult, Content};
 use rmcp::tool;
 use rmcp::tool_router;
 use schemars::JsonSchema;
@@ -853,7 +854,7 @@ impl AndroidEmulatorMcp {
 
     #[tool(
         name = "android.capture_screenshot",
-        description = "Capture a PNG screenshot from the device and save it locally."
+        description = "Capture a PNG screenshot, save it as an artifact, and return it as MCP image content."
     )]
     async fn android_capture_screenshot(
         &self,
@@ -868,12 +869,13 @@ impl AndroidEmulatorMcp {
                 filename_or_timestamp(args.filename, "capture-screenshot", "png"),
             )
             .await?;
-        Ok(CallToolResult::structured(json!({
+        structured_result_with_optional_screenshot(json!({
             "ok": true,
             "serial": serial,
-            "path": path,
+            "path": path.clone(),
             "backend_used": backend_used,
-        })))
+        }), Some(&path))
+        .await
     }
 
     #[tool(
@@ -899,7 +901,7 @@ impl AndroidEmulatorMcp {
 
     #[tool(
         name = "android.inspect_ui",
-        description = "Capture the current UI hierarchy, optionally pair it with a screenshot, and return a normalized UI tree."
+        description = "Capture the current UI hierarchy and normalized tree, optionally attaching the screenshot as MCP image content."
     )]
     async fn android_inspect_ui(
         &self,
@@ -916,7 +918,8 @@ impl AndroidEmulatorMcp {
                 filename_or_timestamp(args.screenshot_filename, "inspect-ui", "png"),
             )
             .await?;
-        Ok(CallToolResult::structured(json!({
+        let screenshot_path = observation.screenshot_path.clone();
+        structured_result_with_optional_screenshot(json!({
             "ok": true,
             "serial": serial,
             "artifacts": {
@@ -928,12 +931,13 @@ impl AndroidEmulatorMcp {
             "window_state": observation.window_state,
             "node_count": observation.nodes.len(),
             "nodes": observation.nodes,
-        })))
+        }), screenshot_path.as_deref())
+        .await
     }
 
     #[tool(
         name = "android.wait_for_stable_ui",
-        description = "Wait until the UI hierarchy and top window state stop changing, then return a paired observation bundle."
+        description = "Wait for a stable UI and return its structured observation, optionally attaching the screenshot as MCP image content."
     )]
     async fn android_wait_for_stable_ui(
         &self,
@@ -963,7 +967,8 @@ impl AndroidEmulatorMcp {
             })
             .await?;
 
-        Ok(CallToolResult::structured(json!({
+        let screenshot_path = stable_result.observation.screenshot_path.clone();
+        structured_result_with_optional_screenshot(json!({
             "ok": stable_result.stabilized,
             "serial": serial,
             "stabilized": stable_result.stabilized,
@@ -980,7 +985,8 @@ impl AndroidEmulatorMcp {
             "window_state": stable_result.observation.window_state,
             "node_count": stable_result.observation.nodes.len(),
             "nodes": stable_result.observation.nodes,
-        })))
+        }), screenshot_path.as_deref())
+        .await
     }
 
     #[tool(
@@ -4961,6 +4967,22 @@ fn extract_component_token(line: &str) -> Option<String> {
         })
 }
 
+async fn structured_result_with_optional_screenshot(
+    value: serde_json::Value,
+    screenshot_path: Option<&Path>,
+) -> Result<CallToolResult, McpError> {
+    let mut result = CallToolResult::structured(value);
+    if let Some(path) = screenshot_path {
+        let bytes = fs::read(path).await.map_err(|err| {
+            McpError::internal_error(format!("Failed to read screenshot artifact: {err}"), None)
+        })?;
+        result
+            .content
+            .push(Content::image(BASE64_STANDARD.encode(bytes), "image/png"));
+    }
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4970,6 +4992,53 @@ mod tests {
     use mcp_toolkit_testing::assert_tool_schema_snapshot;
     #[cfg(unix)]
     use std::os::unix::process::ExitStatusExt;
+
+    #[tokio::test]
+    async fn mcp_observation_includes_typed_screenshot_and_structured_receipt() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after the Unix epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "android-mcp-image-content-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory)
+            .await
+            .expect("unique fixture directory should be created");
+        let path = directory.join("screen.png");
+        fs::write(&path, b"png-bytes")
+            .await
+            .expect("fixture image should be written");
+
+        let result = structured_result_with_optional_screenshot(
+            json!({"ok": true, "serial": "emulator-5554"}),
+            Some(&path),
+        )
+        .await
+        .expect("screenshot image content should be attached");
+
+        assert_eq!(
+            result
+                .structured_content
+                .as_ref()
+                .expect("structured receipt should be preserved"),
+            &json!({"ok": true, "serial": "emulator-5554"})
+        );
+        assert_eq!(result.content.len(), 2);
+        let image = serde_json::to_value(&result.content[1])
+            .expect("image content should serialize for assertion");
+        assert_eq!(image["type"], "image");
+        assert_eq!(image["mimeType"], "image/png");
+        assert_eq!(image["data"], BASE64_STANDARD.encode(b"png-bytes"));
+
+        fs::remove_file(&path)
+            .await
+            .expect("fixture image should be removed");
+        fs::remove_dir(&directory)
+            .await
+            .expect("fixture directory should be removed");
+    }
 
     #[test]
     fn adb_device_line_is_parsed() {
