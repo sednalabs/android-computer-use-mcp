@@ -62,18 +62,26 @@ const finalMessage = (responseId) => sse([
 function assertTypedPng(output) {
   const images = output.filter((item) => item.type === "input_image");
   const textPreview = (text) => {
+    const redact = (key, value) => {
+      if (typeof value !== "string") return value;
+      if (key === "path" || key.endsWith("_path")) return "[artifact path]";
+      if (["data", "image_url", "imageUrl", "audio_url", "audioUrl"].includes(key)) {
+        return `[binary content omitted length=${value.length}]`;
+      }
+      return value
+        .replace(/data:[^\s,\"]+;base64,[A-Za-z0-9+/=]+/gi, "[binary content omitted]")
+        .replace(/\/[^\"\s]+/g, "[path]");
+    };
     try {
       const parsed = JSON.parse(text);
       if (parsed && typeof parsed === "object") {
         if (parsed.type === "image") {
           return `image-content mime=${parsed.mimeType || parsed.mime_type || "unknown"} dataLength=${typeof parsed.data === "string" ? parsed.data.length : 0}`;
         }
-        if (typeof parsed.path === "string") parsed.path = "[artifact path]";
-        if (typeof parsed.data === "string") parsed.data = "[binary content omitted]";
-        return JSON.stringify(parsed).slice(0, 120);
+        return JSON.stringify(parsed, redact).slice(0, 240);
       }
     } catch {}
-    return text.replace(/\/[^"\s]+/g, "[path]").slice(0, 120);
+    return redact("", text).slice(0, 240);
   };
   const outputShape = JSON.stringify(output.map((item) => ({
     type: item.type,
