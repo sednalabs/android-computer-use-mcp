@@ -275,7 +275,7 @@
         "description": "Structured inventory of public Android and Solar Lab tools.",
         "mimeType": "application/json",
         "name": "tool-catalog",
-        "size": 9461,
+        "size": 9486,
         "title": "Android tool catalog",
         "uri": "android-computer-use-mcp://tool-catalog"
       },
