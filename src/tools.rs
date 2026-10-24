@@ -869,7 +869,7 @@ impl AndroidEmulatorMcp {
                 filename_or_timestamp(args.filename, "capture-screenshot", "png"),
             )
             .await?;
-        structured_result_with_optional_screenshot(
+        observation_result_with_optional_screenshot(
             json!({
                 "ok": true,
                 "serial": serial,
@@ -922,7 +922,7 @@ impl AndroidEmulatorMcp {
             )
             .await?;
         let screenshot_path = observation.screenshot_path.clone();
-        structured_result_with_optional_screenshot(
+        observation_result_with_optional_screenshot(
             json!({
                 "ok": true,
                 "serial": serial,
@@ -974,7 +974,7 @@ impl AndroidEmulatorMcp {
             .await?;
 
         let screenshot_path = stable_result.observation.screenshot_path.clone();
-        structured_result_with_optional_screenshot(
+        observation_result_with_optional_screenshot(
             json!({
                 "ok": stable_result.stabilized,
                 "serial": serial,
@@ -4976,20 +4976,29 @@ fn extract_component_token(line: &str) -> Option<String> {
         })
 }
 
-async fn structured_result_with_optional_screenshot(
+async fn observation_result_with_optional_screenshot(
     value: serde_json::Value,
     screenshot_path: Option<&Path>,
 ) -> Result<CallToolResult, McpError> {
-    let mut result = CallToolResult::structured(value);
-    if let Some(path) = screenshot_path {
-        let bytes = fs::read(path).await.map_err(|err| {
-            McpError::internal_error(format!("Failed to read screenshot artifact: {err}"), None)
-        })?;
-        result
-            .content
-            .push(Content::image(BASE64_STANDARD.encode(bytes), "image/png"));
-    }
-    Ok(result)
+    let Some(path) = screenshot_path else {
+        return Ok(CallToolResult::structured(value));
+    };
+
+    let receipt = serde_json::to_string(&value).map_err(|err| {
+        McpError::internal_error(
+            format!("Failed to serialize Android observation receipt: {err}"),
+            None,
+        )
+    })?;
+    let bytes = fs::read(path).await.map_err(|err| {
+        McpError::internal_error(format!("Failed to read screenshot artifact: {err}"), None)
+    })?;
+
+    // Codex prefers structured_content and drops accompanying image content.
+    Ok(CallToolResult::success(vec![
+        Content::text(receipt),
+        Content::image(BASE64_STANDARD.encode(bytes), "image/png"),
+    ]))
 }
 
 #[cfg(test)]
@@ -5003,7 +5012,7 @@ mod tests {
     use std::os::unix::process::ExitStatusExt;
 
     #[tokio::test]
-    async fn mcp_observation_includes_typed_screenshot_and_structured_receipt() {
+    async fn mcp_observation_includes_typed_screenshot_and_json_text_receipt() {
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system time should be after the Unix epoch")
@@ -5020,26 +5029,44 @@ mod tests {
             .await
             .expect("fixture image should be written");
 
-        let result = structured_result_with_optional_screenshot(
+        let result = observation_result_with_optional_screenshot(
             json!({"ok": true, "serial": "emulator-5554"}),
             Some(&path),
         )
         .await
         .expect("screenshot image content should be attached");
 
-        assert_eq!(
-            result
-                .structured_content
-                .as_ref()
-                .expect("structured receipt should be preserved"),
-            &json!({"ok": true, "serial": "emulator-5554"})
-        );
+        assert!(result.structured_content.is_none());
         assert_eq!(result.content.len(), 2);
+        let receipt = serde_json::to_value(&result.content[0])
+            .expect("JSON receipt should serialize for assertion");
+        assert_eq!(receipt["type"], "text");
+        let receipt: serde_json::Value = serde_json::from_str(
+            receipt["text"]
+                .as_str()
+                .expect("text receipt should contain JSON"),
+        )
+        .expect("JSON receipt should parse");
+        assert_eq!(receipt, json!({"ok": true, "serial": "emulator-5554"}));
         let image = serde_json::to_value(&result.content[1])
             .expect("image content should serialize for assertion");
         assert_eq!(image["type"], "image");
         assert_eq!(image["mimeType"], "image/png");
         assert_eq!(image["data"], BASE64_STANDARD.encode(b"png-bytes"));
+
+        let without_screenshot = observation_result_with_optional_screenshot(
+            json!({"ok": true, "serial": "emulator-5554"}),
+            None,
+        )
+        .await
+        .expect("structured result should remain available without a screenshot");
+        assert_eq!(
+            without_screenshot
+                .structured_content
+                .as_ref()
+                .expect("no-image response should retain structured receipt"),
+            &json!({"ok": true, "serial": "emulator-5554"})
+        );
 
         fs::remove_file(&path)
             .await

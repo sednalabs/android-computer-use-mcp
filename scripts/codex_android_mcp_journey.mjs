@@ -61,7 +61,14 @@ const finalMessage = (responseId) => sse([
 
 function assertTypedPng(output) {
   const images = output.filter((item) => item.type === "input_image");
-  assert.equal(images.length, 1, "Expected one typed screenshot in the model request.");
+  const outputShape = JSON.stringify(output.map((item) => ({
+    type: item.type,
+    mimeType: item.mimeType,
+    detail: item.detail,
+    imageUrlLength: typeof item.image_url === "string" ? item.image_url.length : undefined,
+    textLength: typeof item.text === "string" ? item.text.length : undefined,
+  })));
+  assert.equal(images.length, 1, `Expected one typed screenshot in the model request; received ${outputShape}.`);
   assert.equal(images[0].detail, "high");
   assert.ok(/^data:image\/png;base64,/.test(images[0].image_url), "Screenshot was not forwarded as a PNG data URL.");
   const png = Buffer.from(images[0].image_url.slice("data:image/png;base64,".length), "base64");
@@ -82,6 +89,15 @@ function assertBootReadiness(output) {
   const text = output.filter((item) => item.type === "input_text").map((item) => item.text).join("\n");
   assert.match(text, /"ok"\s*:\s*true/, "Android boot tool did not report readiness.");
   assert.match(text, /"serial"\s*:\s*"emulator-5554"/, "Android boot result did not identify the target emulator.");
+}
+
+function assertScreenshotReceipt(output) {
+  const text = output.filter((item) => item.type === "input_text").map((item) => item.text).join("\n");
+  const receipt = JSON.parse(text);
+  assert.equal(receipt.ok, true, "Android screenshot receipt did not report success.");
+  assert.equal(receipt.serial, "emulator-5554", "Android screenshot receipt did not identify the target emulator.");
+  assert.equal(typeof receipt.path, "string", "Android screenshot receipt did not preserve its artifact path.");
+  assert.equal(typeof receipt.backend_used, "string", "Android screenshot receipt did not preserve its capture backend.");
 }
 
 let api;
@@ -141,6 +157,7 @@ try {
       } else if (requestCount === 3) {
         const output = callOutput(body, "android-mcp-call-2");
         const imageBytes = assertTypedPng(output);
+        assertScreenshotReceipt(output);
         stream = finalMessage("android-mcp-response-3");
         response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
         response.end(stream);

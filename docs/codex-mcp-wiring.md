@@ -47,8 +47,11 @@ Codex configuration file or public workflow inputs.
 
 ## Model-visible screenshots
 
-`android.capture_screenshot` returns the PNG as an MCP image content item while
-preserving its structured serial, backend, and artifact-path receipt.
+`android.capture_screenshot` returns the PNG as an MCP image content item and
+keeps the serial, backend, and artifact path in a JSON text receipt. Image-bearing
+results omit `structuredContent`: Codex prefers that field when present and does
+not forward accompanying content blocks to the model. Results without an image
+continue to use structured content.
 `android.inspect_ui` and `android.wait_for_stable_ui` attach the same image item
 when screenshot capture is enabled. Codex can use these namespaced tools through
 its generic MCP configuration; no Codex-specific dynamic-tool adapter is
