@@ -32,4 +32,4 @@ for attempt in $(seq 1 60); do
   sleep 2
 done
 
-node "${repo_dir}/scripts/android_image_content_smoke.mjs"
+npm exec --yes --package=@openai/codex@0.163.0 -- node "${repo_dir}/scripts/codex_android_mcp_journey.mjs"
