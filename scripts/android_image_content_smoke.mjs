@@ -73,7 +73,8 @@ async function rpc(method, params) {
   }
   const payload = await parsePayload(response, method);
   if (!response.ok || payload?.error) {
-    throw new Error(`${method} failed with HTTP ${response.status}`);
+    const detail = typeof payload?.error?.message === "string" ? payload.error.message : "no JSON-RPC error detail";
+    throw new Error(`${method} failed with HTTP ${response.status}: ${detail.slice(0, 240)}`);
   }
   if (method === "initialize" && typeof payload?.result?.protocolVersion === "string") {
     protocolVersion = payload.result.protocolVersion;
