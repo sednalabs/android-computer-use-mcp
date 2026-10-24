@@ -74,7 +74,8 @@ jobs:
           MCP_ENDPOINT: http://127.0.0.1:9526/mcp
         with:
           api-level: 35
-          target: aosp_atd
+          # This journey asserts a rendered device screenshot; ATD images disable hardware rendering.
+          target: default
           arch: x86_64
           profile: pixel_7
           emulator-boot-timeout: 1200
