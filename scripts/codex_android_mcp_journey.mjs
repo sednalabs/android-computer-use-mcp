@@ -8,8 +8,8 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { zstdDecompressSync } from "node:zlib";
 import {
-  assertBootReadiness, assertObservationReceipt, assertScreenshotReceipt,
-  assertStepReceipt, assertTypedPng, callOutput,
+  assertBootReadiness, assertInstallReceipt, assertObservationReceipt, assertScreenshotReceipt,
+  assertStepReceipt, assertTypedPng, callOutput, jsonReceipt,
 } from "./codex_journey_assertions.mjs";
 
 const codexBinary = process.env.CODEX_BINARY || "codex";
@@ -22,6 +22,25 @@ const serial = process.env.ANDROID_SERIAL || "emulator-5554";
 const startedAt = new Date().toISOString();
 const checks = [];
 let consumerProvenance;
+let resolvedInstallTarget;
+let expectedBuild;
+const fixturePackage = "com.sednalabs.mcp.acceptance";
+if (scenario === "production") {
+  const artifactDigest = (process.env.ANDROID_ACCEPTANCE_ARTIFACT_SHA256 || "").replace(/^sha256:/, "");
+  assert.match(artifactDigest, /^[a-f0-9]{64}$/, "Production acceptance requires the uploaded fixture archive digest.");
+  assert.match(process.env.ANDROID_ACCEPTANCE_SOURCE_SHA || "", /^[a-f0-9]{40}$/, "Production acceptance requires the exact fixture source revision.");
+  assert.match(process.env.GITHUB_REPOSITORY || "", /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/);
+  assert.match(process.env.GITHUB_RUN_ID || "", /^[1-9][0-9]*$/);
+  assert.ok(Number.isSafeInteger(Number(process.env.GITHUB_RUN_ID)));
+  assert.ok(process.env.ANDROID_ACCEPTANCE_ARTIFACT_NAME, "Production acceptance requires the uploaded fixture artifact name.");
+  expectedBuild = {
+    repository: process.env.GITHUB_REPOSITORY,
+    commit_sha: process.env.ANDROID_ACCEPTANCE_SOURCE_SHA,
+    workflow_run_id: Number(process.env.GITHUB_RUN_ID),
+    artifact_name: process.env.ANDROID_ACCEPTANCE_ARTIFACT_NAME,
+    artifact_sha256: `sha256:${artifactDigest}`,
+  };
+}
 
 async function verifyConsumer() {
   const version = spawnSync(codexBinary, ["--version"], {
@@ -103,6 +122,7 @@ const finalMessage = (responseId) => sse([
 
 const successActionId = `codex-consumer-${protocolMode || "default"}-success`;
 const failureActionId = `codex-consumer-${protocolMode || "default"}-partial-failure`;
+const installActionId = `codex-consumer-${protocolMode || "default"}-install`;
 const successArgs = {
   serial, action_id: successActionId,
   actions: [{ tool: "android.input.keyevent", arguments: { keycode: "KEYCODE_HOME" } }],
@@ -118,6 +138,44 @@ if (scenario === "upstream-image") {
   });
 } else {
   steps.push({
+    name: "android_resolve_target", args: { serial },
+    check(output) {
+      const receipt = jsonReceipt(output);
+      assert.equal(receipt.ok, true);
+      assert.equal(receipt.contract_version, "android-provider-execution/v1");
+      const target = receipt.resolved_target;
+      assert.equal(target?.device_serial, serial);
+      resolvedInstallTarget = {};
+      for (const key of ["environment_id", "provider_instance_id", "provider_epoch", "session_id", "device_serial"]) {
+        assert.ok(typeof target[key] === "string" && target[key].length > 0, `Missing exact target field ${key}.`);
+        resolvedInstallTarget[key] = target[key];
+      }
+      return { gate: "exact_install_target", target: resolvedInstallTarget };
+    },
+  }, {
+    name: "android_install_build_from_run", args() {
+      assert.ok(resolvedInstallTarget, "Resolve the provider before constructing its install request.");
+      return {
+        action_id: installActionId,
+        build: {
+          contract_version: "android-provider-execution/v1",
+          workflow_run_id: expectedBuild.workflow_run_id,
+          artifact_name: expectedBuild.artifact_name,
+          repository: expectedBuild.repository,
+          install: { launch_after_install: true },
+          target: { ...resolvedInstallTarget, expected_build: expectedBuild },
+        },
+      };
+    },
+    check(output) {
+      const receipt = assertInstallReceipt(output, { serial, actionId: installActionId, expectedBuild, packageName: fixturePackage });
+      return {
+        gate: "hosted_install_receipt_and_image", image: assertTypedPng(output),
+        installed_build: receipt.install.install_receipt.installed_build,
+        apk_sha256: receipt.install.manifest.apk_sha256,
+      };
+    },
+  }, {
     name: "android_observe", args: { serial },
     check(output) {
       const receipt = assertObservationReceipt(output, serial);
@@ -156,7 +214,7 @@ if (scenario === "upstream-image") {
 }
 const enabledTools = scenario === "upstream-image"
   ? ["android.wait_for_boot", "android.capture_screenshot"]
-  : ["android.wait_for_boot", "android.observe", "android.step"];
+  : ["android.wait_for_boot", "android.resolve_target", "android.install_build_from_run", "android.observe", "android.step"];
 
 let api;
 let codex;
@@ -199,7 +257,7 @@ try {
       }
       const next = steps[requestCount - 1];
       const stream = next
-        ? toolCall(`android-mcp-response-${requestCount}`, `android-mcp-call-${requestCount}`, next.name, next.args)
+        ? toolCall(`android-mcp-response-${requestCount}`, `android-mcp-call-${requestCount}`, next.name, typeof next.args === "function" ? next.args() : next.args)
         : finalMessage(`android-mcp-response-${requestCount}`);
 
       response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
@@ -235,7 +293,7 @@ try {
     `url = ${JSON.stringify(mcpEndpoint)}`,
     "required = true",
     "startup_timeout_sec = 20",
-    "tool_timeout_sec = 150",
+    "tool_timeout_sec = 420",
     `enabled_tools = ${JSON.stringify(enabledTools)}`,
     ...(protocolMode ? [`protocol_mode = ${JSON.stringify(protocolMode)}`] : []),
     'default_tools_approval_mode = "approve"',
@@ -273,7 +331,7 @@ try {
     const softKill = setTimeout(() => {
       codex.kill("SIGTERM");
       hardKill = setTimeout(() => codex.kill("SIGKILL"), 10000);
-    }, 360000);
+    }, scenario === "production" ? 720000 : 360000);
     codex.once("error", reject);
     codex.once("close", (code, signal) => resolve({ code, signal }));
     codex.once("close", () => { clearTimeout(softKill); clearTimeout(hardKill); });
@@ -288,8 +346,10 @@ try {
     mcp_binary_sha256: process.env.MCP_BINARY_SHA256 || null,
     requested_protocol_mode: protocolMode || "client_default",
     negotiated_protocol_version: null,
-    serial, scripted_model_fixture: true, live_model_judgement: false,
-    hosted_build_install_tested: false, checks,
+    serial, android_build_fingerprint: process.env.ANDROID_BUILD_FINGERPRINT || null,
+    emulator_version: process.env.ANDROID_EMULATOR_VERSION || null,
+    scripted_model_fixture: true, live_model_judgement: false,
+    hosted_build_install_tested: checks.some((check) => check.gate === "hosted_install_receipt_and_image"), checks,
   };
   if (process.env.ANDROID_MCP_JOURNEY_EVIDENCE) {
     await writeFile(process.env.ANDROID_MCP_JOURNEY_EVIDENCE, `${JSON.stringify(evidence, null, 2)}\n`, { mode: 0o600 });

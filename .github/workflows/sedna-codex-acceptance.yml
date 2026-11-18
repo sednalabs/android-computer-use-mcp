@@ -13,10 +13,12 @@ on:
       - "src/**"
       - "spec/**"
       - "scripts/**"
+      - "tests/android-fixture/**"
   workflow_dispatch:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: sedna-codex-android-acceptance-${{ github.ref }}
@@ -76,13 +78,28 @@ jobs:
           set +o pipefail
           yes | "${sdk_root}/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null
           set -o pipefail
-          "${sdk_root}/cmdline-tools/latest/bin/sdkmanager" "emulator"
+          "${sdk_root}/cmdline-tools/latest/bin/sdkmanager" "emulator" "platforms;android-35" "build-tools;35.0.0"
           test -f "${sdk_root}/emulator/lib/emulator_controller.proto"
+
+      - name: Build the disposable Android acceptance app
+        id: fixture
+        env:
+          ANDROID_ACCEPTANCE_ARTIFACT_NAME: sedna-consumer-fixture-${{ github.run_id }}-${{ github.run_attempt }}
+        run: bash scripts/build_android_acceptance_fixture.sh "${RUNNER_TEMP}/android-acceptance-build"
+
+      - name: Publish the exact install candidate to this workflow run
+        id: fixture-artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ steps.fixture.outputs.artifact_name }}
+          path: ${{ steps.fixture.outputs.bundle_dir }}
+          if-no-files-found: error
+          retention-days: 3
 
       - name: Build the exact Android MCP checkout
         run: ANDROID_COMPUTER_USE_MCP_SDK_ROOT="${ANDROID_HOME}" cargo +1.96.0 build --locked
 
-      - name: Exercise observation, mutation, duplicate ID and partial failure
+      - name: Exercise hosted install, observation, duplicate ID and partial failure
         uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2
         env:
           CODEX_BINARY: ${{ runner.temp }}/sedna-codex-consumer/codex
@@ -91,6 +108,14 @@ jobs:
           ANDROID_COMPUTER_USE_MCP_BIND_ADDR: 127.0.0.1:9526
           ANDROID_COMPUTER_USE_MCP_ALLOWED_HOSTS: localhost,127.0.0.1,::1
           ANDROID_COMPUTER_USE_MCP_HTTP_ALLOW_RESUME: "0"
+          ANDROID_COMPUTER_USE_MCP_INTERACTIVE_SESSION_ROOT: ${{ runner.temp }}/sedna-consumer-session
+          ANDROID_COMPUTER_USE_MCP_INTERACTIVE_SESSION_GITHUB_REPOSITORY: ${{ github.repository }}
+          ANDROID_COMPUTER_USE_MCP_INTERACTIVE_SESSION_GITHUB_TOKEN: ${{ github.token }}
+          ANDROID_COMPUTER_USE_MCP_INTERACTIVE_SESSION_APP_PACKAGE: ${{ steps.fixture.outputs.package_name }}
+          ANDROID_COMPUTER_USE_MCP_INTERACTIVE_SESSION_APP_ACTIVITY: ${{ steps.fixture.outputs.activity_name }}
+          ANDROID_ACCEPTANCE_ARTIFACT_NAME: ${{ steps.fixture.outputs.artifact_name }}
+          ANDROID_ACCEPTANCE_SOURCE_SHA: ${{ steps.fixture.outputs.source_sha }}
+          ANDROID_ACCEPTANCE_ARTIFACT_SHA256: ${{ steps.fixture-artifact.outputs.artifact-digest }}
           ANDROID_SERIAL: emulator-5554
           MCP_ENDPOINT: http://127.0.0.1:9526/mcp
         with:

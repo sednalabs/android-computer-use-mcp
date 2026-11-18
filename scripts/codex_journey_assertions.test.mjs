@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { assertObservationReceipt, assertStepReceipt, assertTypedPng, callOutput, jsonReceipt } from "./codex_journey_assertions.mjs";
+import { assertInstallReceipt, assertObservationReceipt, assertStepReceipt, assertTypedPng, callOutput, jsonReceipt } from "./codex_journey_assertions.mjs";
 
 const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ip1sAAAAASUVORK5CYII=", "base64");
 const image = { type: "input_image", detail: "high", image_url: `data:image/png;base64,${png.toString("base64")}` };
@@ -56,4 +56,42 @@ test("output extraction retains call identity and rejects multiple receipts", ()
   assert.deepEqual(callOutput(body, "call-a"), [text(step), image]);
   assert.throws(() => callOutput(body, "call-b"), /Missing model-facing output/);
   assert.throws(() => jsonReceipt([text(step), text(step)]), /one JSON text receipt/);
+});
+
+test("hosted install evidence rejects wrong build identity and missing installation effects", () => {
+  const expectedBuild = {
+    repository: "fixture/app", commit_sha: "a".repeat(40), workflow_run_id: 42,
+    artifact_name: "fixture-apk", artifact_sha256: `sha256:${"b".repeat(64)}`,
+  };
+  const installedBuild = { ...expectedBuild, workflow_run_id: "42", package_name: "fixture.app", manifest_sha256: `sha256:${"c".repeat(64)}` };
+  const receipt = {
+    ...step, ok: true, action_id: "install-a", outcome: "verified", attempted_action_count: 1,
+    failed_index: null, actions: [{ index: 0, outcome: "verified" }],
+    install: {
+      ok: true, serial: step.serial, contract_version: "android-provider-execution/v1",
+      installed: true, install_performed: true, launched: true,
+      resolved_target: { device_serial: step.serial },
+      manifest: { package_name: "fixture.app", apk_sha256: "d".repeat(64) },
+      install_receipt: {
+        status: "installed", requested_build: expectedBuild, installed_build: installedBuild,
+        install_performed: true, reused_existing_build: false,
+        launch: { requested: true, attempted: true, performed: true },
+      },
+    },
+  };
+  const expected = { serial: step.serial, actionId: "install-a", expectedBuild, packageName: "fixture.app" };
+  assertInstallReceipt([text(receipt), image], expected);
+  for (const modify of [
+    (value) => { value.install.installed = false; },
+    (value) => { value.install.install_performed = false; },
+    (value) => { value.install.install_receipt.installed_build.commit_sha = "e".repeat(40); },
+    (value) => { value.install.install_receipt.installed_build.artifact_sha256 = `sha256:${"e".repeat(64)}`; },
+    (value) => { value.install.install_receipt.installed_build.workflow_run_id = "43"; },
+    (value) => { value.install.install_receipt.launch.performed = false; },
+    (value) => { value.install.resolved_target.device_serial = "emulator-5556"; },
+  ]) {
+    const changed = structuredClone(receipt);
+    modify(changed);
+    assert.throws(() => assertInstallReceipt([text(changed), image], expected));
+  }
 });

@@ -117,3 +117,32 @@ export function assertStepReceipt(output, { serial, actionId, success, count, at
   assert.equal(receipt.actions.length, attempted, "Actions continued after failure or receipts were lost.");
   return receipt;
 }
+
+export function assertInstallReceipt(output, { serial, actionId, expectedBuild, packageName, launch = true }) {
+  const receipt = assertStepReceipt(output, { serial, actionId, success: true, count: 1 });
+  const install = receipt.install;
+  assert.equal(install?.ok, true, "Hosted install lost its successful phase receipt.");
+  assert.equal(install.serial, serial);
+  assert.equal(install.contract_version, "android-provider-execution/v1");
+  assert.equal(install.installed, true, "The fixture must perform a real installation.");
+  assert.equal(install.install_performed, true);
+  assert.equal(install.launched, launch);
+  assert.equal(install.resolved_target?.device_serial, serial);
+  assert.equal(install.manifest?.package_name, packageName);
+  assert.match(install.manifest?.apk_sha256 || "", /^[a-f0-9]{64}$/);
+  const phase = install.install_receipt;
+  assert.equal(phase?.status, "installed");
+  assert.deepEqual(phase.requested_build, expectedBuild);
+  for (const field of ["repository", "commit_sha", "artifact_name", "artifact_sha256"]) {
+    assert.equal(phase.installed_build?.[field], expectedBuild[field], `Installed ${field} differs from the requested build.`);
+  }
+  assert.equal(String(phase.installed_build?.workflow_run_id), String(expectedBuild.workflow_run_id));
+  assert.equal(phase.installed_build?.package_name, packageName);
+  assert.match(phase.installed_build?.manifest_sha256 || "", /^sha256:[a-f0-9]{64}$/);
+  assert.equal(phase.install_performed, true);
+  assert.equal(phase.reused_existing_build, false);
+  assert.equal(phase.launch?.requested, launch);
+  assert.equal(phase.launch?.attempted, launch);
+  assert.equal(phase.launch?.performed, launch);
+  return receipt;
+}

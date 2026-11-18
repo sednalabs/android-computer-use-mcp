@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <item type="id" name="counter" />
+    <item type="id" name="increment" />
+    <item type="id" name="text_input" />
+    <item type="id" name="dialog" />
+    <item type="id" name="scroll" />
+    <item type="id" name="touch_pad" />
+    <item type="id" name="pointer_count" />
+    <item type="id" name="scroll_end" />
+    <item type="id" name="back_to_controls" />
+</resources>

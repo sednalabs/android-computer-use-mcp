@@ -11,12 +11,22 @@ Android MCP commit, consumer commit and binary digests with each result.
 | Rust validation | Locked dependency build, formatting, Clippy, tool schemas and Rust regression tests | A real device journey |
 | Adapter and consumer contracts | JavaScript contracts and negative tests for missing/corrupt images, wrong-device receipts and unsafe retry flags | Actual Codex or Android execution |
 | Upstream image smoke | Pinned upstream Codex 0.163.0 discovers Android tools and forwards a real emulator PNG and JSON receipt | Sedna fork compatibility or action parity |
-| Sedna Codex acceptance | Exact source-built fork discovers generic MCP tools; observe, successful action, duplicate ID and partial failure preserve typed PNGs and truthful receipts | Live model judgement, hosted build installation, multi-device races or a long session |
+| Android provider acceptance | A disposable Android app is installed from an exact GitHub Actions artifact; identity rejection, install-only behaviour, semantic controls, lifecycle, rotation and simultaneous touch run on a real emulator | Codex wire compatibility, multiple physical devices or production app behaviour |
+| Sedna Codex acceptance | Exact source-built fork discovers generic MCP tools; hosted install, observe, successful action, duplicate ID and partial failure preserve typed PNGs and truthful receipts | Live model judgement, multi-device races or a long session |
 
 The consumer fixture drives a disposable local Responses endpoint with fixed
 tool calls. It sends no real API credential and makes no call to a live model.
 This tests what reaches the model-facing request, not whether a model correctly
 understands the screen.
+
+The hosted install gate builds the small app in `tests/android-fixture`, uploads
+its APK and manifest to the same workflow run, and passes the upload's archive
+digest to `android.install_build_from_run` through Codex. The request binds the
+resolved provider epoch and device to the exact repository, source commit, run,
+artifact and archive digest. The model-facing receipt must preserve the known
+installation and launch effects, build identity and typed post-install PNG.
+The provider alone receives an Actions read token through its environment; the
+Codex subprocess and disposable model endpoint receive only a fake API key.
 
 Image results must retain one JSON text receipt and one typed PNG. They must not
 acquire `structuredContent` while a supported Codex consumer suppresses image
@@ -56,6 +66,16 @@ bash scripts/build_sedna_codex_consumer.sh \
 export CODEX_BINARY=<consumer-output-directory>/codex
 export CODEX_BUILD_PROVENANCE=<consumer-output-directory>/provenance.json
 export CODEX_SOURCE_SHA="$(cat scripts/sedna_codex_consumer_revision.txt)"
+export ANDROID_ACCEPTANCE_ARTIFACT_NAME=<uploaded-fixture-artifact-name>
+export ANDROID_ACCEPTANCE_ARTIFACT_SHA256=<upload-artifact-archive-digest>
+export ANDROID_ACCEPTANCE_SOURCE_SHA=<fixture-source-commit>
+export GITHUB_REPOSITORY=<owner/repository>
+export GITHUB_RUN_ID=<run-containing-the-fixture-artifact>
+export ANDROID_COMPUTER_USE_MCP_INTERACTIVE_SESSION_ROOT=<private-session-directory>
+export ANDROID_COMPUTER_USE_MCP_INTERACTIVE_SESSION_GITHUB_REPOSITORY="$GITHUB_REPOSITORY"
+export ANDROID_COMPUTER_USE_MCP_INTERACTIVE_SESSION_APP_PACKAGE=com.sednalabs.mcp.acceptance
+export ANDROID_COMPUTER_USE_MCP_INTERACTIVE_SESSION_APP_ACTIVITY=com.sednalabs.mcp.acceptance.MainActivity
+# Provide ANDROID_COMPUTER_USE_MCP_INTERACTIVE_SESSION_GITHUB_TOKEN securely.
 export ANDROID_SDK_ROOT=<android-sdk-directory>
 export ANDROID_SERIAL=emulator-5554
 export ANDROID_COMPUTER_USE_MCP_BIND_ADDR=127.0.0.1:9526
@@ -83,7 +103,7 @@ the actual deployed consumer/provider pair and its configuration, including:
 - Long sessions and bounded artefact retention, with measured latency on the
   named host and emulator configuration.
 
-The current consumer receipt explicitly records `hosted_build_install_tested:
-false` and `live_model_judgement: false`. Those fields must only change when a
-corresponding executed gate provides evidence. A workflow definition or queued
-run is not a passing result.
+Consumer receipts set `hosted_build_install_tested` only after the hosted install
+result passes its model-facing assertions. `live_model_judgement` remains false.
+These are results of executed checks; a workflow definition or queued run is not
+a passing result.
