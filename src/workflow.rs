@@ -9,7 +9,7 @@ use crate::tools::*;
 use crate::ui::{UiSelectorInput, ensure_selector_not_empty, normalize_selector_input};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Content, RawContent};
+use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::{tool, tool_router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -328,7 +328,7 @@ fn receipt_from_result(result: &CallToolResult) -> Result<Value, McpError> {
         return Ok(value.clone());
     }
     for content in &result.content {
-        if let RawContent::Text(text) = &content.raw
+        if let ContentBlock::Text(text) = content
             && let Ok(value) = serde_json::from_str::<Value>(&text.text)
             && value.is_object()
         {
@@ -381,8 +381,8 @@ fn image_from_result(result: &CallToolResult) -> Result<Vec<u8>, McpError> {
     let images = result
         .content
         .iter()
-        .filter_map(|content| match &content.raw {
-            RawContent::Image(image) => Some(image),
+        .filter_map(|content| match content {
+            ContentBlock::Image(image) => Some(image),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -406,10 +406,10 @@ fn json_image_result(receipt: Value, image: Option<Vec<u8>>) -> Result<CallToolR
     let is_error = receipt.get("ok").and_then(Value::as_bool) != Some(true);
     let text = serde_json::to_string(&receipt)
         .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-    let mut content = vec![Content::text(text)];
+    let mut content = vec![ContentBlock::text(text)];
     if let Some(bytes) = image {
         png_dimensions(&bytes)?;
-        content.push(Content::image(STANDARD.encode(bytes), "image/png"));
+        content.push(ContentBlock::image(STANDARD.encode(bytes), "image/png"));
     }
     let mut result = CallToolResult::success(content);
     result.is_error = Some(is_error);
@@ -636,7 +636,11 @@ impl AndroidEmulatorMcp {
         observation["serial"] = json!(serial);
         observation["observation_id"] = json!(id);
         observation["provider_epoch"] = json!(self.config.execution_identity.provider_epoch);
-        observation["captured_at"] = json!(chrono::Utc::now().to_rfc3339());
+        observation["captured_at"] = json!(
+            time::OffsetDateTime::now_utc()
+                .format(&time::format_description::well_known::Rfc3339)
+                .expect("current UTC time has an RFC3339 representation")
+        );
         observation["elapsed_ms"] = json!(started.elapsed().as_millis());
         observation["screenshot_present"] = json!(image.is_some());
         let frame_fresh = started.elapsed() <= OBSERVATION_TTL;

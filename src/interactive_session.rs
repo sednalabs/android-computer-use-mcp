@@ -2248,7 +2248,11 @@ async fn write_json_file(path: &Path, payload: &serde_json::Value) -> Result<(),
 }
 
 fn iso_now() -> String {
-    chrono_like_iso(SystemTimeLike::now())
+    time::OffsetDateTime::now_utc()
+        .replace_nanosecond(0)
+        .expect("zero nanoseconds is valid")
+        .format(&time::format_description::well_known::Rfc3339)
+        .expect("current UTC time has an RFC3339 representation")
 }
 
 fn timestamp_slug() -> String {
@@ -2258,19 +2262,6 @@ fn timestamp_slug() -> String {
         crate::config::process_epoch(),
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     )
-}
-
-struct SystemTimeLike(std::time::SystemTime);
-
-impl SystemTimeLike {
-    fn now() -> Self {
-        Self(std::time::SystemTime::now())
-    }
-}
-
-fn chrono_like_iso(now: SystemTimeLike) -> String {
-    let datetime: chrono::DateTime<chrono::Utc> = now.0.into();
-    datetime.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
 #[cfg(test)]

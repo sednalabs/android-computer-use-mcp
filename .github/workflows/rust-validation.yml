@@ -58,6 +58,14 @@ jobs:
           cargo run --locked --bin android-computer-use-mcp -- --print-tools > /tmp/tools.json
           test -s /tmp/tools.json
 
+      - name: Install Node.js for HTTP contracts
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24.22.3"
+
+      - name: Verify HTTP workflow recovery with a simulated device
+        run: python3 scripts/test_mcp_workflow_http.py
+
   javascript-contracts:
     name: Adapter And Consumer Contracts
     runs-on: ubuntu-24.04

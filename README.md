@@ -58,6 +58,9 @@ backend details such as ADB and emulator gRPC remain implementation details.
 
 ## Quick Start
 
+Building requires Rust 1.99 or newer, a Protobuf compiler (`protoc`), and the
+Android SDK emulator package, which supplies the gRPC protocol definitions.
+
 Set the Android SDK paths for your machine and start the loopback server:
 
 ```bash

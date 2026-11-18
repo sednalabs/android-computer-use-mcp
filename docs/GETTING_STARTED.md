@@ -5,7 +5,7 @@ loopback Android emulator automation workflow.
 
 ## Prerequisites
 
-- Rust toolchain with the edition used by this crate.
+- Rust 1.99 or newer and the Protobuf compiler (`protoc`) on `PATH`.
 - Android SDK with `adb`, `emulator`, and `avdmanager`.
 - At least one Android Virtual Device if you want the MCP to launch an emulator.
 - A trusted local shell. This server is intended for local or runner-owned
@@ -48,26 +48,26 @@ curl http://127.0.0.1:9526/health
 List registered tools:
 
 ```bash
-cargo run -- --print-tools
+cargo run --locked -- --print-tools
 ```
 
 ## First Tool Flow
 
-Start with the generic Android tools:
+Start with `android.health` and `android.list_devices`. If an emulator needs to
+be started, use `android.list_avds` and `android.launch_avd_and_wait`.
 
-1. `android.health`
-2. `android.list_devices`
-3. `android.list_avds` if no device is already running
-4. `android.launch_avd_and_wait` to launch and wait for boot
-5. `android.install_apk` for the target APK
-6. `android.launch_app` for the target package/activity
-7. `android.wait_for_stable_ui` before acting on the UI
-8. `android.tap_element` or `android.type_into_element` for semantic interaction
-9. `android.capture_screenshot`, `android.dump_ui_hierarchy`, or
-   `android.collect_logcat` for proof artifacts
+Resolve the exact device with `android.resolve_target`, then use
+`android.observe` for a screenshot and compact UI receipt. Send semantic actions
+through `android.step`, assigning a unique action ID to each intended batch.
+The server executes the batch once, stops after failure and returns a fresh
+observation. After a lost response, recover the existing ID with
+`android.get_action_status` before deciding the next action.
 
-Prefer semantic UI tools when a selector can describe the target. Use
-`android.input.*` tools as explicit fallbacks for coordinate or key-event work.
+For a configured hosted build, use `android.install_build_from_run` with the
+exact build identity. `android.install_apk` remains available for a local APK.
+Prefer semantic selectors when they describe the target; coordinate actions
+require a recent observation ID. See [Agent Workflows and Recovery](agent-workflows.md)
+for complete requests, outcome interpretation and deployment limits.
 
 ## Codex Wiring
 

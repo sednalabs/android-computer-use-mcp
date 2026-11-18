@@ -24,7 +24,11 @@ pub(crate) fn normalized_visible_window_dump_fingerprint_for_package(
 ) -> Result<String, String> {
     let mut archive = ZipArchive::new(Cursor::new(payload))
         .map_err(|error| format!("failed to open visible-window dump zip: {error}"))?;
-    let mut entry_names = archive.file_names().map(str::to_string).collect::<Vec<_>>();
+    let mut entry_names = archive
+        .file_names()
+        .map(|name| name.map(|name| name.into_owned()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("failed to read visible-window entry name: {error}"))?;
     entry_names.sort();
 
     let mut hasher = DefaultHasher::new();
@@ -132,7 +136,7 @@ mod tests {
         let buffer = Cursor::new(Vec::new());
         let mut writer = ZipWriter::new(buffer);
         if let Some(comment) = comment {
-            writer.set_comment(comment);
+            writer.set_comment(comment).expect("valid fixture comment");
         }
         let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
         let iter: Box<dyn Iterator<Item = &(&str, &[u8])>> = if reverse_order {

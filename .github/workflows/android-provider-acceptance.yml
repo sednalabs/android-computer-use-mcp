@@ -50,7 +50,11 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+          sudo apt-get install -y protobuf-compiler acl
+          test -c /dev/kvm
+          sudo setfacl -m "u:$(id -un):rw" /dev/kvm
+          test -r /dev/kvm
+          test -w /dev/kvm
           sdk_root="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
           echo "ANDROID_HOME=${sdk_root}" >> "${GITHUB_ENV}"
           echo "ANDROID_SDK_ROOT=${sdk_root}" >> "${GITHUB_ENV}"
@@ -62,6 +66,7 @@ jobs:
           set -o pipefail
           "${sdk_root}/cmdline-tools/latest/bin/sdkmanager" "emulator" "platforms;android-35" "build-tools;35.0.0"
           test -f "${sdk_root}/emulator/lib/emulator_controller.proto"
+          "${sdk_root}/emulator/emulator" -accel-check
           javac -version
 
       - name: Validate acceptance scripts
@@ -106,7 +111,7 @@ jobs:
           profile: pixel_7
           emulator-boot-timeout: 1200
           disable-animations: false
-          disable-linux-hw-accel: auto
+          disable-linux-hw-accel: false
           emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot-save -noaudio -no-boot-anim -camera-back none -grpc 8554
           script: node "${GITHUB_WORKSPACE}/scripts/android_provider_acceptance.mjs"
 

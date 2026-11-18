@@ -71,7 +71,9 @@ const mcpEndpoint = process.env.MCP_ENDPOINT ?? "http://127.0.0.1:9526/mcp";
 const endpointUrl = new URL(mcpEndpoint);
 assert.ok(endpointUrl.protocol === "http:" && ["127.0.0.1", "localhost", "[::1]"].includes(endpointUrl.hostname), "The disposable journey must use a loopback MCP endpoint.");
 assert.ok(!endpointUrl.username && !endpointUrl.password, "MCP endpoint must not contain credentials.");
-const tmpRoot = await mkdtemp(path.join(tmpdir(), "android-mcp-codex-consumer-"));
+// Codex helper aliases must live outside the global /tmp directory when the
+// host provides a private job directory. The consumer home remains isolated.
+const tmpRoot = await mkdtemp(path.join(process.env.RUNNER_TEMP || tmpdir(), "android-mcp-codex-consumer-"));
 const codexHome = path.join(tmpRoot, "codex-home");
 const codexCwd = path.join(tmpRoot, "workspace");
 await mkdir(codexHome);

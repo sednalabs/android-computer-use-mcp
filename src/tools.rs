@@ -17,7 +17,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::tool;
 use rmcp::tool_router;
 use schemars::JsonSchema;
@@ -5742,8 +5742,8 @@ pub(crate) fn observation_result_with_optional_screenshot(
     // Codex prefers structured_content and drops accompanying image content.
     // Keep both blocks in content until the generic consumer supports both channels.
     let mut result = CallToolResult::success(vec![
-        Content::text(receipt),
-        Content::image(BASE64_STANDARD.encode(bytes), "image/png"),
+        ContentBlock::text(receipt),
+        ContentBlock::image(BASE64_STANDARD.encode(bytes), "image/png"),
     ]);
     result.is_error = Some(is_error);
     Ok(result)

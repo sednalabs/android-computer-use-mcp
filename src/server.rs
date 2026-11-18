@@ -18,9 +18,9 @@ use mcp_toolkit_core::tool_inventory::{ToolInventory, ToolInventoryPolicy, ToolO
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::model::{
-    CallToolRequestMethod, CallToolRequestParams, CallToolResult, Implementation,
+    CallToolRequestMethod, CallToolRequestParams, CallToolResponse, Implementation,
     ListResourcesResult, ListToolsResult, PaginatedRequestParams, ProtocolVersion,
-    ReadResourceRequestParams, ReadResourceResult, ServerCapabilities, ServerInfo, Tool,
+    ReadResourceRequestParams, ReadResourceResponse, ServerCapabilities, ServerConfig, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::transport::common::http_header::HEADER_SESSION_ID;
@@ -128,7 +128,13 @@ fn session_id_from_context(context: &RequestContext<RoleServer>) -> Option<Strin
 }
 
 impl ServerHandler for AndroidEmulatorMcp {
-    fn get_info(&self) -> ServerInfo {
+    fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [ProtocolVersion]> {
+        // An SDK upgrade must not opt this provider into a new lifecycle before
+        // its cancellation and image-bearing consumer contracts are qualified.
+        std::borrow::Cow::Borrowed(ProtocolVersion::known_up_to(&Self::protocol_version()))
+    }
+
+    fn get_info(&self) -> ServerConfig {
         rmcp_models::server_info(
             Self::protocol_version(),
             ServerCapabilities::builder()
@@ -155,18 +161,14 @@ impl ServerHandler for AndroidEmulatorMcp {
                 .tool_list_tracker
                 .observe(&session_id, tools.iter().map(|tool| tool.name.as_ref()));
         }
-        std::future::ready(Ok(ListToolsResult {
-            meta: None,
-            tools,
-            next_cursor: None,
-        }))
+        std::future::ready(Ok(ListToolsResult::with_all_items(tools)))
     }
 
     fn call_tool(
         &self,
         mut request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> impl Future<Output = Result<CallToolResult, rmcp::ErrorData>> + Send + '_ {
+    ) -> impl Future<Output = Result<CallToolResponse, rmcp::ErrorData>> + Send + '_ {
         let call_allowed = self.tool_inventory.is_allowed(
             &request.name,
             ToolOperation::Call,
@@ -191,7 +193,7 @@ impl ServerHandler for AndroidEmulatorMcp {
             let result = crate::execution::REQUEST_CANCELLATION
                 .scope(cancellation, self.tool_router.call(tool_context))
                 .await;
-            if let Ok(payload) = &result
+            if let Ok(CallToolResponse::Complete(payload)) = &result
                 && !payload.is_error.unwrap_or(false)
             {
                 self.maybe_notify_tool_list_changed(session_id.as_deref(), &peer)
@@ -206,19 +208,17 @@ impl ServerHandler for AndroidEmulatorMcp {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListResourcesResult, rmcp::ErrorData>> + Send + '_ {
-        std::future::ready(Ok(ListResourcesResult {
-            resources: resources::list_resources(),
-            next_cursor: None,
-            meta: None,
-        }))
+        std::future::ready(Ok(ListResourcesResult::with_all_items(
+            resources::list_resources(),
+        )))
     }
 
     fn read_resource(
         &self,
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> impl Future<Output = Result<ReadResourceResult, rmcp::ErrorData>> + Send + '_ {
-        std::future::ready(resources::read_resource(&request.uri))
+    ) -> impl Future<Output = Result<ReadResourceResponse, rmcp::ErrorData>> + Send + '_ {
+        std::future::ready(resources::read_resource(&request.uri).map(Into::into))
     }
 }
 
@@ -381,6 +381,31 @@ mod tests {
             &server.tool_list_tracker,
             &session.tool_list_tracker
         ));
+    }
+
+    #[test]
+    fn sdk_upgrade_preserves_the_qualified_protocol_ceiling() {
+        use rmcp::ServerHandler;
+        let server = AndroidEmulatorMcp::new(test_config());
+        let request: rmcp::model::InitializeRequestParams =
+            serde_json::from_value(serde_json::json!({
+                "protocolVersion": "2026-07-28",
+                "capabilities": {},
+                "clientInfo": { "name": "protocol-ceiling-test", "version": "1" }
+            }))
+            .expect("valid initialization request");
+        let response = server
+            .negotiate_initialize(&request)
+            .expect("legacy fallback");
+        assert_eq!(
+            response.protocol_version,
+            super::ProtocolVersion::V_2025_06_18
+        );
+        assert!(
+            !server
+                .supported_protocol_versions()
+                .contains(&super::ProtocolVersion::V_2026_07_28)
+        );
     }
 
     #[test]

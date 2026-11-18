@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 
 use mcp_toolkit_core::rmcp_models;
-use rmcp::model::{Annotated, RawResource, ReadResourceResult, Resource, ResourceContents};
+use rmcp::model::{ReadResourceResult, Resource, ResourceContents};
 use serde_json::json;
 
 use crate::tool_surface::{ToolSurfaceEntry, tool_surface_entries};
@@ -164,19 +164,12 @@ fn resource_for_text(
     mime_type: &str,
     size: Option<usize>,
 ) -> Resource {
-    Annotated::new(
-        RawResource {
-            uri: uri.to_string(),
-            name: name.to_string(),
-            title: Some(title.to_string()),
-            description: Some(description.to_string()),
-            mime_type: Some(mime_type.to_string()),
-            size: size.map(|value| value.min(u32::MAX as usize) as u32),
-            icons: None,
-            meta: None,
-        },
-        None,
-    )
+    let mut resource = Resource::new(uri, name)
+        .with_title(title)
+        .with_description(description)
+        .with_mime_type(mime_type);
+    resource.size = size.map(|value| value as u64);
+    resource
 }
 
 #[cfg(test)]

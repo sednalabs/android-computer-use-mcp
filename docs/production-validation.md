@@ -9,6 +9,7 @@ Android MCP commit, consumer commit and binary digests with each result.
 | Gate | What it establishes | What it does not establish |
 | --- | --- | --- |
 | Rust validation | Locked dependency build, formatting, Clippy, tool schemas and Rust regression tests | A real device journey |
+| HTTP workflow contracts | Independent MCP sessions share duplicate-action protection; exact simulated mutation counts and offline receipt recovery survive provider restart | Real Android execution or Codex image conversion |
 | Adapter and consumer contracts | JavaScript contracts and negative tests for missing/corrupt images, wrong-device receipts and unsafe retry flags | Actual Codex or Android execution |
 | Upstream image smoke | Pinned upstream Codex 0.163.0 discovers Android tools and forwards a real emulator PNG and JSON receipt | Sedna fork compatibility or action parity |
 | Android provider acceptance | A disposable Android app is installed from an exact GitHub Actions artifact; identity rejection, install-only behaviour, semantic controls, lifecycle, rotation and simultaneous touch run on a real emulator | Codex wire compatibility, multiple physical devices or production app behaviour |
@@ -39,6 +40,13 @@ places Home after it. It requires one completed action, two attempted calls,
 the successful batch with the same action ID must return
 `duplicate_action_id: true`. Rust fake-provider tests are the stronger proof of
 underlying dispatch counts; the consumer fixture checks the public receipt.
+
+The HTTP regression uses a disposable simulated SDK and the built provider's
+actual HTTP endpoint. Run it after `cargo build --locked` with
+`python3 scripts/test_mcp_workflow_http.py`. It requires Node.js and Python, and
+uses no real device or model credential. It checks image-bearing results,
+cross-session and concurrent duplicate IDs, the exact underlying mutation log,
+and durable status after restarting the provider with its device offline.
 
 ## Pinning the actual Sedna consumer
 
