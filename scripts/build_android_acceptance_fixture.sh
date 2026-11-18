@@ -31,7 +31,9 @@ test -z "$(find "$bundle_dir" -mindepth 1 -maxdepth 1 -print -quit)" || {
 "$build_tools/aapt2" link -o "$work_dir/unsigned.apk" \
   -I "$android_jar" --manifest "$repo_dir/tests/android-fixture/AndroidManifest.xml" \
   --java "$work_dir/generated" --min-sdk-version 23 --target-sdk-version 35 "$work_dir/resources.zip"
-javac -source 8 -target 8 -bootclasspath "$android_jar" -d "$work_dir/classes" \
+# Android's boot stubs omit javac's LambdaMetafactory; D8 below desugars
+# the Java 8 bytecode against Android's API library for minimum API 23.
+javac -source 8 -target 8 -classpath "$android_jar" -d "$work_dir/classes" \
   "$work_dir/generated/com/sednalabs/mcp/acceptance/R.java" \
   "$repo_dir/tests/android-fixture/src/com/sednalabs/mcp/acceptance/MainActivity.java"
 jar cf "$work_dir/classes.jar" -C "$work_dir/classes" .
