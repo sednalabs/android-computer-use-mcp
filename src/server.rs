@@ -32,6 +32,7 @@ use crate::{resources, tool_surface};
 #[derive(Clone)]
 pub struct AndroidEmulatorMcp {
     pub config: Arc<Config>,
+    pub(crate) workflow: Arc<crate::execution::ExecutionState>,
     tool_router: ToolRouter<AndroidEmulatorMcp>,
     tool_inventory: ToolInventory,
     tool_inventory_policy: ToolInventoryPolicy,
@@ -59,11 +60,23 @@ impl AndroidEmulatorMcp {
             .expect("android-computer-use-mcp tool inventory registration must remain valid");
         Self {
             config: Arc::new(config),
-            tool_router: Self::tool_router_android(),
+            workflow: Arc::new(crate::execution::ExecutionState::default()),
+            tool_router: Self::tool_router_all(),
             tool_inventory,
             tool_inventory_policy: ToolInventoryPolicy::strict(),
             tool_list_tracker: Arc::new(ToolListTracker::new()),
         }
+    }
+
+    pub fn tool_router_all() -> ToolRouter<Self> {
+        Self::tool_router_android() + Self::tool_router_workflow() + Self::tool_router_execution()
+    }
+
+    pub(crate) fn new_session(&self) -> Self {
+        let mut session = self.clone();
+        // Device state is shared; discovery tracking expires with its session.
+        session.tool_list_tracker = Arc::new(ToolListTracker::new());
+        session
     }
 
     pub fn tool_names(&self) -> Vec<String> {
@@ -95,10 +108,10 @@ impl AndroidEmulatorMcp {
         let update = self
             .tool_list_tracker
             .observe(session_id, tools.iter().map(|tool| tool.name.as_ref()));
-        if matches!(update, ToolListUpdate::Changed { .. }) {
-            if let Err(err) = peer.notify_tool_list_changed().await {
-                tracing::debug!(error = %err, session_id, "tools list_changed notification failed");
-            }
+        if matches!(update, ToolListUpdate::Changed { .. })
+            && let Err(err) = peer.notify_tool_list_changed().await
+        {
+            tracing::debug!(error = %err, session_id, "tools list_changed notification failed");
         }
     }
 }
@@ -151,7 +164,7 @@ impl ServerHandler for AndroidEmulatorMcp {
 
     fn call_tool(
         &self,
-        request: CallToolRequestParams,
+        mut request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<CallToolResult, rmcp::ErrorData>> + Send + '_ {
         let call_allowed = self.tool_inventory.is_allowed(
@@ -161,17 +174,28 @@ impl ServerHandler for AndroidEmulatorMcp {
         );
         let session_id = session_id_from_context(&context);
         let peer = context.peer.clone();
-        let tool_context = ToolCallContext::new(self, request, context);
+        let cancellation = context.ct.clone();
         async move {
             if !call_allowed {
                 return Err(rmcp::ErrorData::method_not_found::<CallToolRequestMethod>());
             }
-            let result = self.tool_router.call(tool_context).await;
-            if let Ok(payload) = &result {
-                if !payload.is_error.unwrap_or(false) {
-                    self.maybe_notify_tool_list_changed(session_id.as_deref(), &peer)
-                        .await;
-                }
+            let _leases = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return Err(cancelled_before_dispatch()),
+                leases = self.acquire_operation_leases(&mut request) => leases?,
+            };
+            if cancellation.is_cancelled() {
+                return Err(cancelled_before_dispatch());
+            }
+            let tool_context = ToolCallContext::new(self, request, context);
+            let result = crate::execution::REQUEST_CANCELLATION
+                .scope(cancellation, self.tool_router.call(tool_context))
+                .await;
+            if let Ok(payload) = &result
+                && !payload.is_error.unwrap_or(false)
+            {
+                self.maybe_notify_tool_list_changed(session_id.as_deref(), &peer)
+                    .await;
             }
             result
         }
@@ -196,6 +220,121 @@ impl ServerHandler for AndroidEmulatorMcp {
     ) -> impl Future<Output = Result<ReadResourceResult, rmcp::ErrorData>> + Send + '_ {
         std::future::ready(resources::read_resource(&request.uri))
     }
+}
+
+impl AndroidEmulatorMcp {
+    async fn acquire_operation_leases(
+        &self,
+        request: &mut CallToolRequestParams,
+    ) -> Result<Vec<tokio::sync::OwnedMutexGuard<()>>, crate::McpError> {
+        let name = request.name.to_string();
+        if matches!(
+            name.as_str(),
+            "android.health"
+                | "android.list_avds"
+                | "android.list_devices"
+                | "android.read_artifact"
+                | "android.get_action_status"
+                | "android.resolve_target"
+        ) {
+            return Ok(Vec::new());
+        }
+        let mut leases = Vec::new();
+        let hosted =
+            name.starts_with("interactive_session.") || name == "android.install_build_from_run";
+        // All hosted installs share active-build.json regardless of device.
+        if hosted {
+            leases.push(self.operation_lease("hosted-build-state").await?);
+            if matches!(
+                name.as_str(),
+                "interactive_session.get_status" | "interactive_session.get_current_build"
+            ) {
+                return Ok(leases);
+            }
+        }
+        if name.starts_with("android.launch_avd") {
+            leases.push(self.operation_lease("emulator-launch").await?);
+            return Ok(leases);
+        }
+        let arguments = request.arguments.get_or_insert_with(Default::default);
+        let mut nested = serde_json::Map::new();
+        let values = if name == "android.install_build_from_run" {
+            nested = arguments
+                .get("build")
+                .and_then(serde_json::Value::as_object)
+                .cloned()
+                .ok_or_else(|| crate::McpError::invalid_params("build must be an object", None))?;
+            &mut nested
+        } else {
+            &mut *arguments
+        };
+        let serial = match values.get("serial") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(s)) if !s.trim().is_empty() => Some(s.trim().to_owned()),
+            _ => {
+                return Err(crate::McpError::invalid_params(
+                    "serial must be a nonempty string",
+                    None,
+                ));
+            }
+        };
+        let target: Option<crate::config::AndroidExecutionTarget> = values
+            .get("target")
+            .filter(|v| !v.is_null())
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|e| crate::McpError::invalid_params(format!("invalid target: {e}"), None))?;
+        let target = self
+            .resolve_android_execution_target(target.as_ref(), serial.as_deref())
+            .await?;
+        let serial = target.device_serial;
+        values.insert("serial".into(), serde_json::json!(serial));
+        if name == "android.install_build_from_run" {
+            arguments.insert("build".into(), serde_json::Value::Object(nested));
+        }
+        leases.push(self.operation_lease(&format!("device:{serial}")).await?);
+        if is_direct_device_mutation(&name) {
+            self.workflow.invalidate(&serial).await;
+        }
+        Ok(leases)
+    }
+    async fn operation_lease(
+        &self,
+        key: &str,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, crate::McpError> {
+        tokio::time::timeout(std::time::Duration::from_secs(30), self.workflow.lock(key)).await
+            .map_err(|_| crate::McpError::internal_error("device busy; no action dispatched", Some(serde_json::json!({"outcome":"provider_busy","retry_safe":true,"do_not_replay":false}))))
+    }
+}
+
+fn is_direct_device_mutation(name: &str) -> bool {
+    !matches!(
+        name,
+        "android.observe"
+            | "android.step"
+            | "android.install_build_from_run"
+            | "android.list_apps"
+            | "android.get_orientation"
+            | "android.wait_for_boot"
+            | "android.capture_screenshot"
+            | "android.dump_ui_hierarchy"
+            | "android.inspect_ui"
+            | "android.wait_for_stable_ui"
+            | "android.find_ui_element"
+            | "android.wait_for_ui_element"
+            | "android.collect_logcat"
+    )
+}
+
+fn cancelled_before_dispatch() -> crate::McpError {
+    crate::McpError::internal_error(
+        "request cancelled before dispatch",
+        Some(serde_json::json!({
+            "outcome":"cancelled", "retry_safe":true, "do_not_replay":false,
+            "mutation_dispatched":false,
+        })),
+    )
 }
 
 #[cfg(test)]
@@ -224,7 +363,24 @@ mod tests {
                 allow_resume: true,
             },
             interactive_session: None,
+            execution_identity: crate::config::ProviderExecutionIdentity {
+                environment_id: "test".into(),
+                provider_instance_id: "test-provider".into(),
+                provider_epoch: "test-epoch".into(),
+                session_id: "test-session".into(),
+            },
         }
+    }
+
+    #[test]
+    fn transport_sessions_share_leases_but_expire_their_own_discovery_state() {
+        let server = AndroidEmulatorMcp::new(test_config());
+        let session = server.new_session();
+        assert!(std::sync::Arc::ptr_eq(&server.workflow, &session.workflow));
+        assert!(!std::sync::Arc::ptr_eq(
+            &server.tool_list_tracker,
+            &session.tool_list_tracker
+        ));
     }
 
     #[test]

@@ -54,6 +54,16 @@ Treat those artifacts as potentially sensitive because they can contain:
 Do not commit generated artifacts unless they have been reviewed for public
 release.
 
+Generated writes use unique files and checked, bounded paths. Reads reject
+private action-ledger contents, symlink escapes and oversized files. Artifact
+admission stops at documented implementation limits; files are not silently
+deleted. Emulator stdout streams require host log rotation.
+
+A persistent private artifact root also contains non-replayable operation
+receipts. Do not clear that root to retry an uncertain action. Shared device
+leases cover this process's MCP sessions, not unrelated ADB clients or another
+server process.
+
 ## APK and App Boundary
 
 Only install APKs that are expected for the current task. An APK installed into
@@ -61,7 +71,10 @@ an emulator can still exercise Android permissions, write app data, produce logs
 or expose sensitive UI in screenshots.
 
 Hosted install helpers should be configured with repository and token access
-that is no broader than the runner needs.
+that is no broader than the runner needs. The configured repository, exact
+run/attempt, artifact and manifest digests, package identity and installed APK
+are checked. Archive extraction is bounded. A signing mismatch does not
+automatically uninstall an existing app.
 
 ## Secrets
 

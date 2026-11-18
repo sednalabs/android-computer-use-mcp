@@ -12,8 +12,7 @@ on:
       - "build.rs"
       - "src/**"
       - "spec/**"
-      - "scripts/codex_android_mcp_journey.mjs"
-      - "scripts/run_android_image_content_smoke.sh"
+      - "scripts/**"
   workflow_dispatch:
 
 permissions:
@@ -41,6 +40,11 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
+
+      - name: Install Node.js for the consumer fixture
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24.22.3"
 
       - name: Install Android emulator SDK
         shell: bash
@@ -83,3 +87,12 @@ jobs:
           disable-linux-hw-accel: auto
           emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot-save -noaudio -no-boot-anim -camera-back none
           script: sh "${GITHUB_WORKSPACE}/scripts/run_android_image_content_smoke.sh"
+
+      - name: Preserve the consumer evidence receipt
+        if: ${{ always() && !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: upstream-codex-image-evidence
+          path: ${{ runner.temp }}/android-mcp-evidence-upstream-image.json
+          if-no-files-found: warn
+          retention-days: 14

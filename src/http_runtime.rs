@@ -51,8 +51,9 @@ pub async fn serve(config: Config) -> Result<()> {
     session_config.channel_capacity = config.streamable_http.channel_capacity;
     let runtime = build_local_streamable_http_service(
         {
-            let config = config.clone();
-            move || Ok(AndroidEmulatorMcp::new((*config).clone()))
+            // Every HTTP session must share device leases and observation IDs.
+            let server = AndroidEmulatorMcp::new((*config).clone());
+            move || Ok(server.new_session())
         },
         LocalStreamableHttpServiceConfig {
             max_sessions: config.streamable_http.max_sessions,
@@ -107,8 +108,6 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
     Json(json!({
         "status": "ok",
         "bind_addr": state.config.streamable_http.bind_addr.to_string(),
-        "artifact_dir": state.config.artifact_dir.display().to_string(),
-        "sdk_root": state.config.sdk_root.display().to_string(),
         "resume_enabled": state.config.streamable_http.allow_resume,
         "session": session_stats_json(stats),
     }))

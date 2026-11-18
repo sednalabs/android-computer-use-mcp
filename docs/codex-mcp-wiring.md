@@ -9,28 +9,20 @@ Add a block like this to `~/.codex/config.toml`:
 ```toml
 [mcp_servers.android_computer_use_mcp]
 url = "http://127.0.0.1:9526/mcp"
-tool_timeout_sec = 300.0
+tool_timeout_sec = 420.0
 enabled = false
 default_tools_approval_mode = "prompt"
 enabled_tools = [
   "android.health",
   "android.list_devices",
+  "android.resolve_target",
   "android.wait_for_boot",
-  "android.capture_screenshot",
-  "android.inspect_ui",
-  "android.wait_for_stable_ui",
-  "android.find_ui_element",
-  "android.wait_for_ui_element",
-  "android.tap_element",
-  "android.type_into_element",
-  "android.input.keyevent",
-  "android.input.swipe",
-  "android.input.tap",
-  "android.input.text",
-  "android.scroll_until_visible",
+  "android.observe",
+  "android.step",
+  "android.get_action_status",
+  "android.install_build_from_run",
   "interactive_session.get_status",
   "interactive_session.get_current_build",
-  "interactive_session.install_build_from_run",
 ]
 ```
 
@@ -38,8 +30,10 @@ Keep `enabled = false` until the operator is ready to turn the server on in
 their active Codex profile. The allow-list covers a hosted interactive session's
 readiness, visual/selector-driven interaction, and build provenance/install
 flow; add diagnostics or raw input tools only when the use case needs them.
-Prompt approval is retained for observation, input, and build installation while
-qualifying the exact endpoint and session.
+The example retains prompt approval while qualifying the endpoint. The primary
+observation and action-status tools are annotated read-only; mutation and build
+installation remain distinct policy decisions. See [Agent workflows](agent-workflows.md)
+for action IDs, bounded batches and partial-failure recovery.
 
 For a hosted session, change only the URL to the exact MCP endpoint supplied by
 that session and use its existing access policy. Do not put access tokens in the
@@ -47,7 +41,9 @@ Codex configuration file or public workflow inputs.
 
 ## Model-visible screenshots
 
-`android.capture_screenshot` returns the PNG as an MCP image content item and
+`android.observe`, `android.step` and `android.install_build_from_run` return a
+fresh PNG with their receipt, including partial failures when capture succeeds.
+Missing pixels are explicit errors. `android.capture_screenshot` returns the PNG as an MCP image content item and
 keeps the serial, backend, and artifact path in a JSON text receipt. Image-bearing
 results omit `structuredContent`: Codex prefers that field when present and does
 not forward accompanying content blocks to the model. Results without an image

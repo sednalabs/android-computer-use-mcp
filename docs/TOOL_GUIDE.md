@@ -4,19 +4,19 @@
 structured results and artifact paths. The tools are grouped by how an agent
 should normally use them.
 
-## Recommended Order
+## Recommended workflow
 
-1. Discover the harness state with `android.health`, `android.list_devices`, and
-   `android.list_avds`.
-2. Launch or attach to a device with `android.launch_avd_and_wait` or
-   `android.wait_for_boot`.
-3. Install and launch the target app with `android.install_apk` and
-   `android.launch_app`.
-4. Observe with `android.wait_for_stable_ui` or `android.inspect_ui`.
-5. Act with semantic tools such as `android.tap_element` and
-   `android.type_into_element`.
-6. Fall back to raw input only when semantic targeting cannot express the action.
-7. Capture proof with screenshots, UI XML, logcat, or scenario manifests.
+Discover and resolve an exact ready device, then use `android.observe` and
+`android.step` for ordinary agent interaction. Preserve each action ID and use
+`android.get_action_status` after a lost response or provider restart. Use
+`android.install_build_from_run` for a hosted build when its operator
+configuration is enabled. These tools run through generic MCP, with no native
+Codex Android integration.
+
+See [Agent workflows](agent-workflows.md) for complete examples, receipt fields,
+coordinate freshness and non-replay semantics. Low-level tools remain available
+for focused inspection and specialised input. They share device leases but do
+not inherit the composite workflow's durable action-ID guarantee.
 
 ## Core Discovery
 
@@ -24,6 +24,7 @@ should normally use them.
   directory state.
 - `android.list_avds` lists Android Virtual Devices known to the configured SDK.
 - `android.list_devices` lists attached or running Android devices.
+- `android.resolve_target` validates a ready serial and exact provider/session identity.
 
 ## Lifecycle
 
@@ -34,9 +35,15 @@ should normally use them.
 - `android.launch_app` launches a package/activity and verifies requested
   postconditions when supplied.
 
+- `android.list_apps`, `android.terminate_app`, `android.uninstall_app` and
+  `android.open_url` provide explicit app lifecycle operations.
+- `android.get_orientation` and `android.set_orientation` use observed default-display rotation.
+
 ## Observation
 
-- `android.capture_screenshot` writes a PNG artifact.
+- `android.observe` returns model-visible pixels, compact UI and an observation ID.
+- `android.capture_screenshot` writes a PNG artifact and returns a typed image.
+- `android.read_artifact` reads a bounded, root-confined artifact.
 - `android.dump_ui_hierarchy` writes a UIAutomator XML artifact.
 - `android.collect_logcat` writes a logcat artifact.
 - `android.inspect_ui` captures a paired screenshot/UI dump with normalized UI
@@ -69,6 +76,9 @@ nodes are valid targets.
 - `android.input.text`
 - `android.input.swipe`
 - `android.input.keyevent`
+- `android.input.double_tap` and `android.input.long_press`
+- `android.input.multi_touch` (atomic emulator gRPC only)
+- `android.input.keycombination`
 
 Raw input is useful for fallback control, but it should not be the first choice
 when a stable semantic selector exists. Raw actions can include postcondition
@@ -101,7 +111,7 @@ app is the task.
 For clients that support deferred tool loading, keep the bootstrap tools eager
 and load heavier groups only when needed:
 
-- eager: health, device discovery, AVD launch, install, app launch
+- eager: health, target resolution, observe, step and action status
 - deferred observation: screenshots, UI XML, stable UI, logcat
 - deferred semantic UI: selector-driven find, wait, tap, type, scroll
 - deferred raw input: coordinate/key fallbacks

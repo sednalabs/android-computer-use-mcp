@@ -109,31 +109,7 @@ fn build_about_text() -> String {
 }
 
 fn build_help_text() -> String {
-    [
-        "# Android Computer Use MCP help",
-        "",
-        "Recommended interaction order:",
-        "1. interactive_session.get_status when working against a hosted runner-backed session.",
-        "2. android.health or android.list_devices to understand the current harness state.",
-        "3. android.wait_for_boot if a device may still be starting.",
-        "4. interactive_session.install_build_from_run to swap a fresh remote-built APK into a live hosted session.",
-        "5. android.launch_app or a Solar Lab scenario to reach the target surface.",
-        "6. android.wait_for_stable_ui before acting through semantic UI tools.",
-        "7. android.tap_element or android.type_into_element for semantic interaction.",
-        "8. android.input.* only when semantic tools are insufficient.",
-        "",
-        "Guidance:",
-        "- Prefer semantic UI tools over raw input whenever a selector can describe the target.",
-        "- Prefer scenario tools for durable Solar Lab flows instead of rebuilding them ad hoc.",
-        "- Use observation tools when you need artifacts or structured state, not just one action.",
-        "",
-        "Hosted usage notes:",
-        "- This server works well as a runner-backed Android substrate over Streamable HTTP.",
-        "- interactive_session.* tools exist to avoid restarting the hosted runner for each new build.",
-        "- Discovery resources exist so a fresh agent can orient without local repo context.",
-        "",
-    ]
-    .join("\n")
+    include_str!("../docs/agent-workflows.md").to_owned()
 }
 
 fn build_tool_catalog() -> String {
@@ -145,7 +121,7 @@ fn build_tool_catalog() -> String {
 
     let payload = json!({
         "server": "android-computer-use-mcp",
-        "preferred_lane": "semantic-ui-first",
+        "preferred_lane": "observe-step-status",
         "fallback_lane": "raw-input",
         "groups": groups,
         "tools": entries.iter().map(entry_json).collect::<Vec<_>>(),

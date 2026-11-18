@@ -2,7 +2,7 @@
   "payload": {
     "reads": {
       "about": "# Android Computer Use MCP\n\nPurpose:\n- Provide a structured Android execution substrate for emulator lifecycle, app control, observation, semantic UI interaction, raw input fallback, and Solar Lab scenarios.\n\nCurrent posture:\n- Hosted interactive-session tools can reuse a live runner-backed emulator without rebuilding or rebooting it for each new APK.\n- Semantic Android tools are the preferred interaction lane.\n- Raw input tools remain available as fallback when semantic selection is insufficient.\n- Solar Lab scenarios are first-class tools rather than private hand-assembled scripts.\n\nContract:\n- Public tool exposure is governed by explicit tool inventory registration.\n- Discovery resources are read-only and intended for cold-start orientation.\n- Tool schema and resource catalog snapshots guard the public contract.\n",
-      "help": "# Android Computer Use MCP help\n\nRecommended interaction order:\n1. interactive_session.get_status when working against a hosted runner-backed session.\n2. android.health or android.list_devices to understand the current harness state.\n3. android.wait_for_boot if a device may still be starting.\n4. interactive_session.install_build_from_run to swap a fresh remote-built APK into a live hosted session.\n5. android.launch_app or a Solar Lab scenario to reach the target surface.\n6. android.wait_for_stable_ui before acting through semantic UI tools.\n7. android.tap_element or android.type_into_element for semantic interaction.\n8. android.input.* only when semantic tools are insufficient.\n\nGuidance:\n- Prefer semantic UI tools over raw input whenever a selector can describe the target.\n- Prefer scenario tools for durable Solar Lab flows instead of rebuilding them ad hoc.\n- Use observation tools when you need artifacts or structured state, not just one action.\n\nHosted usage notes:\n- This server works well as a runner-backed Android substrate over Streamable HTTP.\n- interactive_session.* tools exist to avoid restarting the hosted runner for each new build.\n- Discovery resources exist so a fresh agent can orient without local repo context.\n",
+      "help": "# Android agent workflows\n\nUse the generic MCP connection in Codex. Android execution stays in this server;\nno retired native Android provider or Codex-specific tool bridge is required.\nStart with `android.resolve_target`, `android.observe`, `android.step` and\n`android.get_action_status`. Enable `android.install_build_from_run` when the\nhosted build configuration is present.\n\n## Observe and act\n\n`android.observe` takes an optional exact `serial` and provider `target`, plus\n`timeout_secs` from 1 to 15. It returns one typed PNG and one JSON text receipt.\nIf the UI hierarchy is unavailable, screenshot fallback is labelled explicitly.\nIf pixels are unavailable, the result is an MCP error rather than visual success.\nProvider identity and device constraints apply to both observe and step.\n`target.expected_build` is accepted only by the hosted install and relaunch\ncontracts; observe and step reject it rather than imply that they verified the\ninstalled build.\n\n```json\n{\"serial\":\"emulator-5554\"}\n```\n\n`android.step` accepts one to sixteen actions using the documented low-level tool\narguments. All argument shapes and target serials are checked before dispatch.\nThe server holds a device lease through the final observation, executes actions\nserially and stops at the first failure or cancellation. A two-minute dispatch\nbudget stops further actions; an already dispatched action finishes its bounded\nexecution and cleanup before the final observation. A batch is not a\ntransaction: completed actions are not rolled back.\n\n```json\n{\n  \"serial\": \"emulator-5554\",\n  \"action_id\": \"journey-2026-11-19-open-settings\",\n  \"actions\": [\n    {\"tool\":\"android.input.keyevent\",\"arguments\":{\"keycode\":\"KEYCODE_HOME\"}},\n    {\"tool\":\"android.launch_app\",\"arguments\":{\"package_name\":\"com.android.settings\"}}\n  ]\n}\n```\n\nThe batch permits semantic tap/type/scroll, raw input, app launch/termination,\nHTTP(S) URL opening and orientation changes. Installation, uninstall, nested\nbatches and arbitrary tools are excluded. See the schema for supported names.\nDirect low-level tools remain available when their specific behaviour is needed;\nthey do not acquire the workflow's durable action-ID guarantee.\n\nCoordinate gestures must be the first action and supply `observation_id` from a\nrecent `android.observe`. The server checks the observation's device, boot ID,\n30-second age, window identity, orientation, dimensions and bounds. Animation\nwithin the same window is allowed. Set `strict_frame_match: true` to require\nidentical pixels. Prefer semantic selectors where possible. Every batch\nchecks the boot identity again before each dispatch and stops if it changes.\n\n## Interpret outcomes and recover\n\nThe receipt includes `ok`, `outcome`, `executed_action_count`,\n`attempted_action_count`, zero-based `failed_index`, per-action receipts,\n`retry_safe`, `do_not_replay`, and the final observation.\n\n`executed_action_count` counts successfully completed action calls. A failed\ncall may still have affected the device; `attempted_action_count` includes that\ncall. `dispatched` confirms transport completion. `verified` additionally needs\nan explicit satisfied postcondition. An empty postcondition is not UI proof.\n\nEach caller-generated action ID is bound to its request and exact device.\nIntent is flushed to disk before dispatch, and completion is saved before\nscreenshot capture. A repeated ID returns the prior receipt and a fresh\nobservation with `duplicate_action_id: true`; it never repeats the mutation.\nA cancelled, timed-out or interrupted operation remains `outcome_unknown` until\nreconciled. There is no automatic resume of a partly completed batch.\n\nAfter a lost response, provider restart or device disconnect, call\n`android.get_action_status` with the same `action_id`. This does not touch the\ndevice and works when it is offline. Then observe and decide the next action.\nA missing receipt is not proof that an operation never happened. Do not assign a\nnew ID merely to replay an uncertain tap, text entry or installation.\n\nReceipts live in the private `.action-ledger` under the configured artifact root.\nThe artifact reader cannot expose that directory. Pending and complete IDs are\nnot silently evicted. The ledger stops accepting new IDs at its capacity;\narchive it deliberately when retiring a session, while retaining evidence for\nany uncertain operations. Deleting or changing the artifact root discards its\nrecovery history and must not be treated as permission to replay old requests.\n\n## Install a hosted build\n\n`android.install_build_from_run` takes `action_id` and a `build` object using the\nhosted install contract. Prefer the versioned request:\n\n```json\n{\n  \"action_id\": \"install-run-123456\",\n  \"build\": {\n    \"contract_version\": \"android-provider-execution/v1\",\n    \"workflow_run_id\": 123456,\n    \"artifact_name\": \"interactive-build\",\n    \"repository\": \"example/app\",\n    \"install\": {\"launch_after_install\": false},\n    \"target\": {\n      \"environment_id\": \"runner-a\",\n      \"provider_instance_id\": \"android-a\",\n      \"provider_epoch\": \"<epoch returned by resolve_target>\",\n      \"session_id\": \"session-a\",\n      \"device_serial\": \"emulator-5554\",\n      \"expected_build\": {\n        \"repository\": \"example/app\",\n        \"commit_sha\": \"<40-character commit SHA>\",\n        \"workflow_run_id\": 123456,\n        \"artifact_name\": \"interactive-build\",\n        \"artifact_sha256\": \"sha256:<64-character artifact archive digest>\"\n      }\n    }\n  }\n}\n```\n\nReplace placeholders with the actual provider receipt and build provenance.\nThe repository must match the operator's hosted-session configuration. The\nserver verifies GitHub run identity, archive and manifest digests, package and\nactivity, APK bytes, and installed base APK identity. An explicit expected\ncommit supports workflows building a selected checkout; legacy requests require\nthe workflow head. The current contract installs a single APK, not split APK sets.\n\nInstall-only requests neither launch nor stop the application. Signing conflicts\nfail without uninstalling or deleting app data. If the operator deliberately\nneeds a clean install, uninstall is a separate explicit operation. A successful\ninstallation followed by launch, persistence or observation failure retains its\nknown installation effects in the receipt.\n\nThe legacy `interactive_session.install_build_from_run` remains available with\nits translated argument layout and phase receipts. Use the new wrapper to gain\na durable action ID and a post-install image. A provider restart invalidates\npersisted active-build reuse; revalidate the installed app rather than treating\nan old provider epoch as current.\n\n## Operating limits\n\nRun one server process for each configured SDK/artifact/session scope. All MCP\nsessions in that process share device leases. These leases do not coordinate\nunrelated ADB clients or other server processes. Use a dedicated emulator and\noperator-owned directories; this remains trusted local automation.\n\nSet distinct `ANDROID_COMPUTER_USE_MCP_ENVIRONMENT_ID`,\n`ANDROID_COMPUTER_USE_MCP_PROVIDER_INSTANCE_ID` and\n`ANDROID_COMPUTER_USE_MCP_SESSION_ID` for distinct hosted sessions. The process\nprovides its own fresh epoch. The HTTP health endpoint reports readiness and\nsession counts without disclosing SDK or artifact paths.\n\nGenerated artifact writes stop at a 1 GiB directory budget, 4096 files or a\n32 MiB individual file. Existing artifacts are never silently removed. The\nprivate action ledger has its own 10,000-record limit. Provision a persistent,\nprivate artifact directory and archive completed sessions explicitly. Emulator\nstdout log streams are managed by the host's logging/rotation policy.\n\nAtomic multi-touch requires a serial-bound emulator gRPC endpoint. Unsupported\nbackends refuse the gesture. A gRPC mutation failure does not trigger an ADB\nreplay. ADB text input rejects characters it cannot preserve; use an appropriate\ngRPC-capable emulator for Unicode and control-character input.\n\nSee [Production validation](production-validation.md) for the executed evidence\nrequired before promoting a particular consumer/provider pair.\n",
       "scenario_catalog": {
         "domain": "solarlab",
         "notes": [
@@ -36,18 +36,47 @@
       "tool_catalog": {
         "fallback_lane": "raw-input",
         "groups": {
-          "app-control": 2,
+          "app-control": 7,
           "emulator-lifecycle": 4,
           "interactive-session": 4,
-          "observation": 5,
-          "raw-input": 4,
+          "observation": 6,
+          "raw-input": 8,
           "semantic-ui": 5,
           "solarlab-scenarios": 3,
-          "status": 2
+          "status": 4,
+          "workflow": 4
         },
-        "preferred_lane": "semantic-ui-first",
+        "preferred_lane": "observe-step-status",
         "server": "android-computer-use-mcp",
         "tools": [
+          {
+            "description": "Recover a durable action receipt without touching the device.",
+            "group": "workflow",
+            "name": "android.get_action_status",
+            "read_only": true,
+            "use_when": "Use this after a lost response, disconnect or provider restart before deciding the next action."
+          },
+          {
+            "description": "Return a fresh image, compact UI and exact device observation identity.",
+            "group": "workflow",
+            "name": "android.observe",
+            "read_only": true,
+            "use_when": "Use this to inspect the device before planning or reconciling an uncertain action."
+          },
+          {
+            "description": "Execute a short action batch once and return receipts plus a fresh image.",
+            "group": "workflow",
+            "name": "android.step",
+            "read_only": false,
+            "use_when": "Use a unique action ID for serial actions with stop-on-failure and no replay."
+          },
+          {
+            "description": "Install an exact hosted build once and return phase receipts plus a fresh image.",
+            "group": "workflow",
+            "name": "android.install_build_from_run",
+            "read_only": false,
+            "use_when": "Use this for verified build installation with durable recovery by action ID."
+          },
           {
             "description": "Report hosted interactive-session configuration, live session root, and active build metadata.",
             "group": "interactive-session",
@@ -63,7 +92,7 @@
             "use_when": "Use this when you want the exact build currently installed without changing live session state."
           },
           {
-            "description": "Download a reusable interactive build artifact from a GitHub Actions run, install it into the live session, and relaunch the app.",
+            "description": "Download a reusable interactive build artifact from a GitHub Actions run, install it into the live session, and optionally relaunch the app.",
             "group": "interactive-session",
             "name": "interactive_session.install_build_from_run",
             "read_only": false,
@@ -96,6 +125,13 @@
             "name": "android.list_devices",
             "read_only": true,
             "use_when": "Use this when you need the current device serials or want to confirm device visibility."
+          },
+          {
+            "description": "Resolve one exact Android provider, session, and device target.",
+            "group": "status",
+            "name": "android.resolve_target",
+            "read_only": true,
+            "use_when": "Use this before a target-bound Android operation to reject a stale or mismatched provider session."
           },
           {
             "description": "Launch a named AVD in the background.",
@@ -133,11 +169,53 @@
             "use_when": "Use this to bring an app to the foreground before semantic UI interaction."
           },
           {
-            "description": "Capture a PNG screenshot, save it as an artifact, and return it as MCP image content.",
+            "description": "List installed Android apps, optionally limited to launcher-visible apps.",
+            "group": "app-control",
+            "name": "android.list_apps",
+            "read_only": true,
+            "use_when": "Use this when you need package names before launching, terminating, or uninstalling apps."
+          },
+          {
+            "description": "Force-stop an installed Android app by package name.",
+            "group": "app-control",
+            "name": "android.terminate_app",
+            "read_only": false,
+            "use_when": "Use this to reset app state without uninstalling it."
+          },
+          {
+            "description": "Uninstall an Android app by package name.",
+            "group": "app-control",
+            "name": "android.uninstall_app",
+            "read_only": false,
+            "use_when": "Use this only when the app should be removed from the device."
+          },
+          {
+            "description": "Open an http:// or https:// URL on the Android device.",
+            "group": "app-control",
+            "name": "android.open_url",
+            "read_only": false,
+            "use_when": "Use this when the browser or URL intent path is the task under test."
+          },
+          {
+            "description": "Read the device user_rotation setting and normalized orientation class.",
+            "group": "status",
+            "name": "android.get_orientation",
+            "read_only": true,
+            "use_when": "Use this to record orientation before choosing gestures or validation expectations."
+          },
+          {
+            "description": "Set the device user_rotation after disabling accelerometer rotation.",
+            "group": "app-control",
+            "name": "android.set_orientation",
+            "read_only": false,
+            "use_when": "Use this when validation needs a known portrait or landscape posture."
+          },
+          {
+            "description": "Capture a PNG screenshot from the device and save it locally.",
             "group": "observation",
             "name": "android.capture_screenshot",
             "read_only": false,
-            "use_when": "Use this when a model-visible visual observation is needed."
+            "use_when": "Use this when a visual artifact is more important than the normalized UI tree."
           },
           {
             "description": "Dump the current UI hierarchy XML and save it locally.",
@@ -147,14 +225,21 @@
             "use_when": "Use this when you need raw hierarchy XML for debugging or later parsing."
           },
           {
-            "description": "Capture the current UI hierarchy and normalized tree, optionally attaching the screenshot as MCP image content.",
+            "description": "Read a previously generated artifact file from the configured artifact directory and return its contents for remote consumers.",
+            "group": "observation",
+            "name": "android.read_artifact",
+            "read_only": true,
+            "use_when": "Use this when a remote consumer needs the bytes or text for a screenshot, UI dump, or other artifact path that was returned earlier."
+          },
+          {
+            "description": "Capture the current UI hierarchy, optionally pair it with a screenshot, and return a normalized UI tree.",
             "group": "observation",
             "name": "android.inspect_ui",
             "read_only": false,
             "use_when": "Use this for a rich one-shot observation of the current Android state."
           },
           {
-            "description": "Wait for a stable UI and return its structured observation, optionally attaching the screenshot as MCP image content.",
+            "description": "Wait until the UI hierarchy and top window state stop changing, then return a paired observation bundle.",
             "group": "observation",
             "name": "android.wait_for_stable_ui",
             "read_only": false,
@@ -210,6 +295,20 @@
             "use_when": "Use this only when semantic selection is insufficient and you already know the screen coordinates."
           },
           {
+            "description": "Send a double-tap input event to the device as one bounded gesture.",
+            "group": "raw-input",
+            "name": "android.input.double_tap",
+            "read_only": false,
+            "use_when": "Use this only when a genuine Android double-tap gesture is needed and semantic interaction is insufficient."
+          },
+          {
+            "description": "Send a long-press input event to the device as one bounded gesture.",
+            "group": "raw-input",
+            "name": "android.input.long_press",
+            "read_only": false,
+            "use_when": "Use this only when a genuine Android long-press gesture is needed and semantic interaction is insufficient."
+          },
+          {
             "description": "Send text input to the device.",
             "group": "raw-input",
             "name": "android.input.text",
@@ -224,11 +323,25 @@
             "use_when": "Use this only when semantic scrolling is insufficient or you need an exact gesture path."
           },
           {
+            "description": "Send two to five pointer paths as one atomic emulator gRPC gesture.",
+            "group": "raw-input",
+            "name": "android.input.multi_touch",
+            "read_only": false,
+            "use_when": "Use this for pinch, two-finger pan, or another gesture that must keep every pointer in the same device frame."
+          },
+          {
             "description": "Send a keyevent to the device.",
             "group": "raw-input",
             "name": "android.input.keyevent",
             "read_only": false,
             "use_when": "Use this for bounded low-level actions like Back or Enter when semantic tools are not the right fit."
+          },
+          {
+            "description": "Send a chorded key combination to the device.",
+            "group": "raw-input",
+            "name": "android.input.keycombination",
+            "read_only": false,
+            "use_when": "Use this for computer-use key chords such as Ctrl+C that must be dispatched atomically."
           },
           {
             "description": "Launch Solar Lab, open search, focus Earth, and capture step-by-step artifacts.",
@@ -267,7 +380,7 @@
         "description": "Recommended interaction loops and lane guidance.",
         "mimeType": "text/markdown",
         "name": "help",
-        "size": 1245,
+        "size": 8106,
         "title": "Android Computer Use MCP help",
         "uri": "android-computer-use-mcp://help"
       },
@@ -275,7 +388,7 @@
         "description": "Structured inventory of public Android and Solar Lab tools.",
         "mimeType": "application/json",
         "name": "tool-catalog",
-        "size": 9486,
+        "size": 14403,
         "title": "Android tool catalog",
         "uri": "android-computer-use-mcp://tool-catalog"
       },

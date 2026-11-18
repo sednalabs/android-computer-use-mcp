@@ -12,6 +12,9 @@ backend details such as ADB and emulator gRPC remain implementation details.
 
 ## What It Provides
 
+- Image-bearing observe/step/install workflows with durable action IDs,
+  per-device leases, partial receipts and recovery after disconnects.
+
 - Emulator lifecycle tools for AVD discovery, launch, readiness, app install, and
   app launch.
 - Observation tools for screenshots, UIAutomator XML, normalized UI summaries,
@@ -29,6 +32,8 @@ backend details such as ADB and emulator gRPC remain implementation details.
 
 ## Documentation
 
+- [Agent Workflows and Recovery](docs/agent-workflows.md)
+- [Production Validation](docs/production-validation.md)
 - [Getting Started](docs/GETTING_STARTED.md)
 - [Tool Guide](docs/TOOL_GUIDE.md)
 - [Security Model](docs/SECURITY_MODEL.md)
@@ -83,6 +88,9 @@ For a fuller setup walkthrough, see [Getting Started](docs/GETTING_STARTED.md).
 The server can be configured with CLI flags and environment variables. Important
 environment variables include:
 
+- `ANDROID_COMPUTER_USE_MCP_ENVIRONMENT_ID`
+- `ANDROID_COMPUTER_USE_MCP_PROVIDER_INSTANCE_ID`
+- `ANDROID_COMPUTER_USE_MCP_SESSION_ID`
 - `ANDROID_COMPUTER_USE_MCP_SDK_ROOT`
 - `ANDROID_COMPUTER_USE_MCP_ADB_PATH`
 - `ANDROID_COMPUTER_USE_MCP_EMULATOR_PATH`
@@ -108,6 +116,11 @@ are rejected by configuration validation in this release line.
 
 The committed schema snapshot currently includes these public tool groups:
 
+- Agent workflows: `android.observe`, `android.step`,
+  `android.install_build_from_run`, `android.get_action_status`
+- App/device control: `android.resolve_target`, `android.list_apps`,
+  `android.terminate_app`, `android.uninstall_app`, `android.open_url`,
+  `android.get_orientation`, `android.set_orientation`, `android.read_artifact`
 - Core health and discovery: `android.health`, `android.list_avds`,
   `android.list_devices`
 - Emulator lifecycle: `android.launch_avd`, `android.launch_avd_and_wait`,
@@ -118,7 +131,8 @@ The committed schema snapshot currently includes these public tool groups:
   `android.tap_element`, `android.type_into_element`,
   `android.scroll_until_visible`
 - Raw input: `android.input.tap`, `android.input.text`, `android.input.swipe`,
-  `android.input.keyevent`
+  `android.input.keyevent`, `android.input.double_tap`, `android.input.long_press`,
+  `android.input.multi_touch`, `android.input.keycombination`
 - Hosted interactive session: `interactive_session.get_status`,
   `interactive_session.get_current_build`,
   `interactive_session.install_build_from_run`,
@@ -144,7 +158,8 @@ usable endpoint is discovered or configured:
 - if a `grpc.token` is published, the MCP attaches the required bearer token
 - if `ANDROID_COMPUTER_USE_MCP_EMULATOR_GRPC_PORT` is set, launched emulators include
   `-grpc <port>`
-- if gRPC is unavailable or unhealthy, the MCP falls back to ADB
+- mutating calls use ADB only before gRPC dispatch, never to replay an uncertain action
+- atomic multi-touch requires a serial-bound gRPC backend and has no sequential ADB substitute
 
 This keeps the tool contract stable while allowing lower-latency local emulator
 control where it is available.
@@ -168,9 +183,9 @@ ownership, and truthful tool results.
 Useful local checks include:
 
 ```bash
-cargo test
-cargo fmt --all
-cargo clippy --all-targets --all-features
+cargo test --locked
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
 ```
 
 The tool schema snapshot is checked by the Rust test suite. Refresh it only when
