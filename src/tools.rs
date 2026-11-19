@@ -11767,9 +11767,7 @@ else:
                 );
                 receipt
             } else {
-                let error = result
-                    .err()
-                    .expect("recovery alone must not satisfy the tap");
+                let error = result.expect_err("recovery alone must not satisfy the tap");
                 let data = error.data.unwrap();
                 assert_eq!(data["outcome"], "postcondition_failed", "{scenario}");
                 assert_eq!(data["retry_safe"], false);

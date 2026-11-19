@@ -10,7 +10,10 @@ import { setTimeout as delay } from "node:timers/promises";
 import { createMcpStreamableHttpClient } from "../adapters/openai/mcp_streamable_http_client.js";
 import { assertTypedPng } from "./codex_journey_assertions.mjs";
 import { summarizeDisplayGeometry, summarizeInputGeometry, summarizeWmSize } from "./android_provider_geometry.mjs";
-import { classifyAnrOwner, decodeXmlAttribute, summarizeBuildIdentity, summarizeVerification } from "./android_provider_diagnostics.mjs";
+import {
+  awakeUnlockedReadiness, classifyAnrOwner, decodeXmlAttribute, pollReadOnlyReadiness,
+  summarizeBuildIdentity, summarizeCredentialReadiness, summarizeVerification,
+} from "./android_provider_diagnostics.mjs";
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const required = (name) => {
@@ -78,14 +81,36 @@ const fixtureLabels = new Set([
 const staticFixtureLabel = (label) => typeof label === "string" &&
   (fixtureLabels.has(label) || /^(?:Count: \d{1,3}|Max pointers: [0-5]|Completed two-pointer gestures: \d{1,3}|Scroll row \d{1,2})$/.test(label))
   ? label : undefined;
-function deviceState() {
+function deviceState(timeoutMs = 10000) {
+  const deadline = performance.now() + timeoutMs;
   const capture = (args) => {
-    const result = spawnSync(adb, ["-s", serial, "shell", "dumpsys", ...args], { timeout: 5000, maxBuffer: 1024 * 1024 });
+    const remaining = Math.ceil(deadline - performance.now());
+    if (remaining <= 0) return { available: false };
+    const result = spawnSync(adb, ["-s", serial, "shell", "dumpsys", ...args], { timeout: Math.min(5000, remaining), maxBuffer: 1024 * 1024 });
     if (result.error || result.status !== 0) return { available: false };
     const pattern = /\b(mWakefulness|mInteractive|mAwake|mScreenOnEarly|mScreenOnFully|mKeyguardShowing|mKeyguardOccluded|showing|showingAndNotOccluded|inputRestricted|occluded|secure|deviceHasKeyguard)\s*[:=]\s*(true|false|Awake|Asleep|Dreaming|Dozing)\b/g;
-    return { available: true, fields: [...result.stdout.toString("utf8").matchAll(pattern)].slice(0, 40).map((match) => ({ name: match[1], value: match[2] })) };
+    const fields = [...result.stdout.toString("utf8").matchAll(pattern)].map((match) => ({ name: match[1], value: match[2] }));
+    return fields.length > 40 ? { available: false } : { available: true, fields };
   };
   return { power: capture(["power"]), window_policy: capture(["window", "policy"]) };
+}
+function credentialReadiness(timeoutMs) {
+  const deadline = performance.now() + timeoutMs;
+  const capture = (args) => {
+    const remaining = Math.ceil(deadline - performance.now());
+    if (remaining <= 0) return undefined;
+    const result = spawnSync(adb, ["-s", serial, "shell", ...args], { timeout: Math.min(5000, remaining), maxBuffer: 1024 * 1024 });
+    return result.error || result.status !== 0 ? undefined : result.stdout.toString("utf8");
+  };
+  const currentUser = () => {
+    const value = capture(["am", "get-current-user"])?.trim();
+    return /^(?:0|[1-9]\d{0,5})$/.test(value || "") ? Number(value) : undefined;
+  };
+  const user = currentUser();
+  if (user === undefined) return { state: "failed" };
+  const result = summarizeCredentialReadiness(capture(["dumpsys", "lock_settings"]), user);
+  if (result.state !== "failed" && currentUser() !== user) result.state = "failed";
+  return result;
 }
 function recordDeviceGeometry(phase) {
   const capture = (args, summarize) => {
@@ -101,15 +126,16 @@ function recordDeviceGeometry(phase) {
   });
 }
 function deviceBuildIdentity() {
-  const capture = (command, args) => {
+  const capture = (command, args, includeStderr = false) => {
     const result = spawnSync(command, args, { timeout: 5000, maxBuffer: 64 * 1024 });
-    return result.error || result.status !== 0 ? "" : result.stdout.toString("utf8");
+    return result.error || result.status !== 0 ? "" : result.stdout.toString("utf8")
+      + (includeStderr ? `\n${result.stderr.toString("utf8")}` : "");
   };
   const property = (name) => capture(adb, ["-s", serial, "shell", "getprop", name]);
   return summarizeBuildIdentity({
     apiLevel: property("ro.build.version.sdk"), release: property("ro.build.version.release"),
     buildId: property("ro.build.id"), fingerprint: property("ro.build.fingerprint"),
-    emulator: capture(path.join(sdk, "emulator/emulator"), ["-version"]),
+    emulator: capture(path.join(sdk, "emulator/emulator"), ["-version"], true),
     adb: capture(adb, ["version"]),
   });
 }
@@ -346,13 +372,17 @@ try {
   deviceIdentity = deviceBuildIdentity();
   currentGate = "disposable_device_ready";
   deviceReadiness = { before: deviceState() };
-  assert.ok(!deviceReadiness.before.window_policy.fields?.some((field) => field.name === "secure" && field.value === "true"), "The disposable fixture emulator must not have secure credentials.");
+  // Window policy's secure field is a conservative startup cache. Require the
+  // initialized lock service's explicit current-user NONE credential instead.
+  deviceReadiness.credential_check = await pollReadOnlyReadiness(credentialReadiness, (state) => state.state);
+  assert.equal(deviceReadiness.credential_check.ready, true, "The initialized lock service must explicitly confirm no current-user credential before input.");
   adbCall(["shell", "svc", "power", "stayon", "true"]);
   adbCall(["shell", "input", "keyevent", "KEYCODE_WAKEUP"]);
   adbCall(["shell", "wm", "dismiss-keyguard"]);
-  await delay(250);
-  deviceReadiness.after = deviceState();
-  assert.equal(deviceReadiness.after.power.fields?.find((field) => field.name === "mWakefulness")?.value, "Awake", "The disposable emulator must be awake before UI acceptance.");
+  const { last: readyState, ...uiConfirmation } = await pollReadOnlyReadiness(deviceState, awakeUnlockedReadiness);
+  deviceReadiness.after = readyState;
+  deviceReadiness.ui_confirmation = uiConfirmation;
+  assert.equal(uiConfirmation.ready, true, "The disposable emulator must be explicitly awake and unlocked before UI acceptance.");
   checks.push({ gate: "disposable_device_awake", ok: true, state: deviceReadiness });
   const target = (await call("android.resolve_target", { serial })).resolved_target;
   assert.equal(target.device_serial, serial);

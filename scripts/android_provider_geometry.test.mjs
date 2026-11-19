@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { summarizeDisplayGeometry, summarizeInputGeometry, summarizeWmSize } from "./android_provider_geometry.mjs";
-import { classifyAnrOwner, summarizeBuildIdentity, summarizeVerification } from "./android_provider_diagnostics.mjs";
+import {
+  awakeUnlockedReadiness, classifyAnrOwner, pollReadOnlyReadiness,
+  summarizeBuildIdentity, summarizeCredentialReadiness, summarizeVerification,
+} from "./android_provider_diagnostics.mjs";
 
 const viewport = "Viewport INTERNAL: displayId=0, uniqueId=private-display, port=0, orientation=1, logicalFrame=[0, 0, 2400, 1080], physicalFrame=[0, 0, 2400, 1080], deviceSize=[2400, 1080], isActive=[1]";
 const mapper = `  Device 4: private-device-name
@@ -104,6 +107,10 @@ test("build evidence keeps SDK and emulator identity without installation paths"
   assert.equal(summary.adb_protocol_version, "1.0.41");
   assert.equal(summary.adb_build_version, "36.0.2-14143358");
   assert.doesNotMatch(JSON.stringify(summary), /private/);
+  const logged = summarizeBuildIdentity({ emulator: "INFO         | Android emulator version 37.2.13.0 (build_id 16740729) (CL:N/A)\nprivate-details" });
+  assert.equal(logged.emulator_version, "37.2.13.0");
+  assert.equal(logged.emulator_build_id, "16740729");
+  assert.doesNotMatch(JSON.stringify(logged), /private/);
   const malformed = summarizeBuildIdentity({ apiLevel: "35 private-value", buildId: "unexpected private-value", emulator: "private-output" });
   assert.equal(malformed.android_api_level, undefined);
   assert.equal(malformed.android_build_id, undefined);
@@ -139,4 +146,108 @@ test("verification summaries bound recovery evidence and omit text and selector 
   assert.equal(summary.handled_system_dialogs.length, 4);
   assert.deepEqual(summary.handled_system_dialogs[0], { kind: "anr", action: "wait" });
   assert.doesNotMatch(JSON.stringify(summary), /private/);
+});
+
+const lockDump = (type = "NONE", started = true) => `Current lock settings service state:
+User State:
+  User 0
+    LSKF-based SP protector ID: private-protector-id
+    SID: private-security-id
+    CredentialType: ${type}
+    SeparateChallenge: false
+Keys in namespace:
+  private-key-alias
+ThirdPartyAppsStarted: ${started}
+`;
+const uiState = (showing = "false", wakefulness = "Awake") => ({
+  power: { available: true, fields: [{ name: "mWakefulness", value: wakefulness }] },
+  window_policy: { available: true, fields: [
+    { name: "showing", value: showing }, { name: "inputRestricted", value: "false" },
+    { name: "secure", value: "true" }, // Conservative startup cache; not credential proof.
+  ] },
+});
+
+test("readiness requires initialized current-user NONE even when the policy cache says secure", () => {
+  const summary = summarizeCredentialReadiness(lockDump(), 0);
+  assert.deepEqual(summary, { current_user: 0, state: "ready", credential_type: "NONE", third_party_apps_started: true });
+  assert.equal(awakeUnlockedReadiness(uiState()), "ready");
+  assert.doesNotMatch(JSON.stringify(summary), /private|protector|SID|alias/);
+});
+
+test("credential readiness rejects wrong or missing users and ambiguous fields", () => {
+  for (const [dump, user] of [
+    [lockDump(), 10], [lockDump(), undefined], [undefined, 0],
+    [lockDump().replace("    CredentialType: NONE\n", ""), 0],
+    [lockDump().replace("    CredentialType: NONE", "    CredentialType: NONE\n    CredentialType: NONE"), 0],
+    [lockDump().replace("Keys in namespace:", "  User 0\n    CredentialType: NONE\nKeys in namespace:"), 0],
+    [lockDump().replace("ThirdPartyAppsStarted: true", ""), 0],
+    [`${lockDump()}ThirdPartyAppsStarted: true\n`, 0],
+    [`${lockDump()}${"\n".repeat(8192)}ThirdPartyAppsStarted: false\n`, 0],
+    [lockDump().replace("    CredentialType: NONE", `    CredentialType: NONE\n    CredentialType: ${"X".repeat(2048)}`), 0],
+    [lockDump().replace("ThirdPartyAppsStarted: true", "  ThirdPartyAppsStarted: true"), 0],
+    [lockDump().replace("  User 0", "  User 10\n    User 0").replace("    CredentialType: NONE", "      CredentialType: NONE"), 0],
+    [lockDump().replace("    CredentialType: NONE", "      CredentialType: NONE"), 0],
+    [lockDump().replace("User State:", "  User State:"), 0],
+  ]) {
+    assert.equal(summarizeCredentialReadiness(dump, user).state, "failed");
+  }
+  const twoUsers = lockDump().replace("Keys in namespace:", "  User 10\n    CredentialType: PIN\nKeys in namespace:");
+  assert.equal(summarizeCredentialReadiness(twoUsers, 10).state, "failed");
+  assert.equal(summarizeCredentialReadiness(twoUsers, 10).credential_type, "PIN");
+});
+
+test("PIN, password, pattern and unknown credentials never become pending or ready", () => {
+  for (const type of ["PIN", "PASSWORD", "PATTERN", "UNKNOWN_9", "None"]) {
+    for (const started of [true, false]) {
+      assert.equal(summarizeCredentialReadiness(lockDump(type, started), 0).state, "failed");
+    }
+  }
+  assert.equal(summarizeCredentialReadiness(lockDump("NONE", false), 0).state, "pending");
+});
+
+test("read-only readiness polling accepts a known initialization transition", async () => {
+  let time = 0;
+  let reads = 0;
+  const result = await pollReadOnlyReadiness(() => summarizeCredentialReadiness(lockDump("NONE", reads++ > 0), 0), (state) => state.state, {
+    timeoutMs: 1000, intervalMs: 250, now: () => time, wait: async (ms) => { time += ms; },
+  });
+  assert.equal(result.ready, true);
+  assert.equal(result.polls, 2);
+  assert.equal(result.elapsed_ms, 250);
+  assert.equal(result.last.credential_type, "NONE");
+});
+
+test("read-only polling bounds persistent initialization and fails unknown or secured states immediately", async () => {
+  for (const type of ["PIN", "PASSWORD", "PATTERN", "UNKNOWN_9"]) {
+    const result = await pollReadOnlyReadiness(() => summarizeCredentialReadiness(lockDump(type), 0), (state) => state.state, {
+      wait: async () => assert.fail("Secured or unknown state must fail before waiting or input."),
+    });
+    assert.equal(result.ready, false);
+    assert.equal(result.polls, 1);
+    assert.equal(result.timed_out, false);
+  }
+  let time = 0;
+  const result = await pollReadOnlyReadiness(() => summarizeCredentialReadiness(lockDump("NONE", false), 0), (state) => state.state, {
+    timeoutMs: 500, intervalMs: 250, now: () => time, wait: async (ms) => { time += ms; },
+  });
+  assert.equal(result.ready, false);
+  assert.equal(result.timed_out, true);
+  assert.equal(result.elapsed_ms, 500);
+  assert.equal(result.polls, 2);
+});
+
+test("UI readiness requires explicit awake, not showing and unrestricted input", async () => {
+  assert.equal(awakeUnlockedReadiness(uiState("true")), "pending");
+  assert.equal(awakeUnlockedReadiness(uiState("false", "Asleep")), "pending");
+  assert.equal(awakeUnlockedReadiness({ power: { available: false } }), "failed");
+  const ambiguous = uiState();
+  ambiguous.window_policy.fields.push({ name: "showing", value: "false" });
+  assert.equal(awakeUnlockedReadiness(ambiguous), "failed");
+  let reads = 0;
+  let time = 0;
+  const result = await pollReadOnlyReadiness(() => uiState(reads++ ? "false" : "true"), awakeUnlockedReadiness, {
+    timeoutMs: 1000, intervalMs: 250, now: () => time, wait: async (ms) => { time += ms; },
+  });
+  assert.equal(result.ready, true);
+  assert.equal(result.polls, 2);
 });
