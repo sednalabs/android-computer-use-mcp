@@ -61,10 +61,6 @@ use crate::verification::{
     TapVerificationStatus, derive_observed_package, tap_verification_is_confirmed,
     tap_verification_status, text_verification_fingerprint, text_verification_status,
 };
-use crate::window_views::{
-    normalized_visible_window_dump_fingerprint,
-    normalized_visible_window_dump_fingerprint_for_package,
-};
 
 const DEFAULT_BOOT_TIMEOUT_SECS: u64 = 180;
 const DEFAULT_SWIPE_DURATION_MS: u64 = 250;
@@ -84,14 +80,12 @@ const DEFAULT_EMULATOR_COMMAND_TIMEOUT_SECS: u64 = 20;
 // on a real emulator; callers can still request a shorter explicit deadline.
 pub(crate) const DEFAULT_ACTION_TIMEOUT_SECS: u64 = 30;
 const MIN_OBSERVATION_BUDGET_MS: u64 = 500;
-const MIN_FAST_UI_FINGERPRINT_BUDGET_MS: u64 = 1000;
 const MAX_ARTIFACT_READ_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_ARTIFACT_STORE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_ARTIFACT_STORE_FILES: u64 = 4096;
 static ARTIFACT_WRITE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const MAX_SCREENSHOT_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_GESTURE_DURATION_MS: u64 = 10_000;
-const FULL_OBSERVATION_CAPTURE_RESERVE_MS: u64 = 4500;
 const UI_DUMP_PULL_MAX_ATTEMPTS: usize = 3;
 const UI_DUMP_PULL_RETRY_DELAY_MS: u64 = 100;
 static ARTIFACT_NAME_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -3264,13 +3258,6 @@ pub(crate) fn has_meaningful_observation_budget(deadline: Instant) -> bool {
     remaining_until(deadline) >= Duration::from_millis(MIN_OBSERVATION_BUDGET_MS)
 }
 
-pub(crate) fn has_meaningful_fast_ui_fingerprint_budget(deadline: Instant) -> bool {
-    remaining_until(deadline)
-        >= Duration::from_millis(
-            FULL_OBSERVATION_CAPTURE_RESERVE_MS + MIN_FAST_UI_FINGERPRINT_BUDGET_MS,
-        )
-}
-
 fn bounded_deadline(deadline: Instant, soft_budget: Duration) -> Instant {
     let soft_deadline = Instant::now() + soft_budget;
     if soft_deadline < deadline {
@@ -3278,26 +3265,6 @@ fn bounded_deadline(deadline: Instant, soft_budget: Duration) -> Instant {
     } else {
         deadline
     }
-}
-
-fn reserved_fallback_deadline(deadline: Instant, reserve_budget: Duration) -> Instant {
-    let now = Instant::now();
-    let remaining = remaining_until(deadline);
-    if remaining <= reserve_budget {
-        deadline
-    } else {
-        now + (remaining - reserve_budget)
-    }
-}
-
-fn fast_ui_fingerprint_deadline(deadline: Instant) -> Instant {
-    bounded_deadline(
-        reserved_fallback_deadline(
-            deadline,
-            Duration::from_millis(FULL_OBSERVATION_CAPTURE_RESERVE_MS),
-        ),
-        Duration::from_millis(MIN_FAST_UI_FINGERPRINT_BUDGET_MS),
-    )
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -4406,8 +4373,6 @@ impl AndroidEmulatorMcp {
         } = request;
         let started = Instant::now();
         let mut last_fingerprint: Option<String> = None;
-        let mut last_fast_fingerprint: Option<String> = None;
-        let mut use_fast_stability_backend: Option<bool> = None;
         let mut stable_polls = 0u32;
         let mut final_observation: Option<UiObservation> = None;
 
@@ -4416,34 +4381,6 @@ impl AndroidEmulatorMcp {
                 break;
             }
             let final_poll = remaining_until(deadline) <= poll_interval;
-            let fast_fingerprint = if use_fast_stability_backend == Some(false) {
-                None
-            } else {
-                self.capture_fast_ui_fingerprint_until_deadline(serial, deadline, None)
-                    .await?
-            };
-            if use_fast_stability_backend.is_none() {
-                use_fast_stability_backend = Some(fast_fingerprint.is_some());
-            }
-            if use_fast_stability_backend == Some(true) {
-                if let Some(fast_fingerprint) = fast_fingerprint {
-                    if last_fast_fingerprint.as_deref() == Some(fast_fingerprint.as_str()) {
-                        stable_polls += 1;
-                    } else {
-                        stable_polls = 1;
-                        last_fast_fingerprint = Some(fast_fingerprint);
-                    }
-                } else {
-                    use_fast_stability_backend = Some(false);
-                }
-                if use_fast_stability_backend == Some(true)
-                    && stable_polls < required_stable_polls
-                    && !final_poll
-                {
-                    sleep(poll_interval).await;
-                    continue;
-                }
-            }
             let Some(observation) = self
                 .capture_ui_observation_until_deadline(
                     serial,
@@ -4458,13 +4395,11 @@ impl AndroidEmulatorMcp {
             };
             let fingerprint =
                 ui_observation_fingerprint(&observation.hierarchy_xml, &observation.window_state);
-            if use_fast_stability_backend == Some(false) {
-                if last_fingerprint.as_deref() == Some(fingerprint.as_str()) {
-                    stable_polls += 1;
-                } else {
-                    stable_polls = 1;
-                    last_fingerprint = Some(fingerprint);
-                }
+            if last_fingerprint.as_deref() == Some(fingerprint.as_str()) {
+                stable_polls += 1;
+            } else {
+                stable_polls = 1;
+                last_fingerprint = Some(fingerprint);
             }
             final_observation = Some(observation);
             if stable_polls >= required_stable_polls {
@@ -5227,62 +5162,6 @@ impl AndroidEmulatorMcp {
                 None,
             )
         }))
-    }
-
-    async fn capture_fast_ui_fingerprint_with_timeout(
-        &self,
-        serial: &str,
-        timeout_duration: Duration,
-        target_package: Option<&str>,
-    ) -> Result<String, McpError> {
-        let mut command = Command::new(&self.config.adb_path);
-        command.arg("-s").arg(serial).args([
-            "exec-out",
-            "cmd",
-            "window",
-            "dump-visible-window-views",
-        ]);
-        let output = run_command_with_timeout(
-            command,
-            timeout_duration,
-            &format!("adb -s {serial} exec-out cmd window dump-visible-window-views"),
-        )
-        .await?;
-        let fingerprint = match target_package {
-            Some(target_package) => normalized_visible_window_dump_fingerprint_for_package(
-                &output.stdout,
-                Some(target_package),
-            ),
-            None => normalized_visible_window_dump_fingerprint(&output.stdout),
-        };
-        fingerprint.map_err(|error| {
-            McpError::internal_error(
-                format!("failed to normalize visible-window dump fingerprint: {error}"),
-                None,
-            )
-        })
-    }
-
-    pub(crate) async fn capture_fast_ui_fingerprint_until_deadline(
-        &self,
-        serial: &str,
-        deadline: Instant,
-        target_package: Option<&str>,
-    ) -> Result<Option<String>, McpError> {
-        if !has_meaningful_fast_ui_fingerprint_budget(deadline) {
-            return Ok(None);
-        }
-        let timeout_duration = require_remaining_budget(
-            fast_ui_fingerprint_deadline(deadline),
-            "fast visible-window dump",
-        )?;
-        match self
-            .capture_fast_ui_fingerprint_with_timeout(serial, timeout_duration, target_package)
-            .await
-        {
-            Ok(fingerprint) => Ok(Some(fingerprint)),
-            Err(_) => Ok(None),
-        }
     }
 
     async fn capture_ui_observation(
@@ -8481,6 +8360,12 @@ else:
             let calls = fs::read_to_string(root.join("calls"))
                 .await
                 .unwrap_or_default();
+            assert!(
+                !calls
+                    .lines()
+                    .any(|line| line == "exec-out cmd window dump-visible-window-views"),
+                "Text verification must use semantic observations: {scenario}"
+            );
             let mutations = calls
                 .lines()
                 .filter(|line| line.starts_with("shell input"))
@@ -10547,30 +10432,12 @@ else:
     }
 
     #[test]
-    fn reserved_fallback_deadline_keeps_time_in_hand_for_retry_budget() {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let reserved = reserved_fallback_deadline(deadline, Duration::from_secs(2));
-
-        assert!(reserved <= deadline);
-        assert!(remaining_until(reserved) >= Duration::from_secs(2));
-    }
-
-    #[test]
     fn has_meaningful_observation_budget_rejects_near_expiry_deadlines() {
         let almost_expired = Instant::now() + Duration::from_millis(100);
         let healthy = Instant::now() + Duration::from_millis(1000);
 
         assert!(!has_meaningful_observation_budget(almost_expired));
         assert!(has_meaningful_observation_budget(healthy));
-    }
-
-    #[test]
-    fn has_meaningful_fast_ui_fingerprint_budget_requires_full_capture_reserve() {
-        let tight = Instant::now() + Duration::from_millis(5400);
-        let healthy = Instant::now() + Duration::from_millis(6500);
-
-        assert!(!has_meaningful_fast_ui_fingerprint_budget(tight));
-        assert!(has_meaningful_fast_ui_fingerprint_budget(healthy));
     }
 
     #[test]
@@ -10652,6 +10519,130 @@ else:
             center: None,
         };
         assert!(!node_matches_requested_text(&node, "mars"));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stable_ui_requires_matching_hierarchy_and_window_observations_without_debug_dumps() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let parent = std::env::temp_dir().join(timestamp_filename("semantic-stability", None));
+        for scenario in ["hierarchy_changes", "window_changes", "changing", "expired"] {
+            let root = parent.join(scenario);
+            fs::create_dir_all(&root).await.unwrap();
+            let adb = root.join("adb");
+            fs::write(
+                &adb,
+                r#"#!/usr/bin/env python3
+import pathlib, shlex, sys
+root = pathlib.Path(__file__).resolve().parent
+if sys.argv[1:] == ['devices', '-l']:
+    print('List of devices attached\nstability-fixture device model:fixture')
+    sys.exit(0)
+if sys.argv[1:3] != ['-s', 'stability-fixture']:
+    sys.exit('wrong serial')
+args = sys.argv[3:]
+if args[0] == 'shell':
+    args = ['shell'] + shlex.split(args[1])
+command = ' '.join(args)
+with (root / 'calls').open('a') as log:
+    log.write(command + '\n')
+counter = root / 'captures'
+if command == 'exec-out uiautomator dump /dev/tty':
+    count = int(counter.read_text()) + 1 if counter.exists() else 1
+    counter.write_text(str(count))
+    text = str(count) if root.name == 'changing' else 'Ready'
+    if root.name == 'hierarchy_changes' and count == 1:
+        text = 'Loading'
+    print(f'<hierarchy><node package="fixture" text="{text}" bounds="[0,0][100,40]" /></hierarchy>')
+elif command in ['shell dumpsys window windows', 'shell dumpsys activity activities']:
+    count = int(counter.read_text())
+    activity = 'Before' if root.name == 'window_changes' and count == 1 else 'Main'
+    if command == 'shell dumpsys window windows':
+        print(f'mCurrentFocus=Window{{a u0 fixture/.{activity}}}')
+    else:
+        print(f'mResumedActivity: ActivityRecord{{a u0 fixture/.{activity}}}')
+else:
+    sys.exit('Unexpected fixture command: ' + command)
+"#,
+            )
+            .await
+            .unwrap();
+            fs::set_permissions(&adb, std::fs::Permissions::from_mode(0o700))
+                .await
+                .unwrap();
+            let mcp = adb_fixture_server(&root);
+            if scenario == "expired" {
+                let result = mcp
+                    .wait_for_stable_ui_internal(StableUiWaitRequest {
+                        serial: "stability-fixture",
+                        deadline: Instant::now() - Duration::from_secs(1),
+                        poll_interval: Duration::from_millis(25),
+                        required_stable_polls: 2,
+                        hierarchy_filename: "expired.xml".into(),
+                        include_screenshot: false,
+                        screenshot_filename: "expired.png".into(),
+                    })
+                    .await;
+                assert!(result.is_err());
+                assert!(!root.join("calls").exists());
+                continue;
+            }
+            let started = Instant::now();
+            let receipt = mcp
+                .android_wait_for_stable_ui(Parameters(
+                    serde_json::from_value(json!({
+                        "serial": "stability-fixture",
+                        "timeout_secs": if scenario == "changing" { 3 } else { 10 },
+                        "poll_interval_ms": 25,
+                        "stable_polls": 2,
+                        "include_screenshot": false,
+                    }))
+                    .unwrap(),
+                ))
+                .await
+                .unwrap()
+                .structured_content
+                .unwrap();
+            let captures = fs::read_to_string(root.join("captures"))
+                .await
+                .unwrap()
+                .parse::<usize>()
+                .unwrap();
+            assert_eq!(receipt["stable_polls_required"], 2);
+            assert_eq!(receipt["current_focus"], "fixture/.Main");
+            assert!(Path::new(receipt["artifacts"]["hierarchy_path"].as_str().unwrap()).is_file());
+            if scenario == "changing" {
+                assert_eq!(receipt["ok"], false);
+                assert_eq!(receipt["stabilized"], false);
+                assert_eq!(receipt["timed_out"], true);
+                assert_eq!(receipt["stable_polls_observed"], 1);
+                assert!(captures >= 2);
+                assert!(started.elapsed() < Duration::from_secs(4));
+            } else {
+                assert_eq!(receipt["ok"], true);
+                assert_eq!(receipt["stabilized"], true);
+                assert_eq!(receipt["timed_out"], false);
+                assert_eq!(receipt["stable_polls_observed"], 2);
+                assert_eq!(captures, 3, "{scenario}");
+            }
+            let calls = fs::read_to_string(root.join("calls")).await.unwrap();
+            assert_eq!(
+                calls
+                    .lines()
+                    .filter(|line| *line == "exec-out uiautomator dump /dev/tty")
+                    .count(),
+                captures
+            );
+            assert!(
+                !calls
+                    .lines()
+                    .any(|line| line == "exec-out cmd window dump-visible-window-views"),
+                "Stability must use semantic observations: {scenario}"
+            );
+            assert!(!calls.lines().any(|line| line.starts_with("shell input")));
+        }
+        fs::remove_dir_all(parent).await.unwrap();
     }
 
     #[test]
@@ -11523,7 +11514,7 @@ else:
         fs::write(
             &adb,
             r#"#!/usr/bin/env python3
-import io, pathlib, shlex, sys, zipfile
+import pathlib, shlex, sys
 root = pathlib.Path(__file__).resolve().parent
 if sys.argv[1:] == ['devices', '-l']:
     print('List of devices attached\nanr-fixture device model:fixture')
@@ -11558,11 +11549,8 @@ if command == 'exec-out uiautomator dump /dev/tty':
             elif scenario == 'missing' or (scenario == 'transient' and count > 1):
                 capture = 'before.xml'
     print((root / capture).read_text())
-elif command == 'exec-out cmd window dump-visible-window-views' and (root / 'tap-scenario').exists():
-    payload = io.BytesIO()
-    with zipfile.ZipFile(payload, 'w') as archive:
-        archive.writestr('1 fixture/.Main', b'unchanged target app')
-    sys.stdout.buffer.write(payload.getvalue())
+elif command == 'exec-out cmd window dump-visible-window-views':
+    sys.exit('Debug window dumps must not be dispatched')
 elif command == 'shell dumpsys window windows':
     print('mCurrentFocus=Window{a u0 fixture/.Main}')
 elif command == 'shell dumpsys activity activities':
@@ -11658,8 +11646,8 @@ else:
                 serial: "anr-fixture",
                 selector: Some(&selector),
                 match_index: None,
-                wait_for_activity: Some("fixture.Main"),
-                wait_for_package: Some("fixture"),
+                wait_for_activity: None,
+                wait_for_package: None,
                 deadline: Instant::now() + Duration::from_secs(10),
                 include_screenshot: false,
                 artifact_prefix: "anr-postcondition",
@@ -11677,6 +11665,12 @@ else:
             json!([{ "kind": "anr", "action": "wait" }])
         );
         let calls = fs::read_to_string(root.join("calls")).await.unwrap();
+        assert!(
+            !calls
+                .lines()
+                .any(|line| line == "exec-out cmd window dump-visible-window-views"),
+            "Selector-only postconditions must use fresh semantic observations"
+        );
         assert_eq!(
             calls
                 .lines()
@@ -11793,6 +11787,12 @@ else:
                     .all(|dialog| dialog == &json!({ "kind": "anr", "action": "wait" }))
             );
             let calls = fs::read_to_string(root.join("calls")).await.unwrap();
+            assert!(
+                !calls
+                    .lines()
+                    .any(|line| line == "exec-out cmd window dump-visible-window-views"),
+                "Tap verification must use semantic observations: {scenario}"
+            );
             let mutations = calls
                 .lines()
                 .filter(|line| line.starts_with("shell input"))
@@ -11821,13 +11821,12 @@ else:
                         .unwrap(),
                     "2"
                 );
-                assert!(
-                    calls
-                        .lines()
-                        .filter(|line| *line == "exec-out cmd window dump-visible-window-views")
-                        .count()
-                        > 3,
-                    "An unchanged fast app fingerprint must not hide a later system ANR"
+                assert_eq!(
+                    fs::read_to_string(root.join("post-captures"))
+                        .await
+                        .unwrap(),
+                    "2",
+                    "Every unsatisfied poll must inspect a fresh hierarchy, including the later ANR"
                 );
             } else if matches!(scenario, "wrong" | "missing" | "transient") {
                 let captures = fs::read_to_string(root.join("after-wait-captures"))

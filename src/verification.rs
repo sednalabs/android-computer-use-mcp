@@ -4,6 +4,8 @@
 //! Implements the core logic for ensuring that tool executions succeed in
 //! the dynamic environment of an Android emulator (e.g., waiting for screen
 //! stabilization or text input confirmation).
+//! Verification that depends on UI nodes captures the full hierarchy on every
+//! poll, without a separate debug-window dump to decide whether evidence is needed.
 //!
 //! ## Security Boundaries
 //! * All verification checks are performed on captured state files.
@@ -28,9 +30,6 @@ use crate::ui::{
 };
 
 const MAX_POSTCONDITION_ANR_RECOVERIES: usize = 4;
-// The fast fingerprint can contain only the target app's window. Periodically
-// inspect the full hierarchy so an unchanged app cannot hide a system ANR.
-const POSTCONDITION_SEMANTIC_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Tracks the outcome of a tap-based interaction.
 #[derive(Debug, Clone)]
@@ -325,68 +324,18 @@ impl AndroidEmulatorMcp {
         let mut tapped_selector_still_present = None;
         let mut post_selector_matched = None;
         let mut last_fingerprint: Option<String> = None;
-        let mut last_fast_fingerprint: Option<String> = None;
-        let mut use_fast_fingerprint_backend: Option<bool> = None;
         let mut stable_polls_observed = 0u32;
         let mut satisfied_polls_observed = 0u32;
         let started = Instant::now();
         let mut ui_changed_from_pre_tap = Some(false);
         let required_satisfied_polls = 2u32;
-        let mut force_followup_semantic_capture = false;
-        let mut last_semantic_capture: Option<Instant> = None;
         let mut handled_system_dialogs = Vec::new();
         let mut blocked_by_system_dialog = false;
-        let target_package = infer_unique_package_name(&relevant_selector_snapshot(
-            pre_tap_nodes,
-            tapped_selector,
-            wait_for_tracker,
-            wait_for_selector,
-        ));
         while Instant::now() < deadline {
             if !has_meaningful_observation_budget(deadline) {
                 break;
             }
             let final_poll = remaining_until(deadline) <= poll_interval;
-            let mut fast_fingerprint = if use_fast_fingerprint_backend == Some(false) {
-                None
-            } else {
-                self.capture_fast_ui_fingerprint_until_deadline(
-                    serial,
-                    deadline,
-                    target_package.as_deref(),
-                )
-                .await
-                .map_err(|error| {
-                    verification_observation_error(
-                        error,
-                        "verification",
-                        "post_tap_hierarchy_path",
-                        &handled_system_dialogs,
-                        last_hierarchy_path.as_deref(),
-                    )
-                })?
-            };
-            if use_fast_fingerprint_backend.is_none() {
-                use_fast_fingerprint_backend = Some(fast_fingerprint.is_some());
-            } else if use_fast_fingerprint_backend == Some(true) && fast_fingerprint.is_none() {
-                use_fast_fingerprint_backend = Some(false);
-            }
-            let should_capture_semantic = should_refresh_semantic_observation(
-                last_fast_fingerprint.as_deref(),
-                fast_fingerprint.as_deref(),
-                force_followup_semantic_capture
-                    || last_semantic_capture.is_some_and(|captured| {
-                        captured.elapsed() >= POSTCONDITION_SEMANTIC_REFRESH_INTERVAL
-                    }),
-                final_poll,
-            );
-            if let Some(fast_fingerprint) = fast_fingerprint.take() {
-                last_fast_fingerprint = Some(fast_fingerprint);
-            }
-            if !should_capture_semantic {
-                sleep(poll_interval).await;
-                continue;
-            }
             let Some(observation) = self
                 .capture_ui_observation_until_deadline(
                     serial,
@@ -408,7 +357,6 @@ impl AndroidEmulatorMcp {
             else {
                 break;
             };
-            last_semantic_capture = Some(Instant::now());
             remove_artifact_if_exists(last_hierarchy_path.clone()).await;
             let fingerprint = tap_verification_fingerprint(
                 &observation.nodes,
@@ -462,11 +410,8 @@ impl AndroidEmulatorMcp {
                         // Recovery is not proof of the original postcondition.
                         // Keep the original baseline and require fresh captures.
                         last_fingerprint = None;
-                        last_fast_fingerprint = None;
-                        last_semantic_capture = None;
                         stable_polls_observed = 0;
                         satisfied_polls_observed = 0;
-                        force_followup_semantic_capture = true;
                         continue;
                     }
                     SystemDialogCheck::Blocked(_) => {
@@ -478,11 +423,8 @@ impl AndroidEmulatorMcp {
             }
             if status.satisfied {
                 satisfied_polls_observed += 1;
-                force_followup_semantic_capture =
-                    satisfied_polls_observed < required_satisfied_polls;
             } else {
                 satisfied_polls_observed = 0;
-                force_followup_semantic_capture = false;
             }
 
             if tap_verification_is_confirmed(
@@ -612,68 +554,18 @@ impl AndroidEmulatorMcp {
         let mut target_text_matches_requested = None;
         let mut post_selector_matched = None;
         let mut last_fingerprint: Option<String> = None;
-        let mut last_fast_fingerprint: Option<String> = None;
-        let mut use_fast_fingerprint_backend: Option<bool> = None;
         let mut stable_polls_observed = 0u32;
         let mut satisfied_polls_observed = 0u32;
         let started = Instant::now();
         let mut ui_changed_from_pre_text = Some(false);
-        let mut force_followup_semantic_capture = false;
-        let mut last_semantic_capture: Option<Instant> = None;
         let mut handled_system_dialogs = Vec::new();
         let mut blocked_by_system_dialog = false;
-        let target_package = infer_unique_package_name(&relevant_text_snapshot(
-            pre_text_nodes,
-            target_tracker,
-            target_selector,
-            wait_for_selector,
-        ));
 
         while Instant::now() < deadline {
             if !has_meaningful_observation_budget(deadline) {
                 break;
             }
             let final_poll = remaining_until(deadline) <= poll_interval;
-            let mut fast_fingerprint = if use_fast_fingerprint_backend == Some(false) {
-                None
-            } else {
-                self.capture_fast_ui_fingerprint_until_deadline(
-                    serial,
-                    deadline,
-                    target_package.as_deref(),
-                )
-                .await
-                .map_err(|error| {
-                    verification_observation_error(
-                        error,
-                        "text_verification",
-                        "post_text_hierarchy_path",
-                        &handled_system_dialogs,
-                        last_hierarchy_path.as_deref(),
-                    )
-                })?
-            };
-            if use_fast_fingerprint_backend.is_none() {
-                use_fast_fingerprint_backend = Some(fast_fingerprint.is_some());
-            } else if use_fast_fingerprint_backend == Some(true) && fast_fingerprint.is_none() {
-                use_fast_fingerprint_backend = Some(false);
-            }
-            let should_capture_semantic = should_refresh_semantic_observation(
-                last_fast_fingerprint.as_deref(),
-                fast_fingerprint.as_deref(),
-                force_followup_semantic_capture
-                    || last_semantic_capture.is_some_and(|captured| {
-                        captured.elapsed() >= POSTCONDITION_SEMANTIC_REFRESH_INTERVAL
-                    }),
-                final_poll,
-            );
-            if let Some(fast_fingerprint) = fast_fingerprint.take() {
-                last_fast_fingerprint = Some(fast_fingerprint);
-            }
-            if !should_capture_semantic {
-                sleep(poll_interval).await;
-                continue;
-            }
             let Some(mut observation) = self
                 .capture_ui_observation_until_deadline(
                     serial,
@@ -695,7 +587,6 @@ impl AndroidEmulatorMcp {
             else {
                 break;
             };
-            last_semantic_capture = Some(Instant::now());
             if exact_editable_text {
                 observation.nodes = clipboard_text_nodes_from_xml(&observation.hierarchy_xml)
                     .map_err(|error| {
@@ -754,11 +645,8 @@ impl AndroidEmulatorMcp {
                         // Preserve the original target and exact-text baseline;
                         // never mistake dismissing an ANR for consumed input.
                         last_fingerprint = None;
-                        last_fast_fingerprint = None;
-                        last_semantic_capture = None;
                         stable_polls_observed = 0;
                         satisfied_polls_observed = 0;
-                        force_followup_semantic_capture = true;
                         continue;
                     }
                     SystemDialogCheck::Blocked(_) => {
@@ -770,11 +658,8 @@ impl AndroidEmulatorMcp {
             }
             if status.satisfied {
                 satisfied_polls_observed += 1;
-                force_followup_semantic_capture =
-                    satisfied_polls_observed < required_satisfied_polls;
             } else {
                 satisfied_polls_observed = 0;
-                force_followup_semantic_capture = false;
             }
 
             if text_verification_is_confirmed(
@@ -970,10 +855,6 @@ impl AndroidEmulatorMcp {
 
         let poll_interval = Duration::from_millis(250);
         let started = Instant::now();
-        let selector_only_fast_path =
-            selector.is_some() && wait_for_activity.is_none() && wait_for_package.is_none();
-        let mut last_fast_fingerprint: Option<String> = None;
-        let mut use_fast_fingerprint_backend: Option<bool> = None;
         let mut last_result = ToolPostconditionResult {
             requested: true,
             satisfied: false,
@@ -996,33 +877,6 @@ impl AndroidEmulatorMcp {
                 break;
             }
             let final_poll = remaining_until(deadline) <= poll_interval;
-            let mut fast_fingerprint =
-                if !selector_only_fast_path || use_fast_fingerprint_backend == Some(false) {
-                    None
-                } else {
-                    self.capture_fast_ui_fingerprint_until_deadline(serial, deadline, None)
-                        .await?
-                };
-            if selector_only_fast_path {
-                if use_fast_fingerprint_backend.is_none() {
-                    use_fast_fingerprint_backend = Some(fast_fingerprint.is_some());
-                } else if use_fast_fingerprint_backend == Some(true) && fast_fingerprint.is_none() {
-                    use_fast_fingerprint_backend = Some(false);
-                }
-                let should_capture_semantic = should_refresh_tool_postcondition_observation(
-                    last_fast_fingerprint.as_deref(),
-                    fast_fingerprint.as_deref(),
-                    selector_only_fast_path,
-                    final_poll,
-                );
-                if let Some(fast_fingerprint) = fast_fingerprint.take() {
-                    last_fast_fingerprint = Some(fast_fingerprint);
-                }
-                if !should_capture_semantic {
-                    sleep(poll_interval).await;
-                    continue;
-                }
-            }
             let Some(observation) = self
                 .capture_ui_observation_until_deadline(
                     serial,
@@ -1118,7 +972,6 @@ impl AndroidEmulatorMcp {
                         last_result.satisfied = false;
                         // The dialog changed the UI. Require a new capture and
                         // all original selector, activity and package checks.
-                        last_fast_fingerprint = None;
                         continue;
                     }
                     SystemDialogCheck::Blocked(_) => {
@@ -1619,18 +1472,6 @@ fn semantic_relevant_text_snapshot(
         .collect()
 }
 
-fn infer_unique_package_name(nodes: &[NormalizedUiNode]) -> Option<String> {
-    let mut packages = nodes
-        .iter()
-        .filter_map(|node| node.package_name.as_ref())
-        .map(|package_name| package_name.trim())
-        .filter(|package_name| !package_name.is_empty())
-        .collect::<Vec<_>>();
-    packages.sort_unstable();
-    packages.dedup();
-    (packages.len() == 1).then(|| packages[0].to_string())
-}
-
 pub(crate) fn tracker_matches_node(node: &NormalizedUiNode, tracker: &InternalNodeTracker) -> bool {
     match tracker {
         InternalNodeTracker::Selector(selector) => selector_matches(node, selector),
@@ -1675,32 +1516,6 @@ pub(crate) fn tap_verification_is_confirmed(
     final_poll: bool,
 ) -> bool {
     status.satisfied && (satisfied_polls_observed >= required_satisfied_polls || final_poll)
-}
-
-pub(crate) fn should_refresh_semantic_observation(
-    last_fast_fingerprint: Option<&str>,
-    new_fast_fingerprint: Option<&str>,
-    force_followup_semantic_capture: bool,
-    final_poll: bool,
-) -> bool {
-    final_poll
-        || force_followup_semantic_capture
-        || new_fast_fingerprint.is_none()
-        || last_fast_fingerprint.is_none()
-        || last_fast_fingerprint != new_fast_fingerprint
-}
-
-pub(crate) fn should_refresh_tool_postcondition_observation(
-    last_fast_fingerprint: Option<&str>,
-    new_fast_fingerprint: Option<&str>,
-    selector_only_fast_path: bool,
-    final_poll: bool,
-) -> bool {
-    !selector_only_fast_path
-        || final_poll
-        || new_fast_fingerprint.is_none()
-        || last_fast_fingerprint.is_none()
-        || last_fast_fingerprint != new_fast_fingerprint
 }
 
 pub(crate) fn text_verification_is_confirmed(
@@ -1835,13 +1650,12 @@ mod tests {
     use super::{
         HandledSystemDialog, ToolPostconditionEvidenceSource, ToolPostconditionResult,
         activity_matches, clipboard_text_nodes_from_xml, component_activity_identity,
-        ensure_action_outcome_satisfied, exact_editable_text_status, infer_unique_package_name,
-        should_refresh_semantic_observation, should_refresh_tool_postcondition_observation,
-        text_verification_status, tool_postcondition_json, verification_observation_error,
+        ensure_action_outcome_satisfied, exact_editable_text_status, text_verification_status,
+        tool_postcondition_json, verification_observation_error,
         window_state_postcondition_matches,
     };
     use crate::tools::AndroidWindowState;
-    use crate::ui::{NormalizedUiNode, UiSelector};
+    use crate::ui::UiSelector;
     use serde_json::json;
 
     #[test]
@@ -1961,27 +1775,6 @@ mod tests {
         );
     }
 
-    fn node_with_package(package_name: Option<&str>) -> NormalizedUiNode {
-        NormalizedUiNode {
-            class_name: None,
-            package_name: package_name.map(ToOwned::to_owned),
-            text: None,
-            semantic_label: None,
-            content_desc: None,
-            resource_id: None,
-            clickable: false,
-            focusable: false,
-            enabled: true,
-            selected: false,
-            checked: false,
-            focused: false,
-            scrollable: false,
-            long_clickable: false,
-            bounds: None,
-            center: None,
-        }
-    }
-
     #[test]
     fn package_postcondition_requires_exact_identity() {
         let state = AndroidWindowState {
@@ -1997,78 +1790,6 @@ mod tests {
             !satisfied,
             "a similarly named package is not the requested app"
         );
-    }
-
-    #[test]
-    fn semantic_observation_refreshes_on_first_fast_poll() {
-        assert!(should_refresh_semantic_observation(
-            None,
-            Some("fingerprint-a"),
-            false,
-            false
-        ));
-    }
-
-    #[test]
-    fn semantic_observation_skips_redundant_full_capture_when_fast_fingerprint_is_unchanged() {
-        assert!(!should_refresh_semantic_observation(
-            Some("fingerprint-a"),
-            Some("fingerprint-a"),
-            false,
-            false
-        ));
-    }
-
-    #[test]
-    fn semantic_observation_forces_follow_up_capture_after_satisfied_semantic_poll() {
-        assert!(should_refresh_semantic_observation(
-            Some("fingerprint-a"),
-            Some("fingerprint-a"),
-            true,
-            false
-        ));
-    }
-
-    #[test]
-    fn semantic_observation_refreshes_on_fast_fingerprint_change_or_final_poll() {
-        assert!(should_refresh_semantic_observation(
-            Some("fingerprint-a"),
-            Some("fingerprint-b"),
-            false,
-            false
-        ));
-        assert!(should_refresh_semantic_observation(
-            Some("fingerprint-a"),
-            Some("fingerprint-a"),
-            false,
-            true
-        ));
-    }
-
-    #[test]
-    fn tool_postcondition_observation_skips_redundant_selector_only_semantic_capture() {
-        assert!(!should_refresh_tool_postcondition_observation(
-            Some("fingerprint-a"),
-            Some("fingerprint-a"),
-            true,
-            false
-        ));
-        assert!(should_refresh_tool_postcondition_observation(
-            Some("fingerprint-a"),
-            Some("fingerprint-b"),
-            true,
-            false
-        ));
-    }
-
-    #[test]
-    fn tool_postcondition_observation_never_skips_non_selector_only_polls() {
-        assert!(should_refresh_tool_postcondition_observation(
-            Some("fingerprint-a"),
-            Some("fingerprint-a"),
-            false,
-            false
-        ));
     }
 
     #[test]
@@ -2098,32 +1819,6 @@ mod tests {
 
         assert!(!super::text_verification_is_confirmed(&status, 1, 2, false));
         assert!(super::text_verification_is_confirmed(&status, 2, 2, false));
-    }
-
-    #[test]
-    fn infer_unique_package_name_returns_single_non_empty_package() {
-        let nodes = vec![
-            node_with_package(Some("com.example.app")),
-            node_with_package(Some("com.example.app")),
-            node_with_package(None),
-        ];
-
-        assert_eq!(
-            infer_unique_package_name(&nodes),
-            Some("com.example.app".to_string())
-        );
-    }
-
-    #[test]
-    fn infer_unique_package_name_returns_none_for_mixed_or_missing_packages() {
-        let mixed = vec![
-            node_with_package(Some("com.example.app")),
-            node_with_package(Some("com.other.app")),
-        ];
-        let missing = vec![node_with_package(None), node_with_package(Some(" "))];
-
-        assert_eq!(infer_unique_package_name(&mixed), None);
-        assert_eq!(infer_unique_package_name(&missing), None);
     }
 
     #[test]

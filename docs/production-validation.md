@@ -48,7 +48,37 @@ uses no real device or model credential. It checks image-bearing results,
 cross-session and concurrent duplicate IDs, the exact underlying mutation log,
 and durable status after restarting the provider with its device offline.
 
+## UI observation and verification
+
+Automatic stability and semantic verification use full UI hierarchy observations.
+The original action deadline, required confirmation observations, target baseline
+and exact editable-text checks continue to apply. A system ANR Wait can help a
+blocked application recover, but it never proves the original postcondition or
+replays the original input. Recovery stays within the existing deadline and cap.
+
+The runtime does not poll `cmd window dump-visible-window-views`. In Android 15,
+that diagnostic requests encoded views from all visible and recents windows
+before collecting their pipes. Its one-way requests carry no cancellation or
+deadline; if writing the output ZIP fails, the remaining unvisited pipes are not
+explicitly closed by that command. A one-second host ADB timeout therefore does
+not bound the lifetime of that Android-side work. See the source-defined
+[request and collection path](https://android.googlesource.com/platform/frameworks/base/+/android-15.0.0_r1/services/core/java/com/android/server/wm/WindowManagerShellCommand.java),
+[one-way window interface](https://android.googlesource.com/platform/frameworks/base/+/android-15.0.0_r1/core/java/android/view/IWindow.aidl)
+and [pipe cleanup](https://android.googlesource.com/platform/frameworks/base/+/android-15.0.0_r1/core/java/com/android/internal/os/TransferPipe.java).
+Full hierarchy polling removes this additional diagnostic workload. Host command
+deadlines bound the provider's wait; Android-side completion is a separate concern.
+
 ## Logical display coordinates and rotation
+
+The [first complete provider qualification, at `d56fc928`](https://github.com/sednalabs/android-computer-use-mcp/actions/runs/44446926247/job/135301212030),
+passed all 64 checks on Android 15 / API 35 in 289.7 seconds. It recorded a native
+2400 by 1080 landscape PNG, a coordinate tap that changed the intended counter,
+and distinct completed two-pointer gestures in landscape and portrait. Exact
+ASCII and Unicode replacement, clipboard restoration, ten repeated increments,
+force-stop/relaunch and stop-on-error batch behavior also passed. That run used
+the source tree at `d56fc928`; later candidates require their own complete gate
+results. No ANR recovery was recorded in that passing run, so it does not establish
+the cause of earlier intermittent ANRs.
 
 The [provider run for `5960d205`](https://github.com/sednalabs/android-computer-use-mcp/actions/runs/44436813896/job/135267615481)
 reached landscape orientation, but its post-action and fresh-observation PNGs

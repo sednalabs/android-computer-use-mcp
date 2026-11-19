@@ -1,10 +1,51 @@
 // This module emits only bounded build identifiers and categorical ANR evidence.
 import { setTimeout as delay } from "node:timers/promises";
 
+function emulatorVersionEvidence(stdout = "", stderr = "") {
+  const matches = [];
+  const streams = [];
+  const truncated = [];
+  for (const [stream, output] of [["stdout", stdout], ["stderr", stderr]]) {
+    const bytes = Buffer.isBuffer(output) ? output : Buffer.from(typeof output === "string" ? output : "");
+    if (bytes.length > 64 * 1024) truncated.push(stream);
+    const bounded = bytes.subarray(0, 64 * 1024).toString("utf8");
+    const pattern = /^(?:INFO[ \t]*\|[ \t]*)?Android emulator version (\d{1,4}(?:\.\d{1,4}){1,4}) \(build_id (\d{1,16})\)(?: \(CL:([A-Za-z0-9/:._-]{1,40})\))?\r?$/gm;
+    const lines = [...bounded.matchAll(pattern)];
+    if (lines.length) streams.push(stream);
+    for (const match of lines) {
+      const line = `Android emulator version ${match[1]} (build_id ${match[2]})${match[3] ? ` (CL:${match[3]})` : ""}`;
+      if (!matches.some((entry) => entry.version === match[1] && entry.build === match[2])) matches.push({ version: match[1], build: match[2], line });
+    }
+  }
+  const version = matches.length === 1 ? matches[0] : undefined;
+  return {
+    identity: { emulator_version: version?.version, emulator_build_id: version?.build, emulator_version_line: version?.line },
+    parse_status: matches.length === 1 ? "matched" : matches.length > 1 ? "ambiguous" : "missing",
+    version_streams: streams, truncated_streams: truncated,
+  };
+}
+
+export function summarizeEmulatorVersionProbe(result) {
+  const { identity, ...parsed } = emulatorVersionEvidence(result?.stdout, result?.stderr);
+  const errorStatuses = new Map([["ETIMEDOUT", "timeout"], ["ENOBUFS", "output_limit"], ["ENOENT", "not_found"], ["EACCES", "permission_denied"]]);
+  const signals = new Set(["SIGABRT", "SIGBUS", "SIGHUP", "SIGILL", "SIGINT", "SIGKILL", "SIGSEGV", "SIGTERM"]);
+  return {
+    ...identity,
+    emulator_version_probe: {
+      capture_status: result?.error ? errorStatuses.get(result.error.code) || "other_error"
+        : result?.signal ? "signaled" : result?.status === 0 ? "completed"
+          : Number.isInteger(result?.status) ? "nonzero_exit" : "unknown",
+      exit_code: Number.isInteger(result?.status) && result.status >= 0 && result.status <= 255 ? result.status : null,
+      termination_signal: result?.signal ? signals.has(result.signal) ? result.signal : "other" : null,
+      ...parsed,
+    },
+  };
+}
+
 export function summarizeBuildIdentity({ apiLevel = "", release = "", buildId = "", fingerprint = "", emulator = "", adb = "" }) {
   const safe = (value, pattern) => pattern.test(value.trim()) ? value.trim() : undefined;
   const api = safe(apiLevel, /^[1-9]\d{0,2}$/);
-  const emulatorVersion = emulator.slice(0, 2048).match(/^(?:INFO\s*\|\s*)?Android emulator version ([\d.]{1,24}) \(build_id (\d{1,16})\)(?: \(CL:[A-Za-z0-9/:._-]{1,32}\))?/m);
+  const { identity: emulatorIdentity } = emulatorVersionEvidence(emulator);
   const adbProtocol = adb.slice(0, 2048).match(/^Android Debug Bridge version ([\d.]{1,24})$/m);
   const adbBuild = adb.slice(0, 2048).match(/^Version ([A-Za-z0-9._-]{1,48})$/m);
   return {
@@ -12,8 +53,7 @@ export function summarizeBuildIdentity({ apiLevel = "", release = "", buildId = 
     android_release: safe(release, /^[A-Za-z0-9._-]{1,32}$/),
     android_build_id: safe(buildId, /^[A-Za-z0-9._-]{1,64}$/),
     android_build_fingerprint: safe(fingerprint, /^[A-Za-z0-9._:/+-]{1,256}$/),
-    emulator_version: emulatorVersion?.[1], emulator_build_id: emulatorVersion?.[2],
-    emulator_version_line: emulatorVersion?.[0],
+    ...emulatorIdentity,
     adb_protocol_version: adbProtocol?.[1], adb_build_version: adbBuild?.[1],
   };
 }

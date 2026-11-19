@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import test from "node:test";
 import { summarizeDisplayGeometry, summarizeInputGeometry, summarizeWmSize } from "./android_provider_geometry.mjs";
 import {
   awakeUnlockedReadiness, classifyAnrOwner, pollReadOnlyReadiness,
   summarizeAnrTraces, summarizeBuildIdentity, summarizeCredentialReadiness,
-  summarizeCurrentAnrWindow, summarizeVerification,
+  summarizeCurrentAnrWindow, summarizeEmulatorVersionProbe, summarizeVerification,
 } from "./android_provider_diagnostics.mjs";
 
 const viewport = "Viewport INTERNAL: displayId=0, uniqueId=private-display, port=0, orientation=1, logicalFrame=[0, 0, 2400, 1080], physicalFrame=[0, 0, 2400, 1080], deviceSize=[2400, 1080], isActive=[1]";
@@ -117,6 +118,53 @@ test("build evidence keeps SDK and emulator identity without installation paths"
   assert.equal(malformed.android_build_id, undefined);
   assert.equal(malformed.emulator_version, undefined);
   assert.doesNotMatch(JSON.stringify(malformed), /private/);
+});
+
+test("a nonzero version probe retains a valid stderr identity and truthful exit status", () => {
+  const result = spawnSync(process.execPath, ["-e", `
+    process.stdout.write("private-startup-output\\n".repeat(150));
+    process.stderr.write("INFO         | Android emulator version 37.2.13.0 (build_id 16740729) (CL:N/A)\\nprivate-error\\n");
+    process.exitCode = 7;
+  `], { timeout: 5000, maxBuffer: 64 * 1024 });
+  const summary = summarizeEmulatorVersionProbe(result);
+  assert.equal(summary.emulator_version, "37.2.13.0");
+  assert.equal(summary.emulator_build_id, "16740729");
+  assert.deepEqual(summary.emulator_version_probe, {
+    capture_status: "nonzero_exit", exit_code: 7, termination_signal: null,
+    parse_status: "matched", version_streams: ["stderr"], truncated_streams: [],
+  });
+  assert.doesNotMatch(JSON.stringify(summary), /private/);
+});
+
+test("version probe parsing handles bounded banners and rejects conflicting identities", () => {
+  const line = "Android emulator version 37.2.13.0 (build_id 16740729)";
+  const summary = summarizeEmulatorVersionProbe({ status: 0, stdout: `${"private-banner\n".repeat(300)}${line}\n`, stderr: `INFO | ${line} (CL:N/A)\n` });
+  assert.equal(summary.emulator_version, "37.2.13.0");
+  assert.equal(summary.emulator_version_probe.capture_status, "completed");
+  assert.deepEqual(summary.emulator_version_probe.version_streams, ["stdout", "stderr"]);
+  assert.doesNotMatch(JSON.stringify(summary), /private/);
+  const conflict = summarizeEmulatorVersionProbe({ status: 0, stdout: line, stderr: line.replace("37.2.13.0", "37.2.14.0") });
+  assert.equal(conflict.emulator_version, undefined);
+  assert.equal(conflict.emulator_version_probe.parse_status, "ambiguous");
+  const beyondBound = summarizeEmulatorVersionProbe({ status: 0, stdout: `${"x".repeat(64 * 1024)}\n${line}\n` });
+  assert.equal(beyondBound.emulator_version, undefined);
+  assert.deepEqual(beyondBound.emulator_version_probe.truncated_streams, ["stdout"]);
+});
+
+test("version probe failures expose only categorical status and exact known fields", () => {
+  for (const [code, status] of [["ETIMEDOUT", "timeout"], ["ENOBUFS", "output_limit"], ["ENOENT", "not_found"], ["EACCES", "permission_denied"], ["private-error", "other_error"]]) {
+    const summary = summarizeEmulatorVersionProbe({ status: null, signal: "SIGTERM", error: { code, message: "private-error-path" }, stderr: "private-output" });
+    assert.equal(summary.emulator_version_probe.capture_status, status);
+    assert.equal(summary.emulator_version_probe.exit_code, null);
+    assert.equal(summary.emulator_version_probe.termination_signal, "SIGTERM");
+    assert.equal(summary.emulator_version_probe.parse_status, "missing");
+    assert.doesNotMatch(JSON.stringify(summary), /private/);
+  }
+  const signaled = summarizeEmulatorVersionProbe({ status: null, signal: "SIGABRT", stdout: "Android emulator version 37.2.13.0 (build_id 16740729)\n" });
+  assert.equal(signaled.emulator_version, "37.2.13.0");
+  assert.equal(signaled.emulator_version_probe.capture_status, "signaled");
+  assert.equal(signaled.emulator_version_probe.termination_signal, "SIGABRT");
+  assert.equal(summarizeEmulatorVersionProbe({ status: null, signal: "private-signal" }).emulator_version_probe.termination_signal, "other");
 });
 
 test("ANR owner requires real system controls and exact whitelisted title evidence", () => {

@@ -26,7 +26,6 @@ pub mod tool_surface;
 pub mod tools;
 pub mod ui;
 pub mod verification;
-pub mod window_views;
 pub mod workflow;
 
 pub type McpError = rmcp::ErrorData;

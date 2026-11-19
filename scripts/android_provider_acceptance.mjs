@@ -13,7 +13,7 @@ import { summarizeDisplayGeometry, summarizeInputGeometry, summarizeWmSize } fro
 import {
   awakeUnlockedReadiness, classifyAnrOwner, decodeXmlAttribute, pollReadOnlyReadiness,
   summarizeAnrTraces, summarizeBuildIdentity, summarizeCredentialReadiness,
-  summarizeCurrentAnrWindow, summarizeVerification,
+  summarizeCurrentAnrWindow, summarizeEmulatorVersionProbe, summarizeVerification,
 } from "./android_provider_diagnostics.mjs";
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -127,18 +127,20 @@ function recordDeviceGeometry(phase) {
   });
 }
 function deviceBuildIdentity() {
-  const capture = (command, args, includeStderr = false) => {
+  const capture = (command, args) => {
     const result = spawnSync(command, args, { timeout: 5000, maxBuffer: 64 * 1024 });
-    return result.error || result.status !== 0 ? "" : result.stdout.toString("utf8")
-      + (includeStderr ? `\n${result.stderr.toString("utf8")}` : "");
+    return result.error || result.status !== 0 ? "" : result.stdout.toString("utf8");
   };
   const property = (name) => capture(adb, ["-s", serial, "shell", "getprop", name]);
-  return summarizeBuildIdentity({
+  const identity = summarizeBuildIdentity({
     apiLevel: property("ro.build.version.sdk"), release: property("ro.build.version.release"),
     buildId: property("ro.build.id"), fingerprint: property("ro.build.fingerprint"),
-    emulator: capture(path.join(sdk, "emulator/emulator"), ["-version"], true),
     adb: capture(adb, ["version"]),
   });
+  // A valid version line is evidence even when this headless probe exits
+  // nonzero. Preserve categorical exit/parse status instead of erasing it.
+  const emulator = spawnSync(path.join(sdk, "emulator/emulator"), ["-version"], { timeout: 5000, maxBuffer: 64 * 1024 });
+  return { ...identity, ...summarizeEmulatorVersionProbe(emulator) };
 }
 async function hierarchyEvidence(value) {
   const candidates = [
