@@ -380,7 +380,7 @@
         "description": "Recommended interaction loops and lane guidance.",
         "mimeType": "text/markdown",
         "name": "help",
-        "size": 8106,
+        "size": 8613,
         "title": "Android Computer Use MCP help",
         "uri": "android-computer-use-mcp://help"
       },

@@ -18,8 +18,9 @@ use tokio::time::sleep;
 use crate::McpError;
 use crate::server::AndroidEmulatorMcp;
 use crate::tools::{
-    AndroidWindowState, filename_or_timestamp, has_meaningful_observation_budget,
-    is_command_timeout_error, remaining_until, remove_artifact_if_exists,
+    AndroidWindowState, SystemDialogCheck, filename_or_timestamp,
+    has_meaningful_observation_budget, is_command_timeout_error, remaining_until,
+    remove_artifact_if_exists,
 };
 use crate::ui::{
     NormalizedUiNode, SelectionFailure, SelectorCandidateSummary, UiBounds, UiSelector,
@@ -191,6 +192,13 @@ pub(crate) struct ToolPostconditionResult {
     pub(crate) match_count: usize,
     pub(crate) selected_match_index: Option<usize>,
     pub(crate) candidate_summary: Vec<SelectorCandidateSummary>,
+    pub(crate) handled_system_dialogs: Vec<HandledSystemDialog>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct HandledSystemDialog {
+    pub(crate) kind: &'static str,
+    pub(crate) action: &'static str,
 }
 
 pub(crate) struct TapVerificationRequest<'a> {
@@ -680,6 +688,7 @@ impl AndroidEmulatorMcp {
                 match_count: 0,
                 selected_match_index: None,
                 candidate_summary: Vec::new(),
+                handled_system_dialogs: Vec::new(),
             });
         }
 
@@ -699,6 +708,7 @@ impl AndroidEmulatorMcp {
             match_count: 0,
             selected_match_index: None,
             candidate_summary: Vec::new(),
+            handled_system_dialogs: Vec::new(),
         };
 
         while Instant::now() < deadline {
@@ -736,6 +746,7 @@ impl AndroidEmulatorMcp {
                 match_count: 0,
                 selected_match_index: None,
                 candidate_summary: Vec::new(),
+                handled_system_dialogs: Vec::new(),
             };
             if satisfied {
                 return Ok(last_result);
@@ -783,6 +794,7 @@ impl AndroidEmulatorMcp {
                 match_count: 0,
                 selected_match_index: None,
                 candidate_summary: Vec::new(),
+                handled_system_dialogs: Vec::new(),
             });
         }
 
@@ -806,6 +818,7 @@ impl AndroidEmulatorMcp {
             match_count: 0,
             selected_match_index: None,
             candidate_summary: Vec::new(),
+            handled_system_dialogs: Vec::new(),
         };
 
         while Instant::now() < deadline {
@@ -912,7 +925,41 @@ impl AndroidEmulatorMcp {
                 match_count,
                 selected_match_index,
                 candidate_summary,
+                handled_system_dialogs: std::mem::take(&mut last_result.handled_system_dialogs),
             };
+            if selector.is_some() {
+                match self
+                    .check_postcondition_system_dialog(
+                        serial,
+                        &observation.hierarchy_path,
+                        &observation.nodes,
+                        deadline,
+                        last_result.handled_system_dialogs.len() < 4,
+                    )
+                    .await?
+                {
+                    SystemDialogCheck::Handled(_) => {
+                        last_result
+                            .handled_system_dialogs
+                            .push(HandledSystemDialog {
+                                kind: "anr",
+                                action: "wait",
+                            });
+                        last_result.satisfied = false;
+                        // The dialog changed the UI. Require a new capture and
+                        // all original selector, activity and package checks.
+                        last_fast_fingerprint = None;
+                        continue;
+                    }
+                    SystemDialogCheck::Blocked(_) => {
+                        last_result.satisfied = false;
+                        last_result.timed_out = Instant::now() >= deadline;
+                        last_result.elapsed_ms = started.elapsed().as_millis();
+                        return Ok(last_result);
+                    }
+                    SystemDialogCheck::None => {}
+                }
+            }
             if satisfied {
                 return Ok(last_result);
             }
@@ -984,6 +1031,7 @@ pub(crate) fn tool_postcondition_json(result: &ToolPostconditionResult) -> serde
         "selected_match_index": result.selected_match_index,
         "candidate_summary": result.candidate_summary,
         "node": result.node,
+        "handled_system_dialogs": result.handled_system_dialogs,
     })
 }
 
@@ -1812,6 +1860,7 @@ mod tests {
             match_count: 0,
             selected_match_index: None,
             candidate_summary: Vec::new(),
+            handled_system_dialogs: Vec::new(),
         };
 
         assert_eq!(
@@ -1832,6 +1881,7 @@ mod tests {
                 "selected_match_index": null,
                 "candidate_summary": [],
                 "node": null,
+                "handled_system_dialogs": [],
             })
         );
     }

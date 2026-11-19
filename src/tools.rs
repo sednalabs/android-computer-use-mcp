@@ -2540,6 +2540,7 @@ impl AndroidEmulatorMcp {
                 match_count: 0,
                 selected_match_index: None,
                 candidate_summary: Vec::new(),
+                handled_system_dialogs: Vec::new(),
             }
         };
         ensure_tool_postcondition_satisfied(
@@ -3225,7 +3226,7 @@ pub(crate) struct UiObservation {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct SystemDialogReport {
+pub(crate) struct SystemDialogReport {
     detected: bool,
     kind: String,
     labels: Vec<String>,
@@ -3235,7 +3236,7 @@ struct SystemDialogReport {
     artifact_path: String,
 }
 
-enum SystemDialogCheck {
+pub(crate) enum SystemDialogCheck {
     None,
     Handled(SystemDialogReport),
     Blocked(SystemDialogReport),
@@ -5047,6 +5048,36 @@ impl AndroidEmulatorMcp {
         ui_path: &Path,
         nodes: &[NormalizedUiNode],
     ) -> Result<SystemDialogCheck, McpError> {
+        self.check_system_dialog_with_deadline(serial, ui_path, nodes, None, true)
+            .await
+    }
+
+    pub(crate) async fn check_postcondition_system_dialog(
+        &self,
+        serial: &str,
+        ui_path: &Path,
+        nodes: &[NormalizedUiNode],
+        deadline: Instant,
+        allow_anr_wait: bool,
+    ) -> Result<SystemDialogCheck, McpError> {
+        self.check_system_dialog_with_deadline(
+            serial,
+            ui_path,
+            nodes,
+            Some(deadline),
+            allow_anr_wait,
+        )
+        .await
+    }
+
+    async fn check_system_dialog_with_deadline(
+        &self,
+        serial: &str,
+        ui_path: &Path,
+        nodes: &[NormalizedUiNode],
+        deadline: Option<Instant>,
+        allow_action: bool,
+    ) -> Result<SystemDialogCheck, McpError> {
         let labels = labels_from_nodes(nodes);
         if labels.is_empty() {
             return Ok(SystemDialogCheck::None);
@@ -5055,28 +5086,50 @@ impl AndroidEmulatorMcp {
         let Some(plan) = classify_system_dialog(&labels) else {
             return Ok(SystemDialogCheck::None);
         };
-        if let Some(label) = plan.action_label
-            && let Ok(button) = find_ui_node_by_label(ui_path, label)
+        if deadline.is_some() && plan.kind != "anr" {
+            // Other dialogs may themselves be the requested selector. Preserve
+            // their normal verification without granting permissions or closing.
+            return Ok(SystemDialogCheck::None);
+        }
+        let action = if !allow_action {
+            None
+        } else if deadline.is_some() {
+            // Verification may recover only Android's real ANR Wait button.
+            // It must never grant permissions or choose a destructive button.
+            postcondition_anr_wait_button(&plan, nodes).and_then(|node| {
+                node.bounds
+                    .map(|bounds| (bounds.center(), node.resource_id.clone()))
+            })
+        } else {
+            plan.action_label.and_then(|label| {
+                let button = find_ui_node_by_label(ui_path, label).ok()?;
+                let action_resource_id = matching_nodes(
+                    nodes,
+                    &UiSelector {
+                        text: Some(label.to_string()),
+                        ..UiSelector::default()
+                    },
+                )
+                .matches
+                .into_iter()
+                .next()
+                .and_then(|node| node.resource_id);
+                Some((button.bounds.center(), action_resource_id))
+            })
+        };
+        if let Some(((x, y), action_resource_id)) = action
+            && let Some(label) = plan.action_label
+            && deadline.is_none_or(|deadline| Instant::now() < deadline)
         {
-            let action_resource_id = matching_nodes(
-                nodes,
-                &UiSelector {
-                    text: Some(label.to_string()),
-                    ..UiSelector::default()
-                },
-            )
-            .matches
-            .into_iter()
-            .next()
-            .and_then(|node| node.resource_id);
-            let (x, y) = button.bounds.center();
+            // Once dispatched, retain the existing bounded mutation cleanup.
+            // Dropping this future at the observation deadline could strand input.
             self.tap_point_internal(serial, x, y).await?;
-            sleep(if plan.kind == "anr" {
+            let settle = if plan.kind == "anr" {
                 Duration::from_secs(2)
             } else {
                 Duration::from_millis(750)
-            })
-            .await;
+            };
+            sleep(deadline.map_or(settle, |deadline| settle.min(remaining_until(deadline)))).await;
             return Ok(SystemDialogCheck::Handled(SystemDialogReport {
                 detected: true,
                 kind: plan.kind.to_string(),
@@ -6935,6 +6988,26 @@ fn classify_system_dialog(labels: &[String]) -> Option<SystemDialogPlan> {
     None
 }
 
+fn postcondition_anr_wait_button<'a>(
+    plan: &SystemDialogPlan,
+    nodes: &'a [NormalizedUiNode],
+) -> Option<&'a NormalizedUiNode> {
+    if plan.kind != "anr" || plan.action_label != Some("Wait") {
+        return None;
+    }
+    let mut matches = nodes.iter().filter(|node| {
+        node.package_name.as_deref() == Some("android")
+            && node.resource_id.as_deref() == Some("android:id/aerr_wait")
+            && node.clickable
+            && node.enabled
+            && node
+                .bounds
+                .is_some_and(|bounds| bounds.right > bounds.left && bounds.bottom > bounds.top)
+    });
+    let button = matches.next()?;
+    matches.next().is_none().then_some(button)
+}
+
 fn system_dialog_action_matches_selector(
     selector: &UiSelector,
     report: &SystemDialogReport,
@@ -7137,6 +7210,33 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::process::ExitStatusExt;
 
+    #[cfg(unix)]
+    fn adb_fixture_server(root: &Path) -> AndroidEmulatorMcp {
+        AndroidEmulatorMcp::new(crate::config::Config {
+            sdk_root: root.to_path_buf(),
+            adb_path: root.join("adb"),
+            emulator_path: root.join("emulator"),
+            avdmanager_path: root.join("avdmanager"),
+            artifact_dir: root.join("artifacts"),
+            emulator_grpc_port: None,
+            use_sg_kvm: false,
+            streamable_http: crate::config::StreamableHttpConfig {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                allowed_hosts: vec!["localhost".into()],
+                max_sessions: 1,
+                channel_capacity: 1,
+                allow_resume: false,
+            },
+            interactive_session: None,
+            execution_identity: ProviderExecutionIdentity {
+                environment_id: "adb-test".into(),
+                provider_instance_id: "adb-test".into(),
+                provider_epoch: "adb-test".into(),
+                session_id: "adb-test".into(),
+            },
+        })
+    }
+
     #[tokio::test]
     #[cfg(unix)]
     async fn cancelled_requests_stop_new_adb_mutations_but_keep_observations_and_cleanup() {
@@ -7158,29 +7258,7 @@ mod tests {
         fs::set_permissions(&adb_path, std::fs::Permissions::from_mode(0o700))
             .await
             .unwrap();
-        let mcp = AndroidEmulatorMcp::new(crate::config::Config {
-            sdk_root: root.clone(),
-            adb_path,
-            emulator_path: root.join("emulator"),
-            avdmanager_path: root.join("avdmanager"),
-            artifact_dir: root.join("artifacts"),
-            emulator_grpc_port: None,
-            use_sg_kvm: false,
-            streamable_http: crate::config::StreamableHttpConfig {
-                bind_addr: "127.0.0.1:0".parse().unwrap(),
-                allowed_hosts: vec!["localhost".into()],
-                max_sessions: 1,
-                channel_capacity: 1,
-                allow_resume: false,
-            },
-            interactive_session: None,
-            execution_identity: ProviderExecutionIdentity {
-                environment_id: "cancel-test".into(),
-                provider_instance_id: "cancel-test".into(),
-                provider_epoch: "cancel-test".into(),
-                session_id: "cancel-test".into(),
-            },
-        });
+        let mcp = adb_fixture_server(&root);
         let token = tokio_util::sync::CancellationToken::new();
         token.cancel();
         crate::execution::with_cancellation(token, async {
@@ -10119,6 +10197,7 @@ mod tests {
                 match_count: 0,
                 selected_match_index: None,
                 candidate_summary: Vec::new(),
+                handled_system_dialogs: Vec::new(),
             },
         )
         .expect_err("unsatisfied requested postconditions should hard-fail");
@@ -10147,6 +10226,7 @@ mod tests {
                 match_count: 0,
                 selected_match_index: None,
                 candidate_summary: Vec::new(),
+                handled_system_dialogs: Vec::new(),
             },
         )
         .expect("unrequested postconditions should not error");
@@ -10200,6 +10280,174 @@ mod tests {
         .expect("crash dialog should be detected");
         assert_eq!(crash.kind, "crash");
         assert_eq!(crash.action_label, None);
+    }
+
+    #[test]
+    fn postcondition_recovery_only_selects_a_unique_system_anr_wait_button() {
+        let nodes = parse_ui_nodes_from_xml(
+            r#"<hierarchy><node package="android" resource-id="android:id/aerr_wait" text="Wait" clickable="true" enabled="true" bounds="[60,0][100,20]" /></hierarchy>"#,
+        )
+        .unwrap();
+        let plan = SystemDialogPlan {
+            kind: "anr",
+            action_label: Some("Wait"),
+        };
+        assert!(postcondition_anr_wait_button(&plan, &nodes).is_some());
+        for (package, resource, bounds) in [
+            ("fixture", "android:id/aerr_wait", "[60,0][100,20]"),
+            ("android", "android:id/aerr_close", "[0,0][40,20]"),
+            ("android", "android:id/aerr_wait", "[60,0][60,20]"),
+            ("android", "android:id/aerr_wait", "[60,0][100,0]"),
+        ] {
+            let nodes = parse_ui_nodes_from_xml(&format!(
+                r#"<hierarchy><node package="{package}" resource-id="{resource}" text="Wait" clickable="true" enabled="true" bounds="{bounds}" /></hierarchy>"#,
+            ))
+            .unwrap();
+            assert!(postcondition_anr_wait_button(&plan, &nodes).is_none());
+        }
+        let duplicate = vec![nodes[0].clone(), nodes[0].clone()];
+        assert!(postcondition_anr_wait_button(&plan, &duplicate).is_none());
+        for plan in [
+            SystemDialogPlan {
+                kind: "permission",
+                action_label: Some("Allow"),
+            },
+            SystemDialogPlan {
+                kind: "crash",
+                action_label: None,
+            },
+        ] {
+            assert!(postcondition_anr_wait_button(&plan, &nodes).is_none());
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn selector_postcondition_recovers_anr_then_requires_fresh_target_evidence() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(timestamp_filename("postcondition-anr", None));
+        fs::create_dir_all(&root).await.unwrap();
+        let dialog = root.join("dialog.xml");
+        fs::write(&dialog, r#"<hierarchy>
+            <node package="android" text="Fixture isn't responding" />
+            <node package="android" resource-id="android:id/aerr_close" text="Close app" clickable="true" enabled="true" bounds="[0,0][40,20]" />
+            <node package="android" resource-id="android:id/aerr_wait" text="Wait" clickable="true" enabled="true" bounds="[60,0][100,20]" />
+            </hierarchy>"#).await.unwrap();
+        fs::write(root.join("ready.xml"), r#"<hierarchy>
+            <node package="fixture" resource-id="fixture:id/increment" text="Increment" clickable="true" enabled="true" bounds="[0,0][100,40]" />
+            </hierarchy>"#).await.unwrap();
+        let adb = root.join("adb");
+        fs::write(
+            &adb,
+            r#"#!/usr/bin/env python3
+import pathlib, shlex, sys
+root = pathlib.Path(__file__).resolve().parent
+args = sys.argv[3:]
+if args[0] == 'shell':
+    args = ['shell'] + shlex.split(args[1])
+command = ' '.join(args)
+with (root / 'calls').open('a') as log:
+    log.write(command + '\n')
+if command == 'exec-out uiautomator dump /dev/tty':
+    print((root / ('ready.xml' if (root / 'waited').exists() else 'dialog.xml')).read_text())
+elif command == 'shell dumpsys window windows':
+    print('mCurrentFocus=Window{a u0 fixture/.Main}')
+elif command == 'shell dumpsys activity activities':
+    print('mResumedActivity: ActivityRecord{a u0 fixture/.Main}')
+elif command == 'shell input tap 80 10':
+    (root / 'waited').touch()
+else:
+    sys.exit('Unexpected fixture command: ' + command)
+"#,
+        )
+        .await
+        .unwrap();
+        fs::set_permissions(&adb, std::fs::Permissions::from_mode(0o700))
+            .await
+            .unwrap();
+        let mcp = adb_fixture_server(&root);
+        let nodes = parse_ui_nodes_from_path(&dialog).unwrap();
+        let permission = parse_ui_nodes_from_xml(
+            r#"<hierarchy><node text="Allow location permission" /><node text="While using the app" /><node text="Don't allow" /></hierarchy>"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            mcp.check_postcondition_system_dialog(
+                "anr-fixture",
+                &dialog,
+                &permission,
+                Instant::now() + Duration::from_secs(10),
+                true,
+            )
+            .await
+            .unwrap(),
+            SystemDialogCheck::None
+        ));
+        for (deadline, allow_wait) in [
+            (Instant::now() - Duration::from_secs(1), true),
+            (Instant::now() + Duration::from_secs(10), false),
+        ] {
+            assert!(matches!(
+                mcp.check_postcondition_system_dialog(
+                    "anr-fixture",
+                    &dialog,
+                    &nodes,
+                    deadline,
+                    allow_wait
+                )
+                .await
+                .unwrap(),
+                SystemDialogCheck::Blocked(_)
+            ));
+        }
+        assert!(
+            !root.join("calls").exists(),
+            "Expired or exhausted recovery must not dispatch"
+        );
+        let selector = UiSelector {
+            resource_id: Some("fixture:id/increment".into()),
+            ..UiSelector::default()
+        };
+        let result = mcp
+            .wait_for_tool_postcondition(ToolPostconditionRequest {
+                serial: "anr-fixture",
+                selector: Some(&selector),
+                match_index: None,
+                wait_for_activity: Some("fixture.Main"),
+                wait_for_package: Some("fixture"),
+                deadline: Instant::now() + Duration::from_secs(10),
+                include_screenshot: false,
+                artifact_prefix: "anr-postcondition",
+            })
+            .await
+            .unwrap();
+        assert!(result.satisfied);
+        assert!(!result.timed_out);
+        assert_eq!(
+            result.node.as_ref().unwrap().resource_id.as_deref(),
+            Some("fixture:id/increment")
+        );
+        assert_eq!(
+            tool_postcondition_json(&result)["handled_system_dialogs"],
+            json!([{ "kind": "anr", "action": "wait" }])
+        );
+        let calls = fs::read_to_string(root.join("calls")).await.unwrap();
+        assert_eq!(
+            calls
+                .lines()
+                .filter(|line| line.starts_with("shell input"))
+                .collect::<Vec<_>>(),
+            ["shell input tap 80 10"]
+        );
+        assert_eq!(
+            calls
+                .lines()
+                .filter(|line| *line == "exec-out uiautomator dump /dev/tty")
+                .count(),
+            2
+        );
+        fs::remove_dir_all(root).await.unwrap();
     }
 
     #[test]

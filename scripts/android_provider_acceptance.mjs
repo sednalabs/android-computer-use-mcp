@@ -67,6 +67,9 @@ const fixtureLabels = new Set([
   "Open dialog", "Acceptance dialog", "Dialog is visible", "Close dialog",
   "Open scroll page", "Scroll acceptance page", "Scroll destination reached",
   "Back to controls", "Touch pad", "Acceptance touch pad", "Sedna café Ω %s",
+  "System UI isn't responding", "System UI isn’t responding",
+  "Pixel Launcher isn't responding", "Launcher3 isn't responding",
+  "Android MCP Acceptance isn't responding", "Wait", "Close app",
 ]);
 const staticFixtureLabel = (label) => typeof label === "string" &&
   (fixtureLabels.has(label) || /^(?:Count: \d{1,3}|Max pointers: [0-5]|Scroll row \d{1,2})$/.test(label))
@@ -125,6 +128,11 @@ function imageEvidence(result) {
   assert.equal(images[0].mimeType, "image/png");
   return assertTypedPng([{ type: "input_image", detail: "high", image_url: `data:image/png;base64,${images[0].data}` }]);
 }
+function handledDialogs(condition) {
+  return condition?.handled_system_dialogs?.slice(0, 4).map((dialog) => ({
+    kind: dialog.kind, action: dialog.action,
+  })) || [];
+}
 function failureSummary(value) {
   // Keep actionable errors while excluding screenshots, hierarchies, transport
   // stdout/stderr, request arguments and arbitrary receipt fields from evidence.
@@ -140,6 +148,7 @@ function failureSummary(value) {
     timed_out: condition.timed_out, elapsed_ms: condition.elapsed_ms,
     evidence_source: condition.evidence_source, match_count: condition.match_count,
     observed_package: condition.observed_package, observed_activity: condition.observed_activity,
+    handled_system_dialogs: handledDialogs(condition),
   };
   return {
     outcome: value.outcome, executed_action_count: value.executed_action_count,
@@ -166,6 +175,10 @@ async function call(name, args, { ok = true, image = false } = {}) {
   const result = await client.callTool(name, args);
   const value = receipt(result);
   const check = { tool: name, action_id: args.action_id, ok: value.ok, expected_ok: ok, elapsed_ms: Date.now() - begin };
+  const recoveredDialogs = [value.postcondition, ...(value.actions || []).map((row) =>
+    row.receipt?.postcondition || row.error?.data?.postcondition,
+  )].flatMap(handledDialogs).slice(0, 16);
+  if (recoveredDialogs.length) check.handled_system_dialogs = recoveredDialogs;
   checks.push(check);
   if (value.ok !== ok) {
     check.failure = failureSummary(value);
@@ -174,6 +187,9 @@ async function call(name, args, { ok = true, image = false } = {}) {
     console.error(JSON.stringify({ failed_gate: currentGate, failure: check.failure }));
   }
   assert.equal(value.ok, ok, `Unexpected outcome for ${currentGate}.`);
+  for (const dialog of recoveredDialogs) {
+    assert.deepEqual(dialog, { kind: "anr", action: "wait" }, "Fixture recovery must use the bounded safe ANR Wait policy.");
+  }
   if (image) assert.equal(Boolean(result.isError), !ok, `${name} MCP error flag must match the receipt.`);
   const imageReceipt = image ? imageEvidence(result) : undefined;
   if (imageReceipt) check.image = imageReceipt;
