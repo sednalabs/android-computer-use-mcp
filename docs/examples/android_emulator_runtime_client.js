@@ -580,7 +580,7 @@ export function createAndroidEmulatorRuntime({
     async scrollUntilVisible(
       selector,
       {
-        direction = "down",
+        direction = "up",
         maxSwipes = 5,
         hierarchyFilename = "scroll-until-visible.xml",
         matchIndex = null,

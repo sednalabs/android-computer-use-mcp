@@ -63,7 +63,9 @@ what the user or model can actually see.
 - `android.type_into_element` focuses a resolved input and verifies visible text
   entry.
 - `android.scroll_until_visible` scrolls until a target selector appears or the
-  swipe budget is exhausted.
+  swipe budget is exhausted. Its direction describes vertical finger motion:
+  `up` (the default) swipes from bottom to top to reveal later rows in a list;
+  `down` swipes from top to bottom. Horizontal directions are unsupported.
 
 Selector-bearing tools accept a structured selector object. Some tools also
 accept a string shorthand such as `"Search"` for visible text. Ambiguity is a

@@ -3194,7 +3194,7 @@
         "properties": {
           "direction": {
             "default": null,
-            "description": "Scroll direction such as `up`, `down`, `left`, or `right`.",
+            "description": "Vertical finger swipe direction: `up` (default, bottom to top) or `down` (top to bottom).",
             "type": [
               "string",
               "null"

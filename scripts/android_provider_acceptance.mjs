@@ -340,7 +340,8 @@ try {
   await step("dismiss-dialog", [action("android.input.keyevent", { keycode: "KEYCODE_BACK" })]);
   await waitFor(id("increment"));
   await step("scroll-page", [action("android.tap_element", { selector: id("scroll"), wait_for_selector: text("Scroll acceptance page") })]);
-  await step("scroll-to-end", [action("android.scroll_until_visible", { selector: id("back_to_controls"), direction: "down", max_swipes: 8 })]);
+  // Direction describes the finger's motion; swipe up to reveal later rows.
+  await step("scroll-to-end", [action("android.scroll_until_visible", { selector: id("back_to_controls"), direction: "up", max_swipes: 8 })]);
   await waitFor(text("Scroll destination reached"));
   await step("scroll-back", [action("android.tap_element", { selector: id("back_to_controls"), wait_for_selector: id("increment") })]);
   await step("landscape", [action("android.set_orientation", { orientation: "landscape", timeout_secs: 20 })]);

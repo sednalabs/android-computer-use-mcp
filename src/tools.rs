@@ -428,7 +428,7 @@ pub struct ScrollUntilVisibleArgs {
     pub serial: Option<String>,
     /// Selector for the element that should become visible.
     pub selector: UiSelectorInput,
-    /// Scroll direction such as `up`, `down`, `left`, or `right`.
+    /// Vertical finger swipe direction: `up` (default, bottom to top) or `down` (top to bottom).
     #[serde(default)]
     pub direction: Option<String>,
     /// Maximum number of swipe attempts before giving up.
