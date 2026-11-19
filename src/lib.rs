@@ -16,6 +16,7 @@
 pub mod config;
 pub mod discovery;
 pub mod emulator_grpc;
+mod execution;
 pub mod grpc_backend;
 pub mod http_runtime;
 pub mod interactive_session;
@@ -25,6 +26,6 @@ pub mod tool_surface;
 pub mod tools;
 pub mod ui;
 pub mod verification;
-pub mod window_views;
+pub mod workflow;
 
 pub type McpError = rmcp::ErrorData;

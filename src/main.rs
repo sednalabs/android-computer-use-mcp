@@ -32,13 +32,13 @@ async fn run() -> Result<()> {
     let cli = Cli::parse();
 
     if cli.print_tools {
-        let tools = AndroidEmulatorMcp::tool_router_android().list_all();
+        let tools = AndroidEmulatorMcp::tool_router_all().list_all();
         println!("{}", serde_json::to_string_pretty(&tool_names(&tools)?)?);
         return Ok(());
     }
 
     if cli.print_tool_schema {
-        let tools = AndroidEmulatorMcp::tool_router_android().list_all();
+        let tools = AndroidEmulatorMcp::tool_router_all().list_all();
         println!(
             "{}",
             serde_json::to_string_pretty(&tool_schema_snapshot_value(&tools)?)?

@@ -12,6 +12,9 @@ backend details such as ADB and emulator gRPC remain implementation details.
 
 ## What It Provides
 
+- Image-bearing observe/step/install workflows with durable action IDs,
+  per-device leases, partial receipts and recovery after disconnects.
+
 - Emulator lifecycle tools for AVD discovery, launch, readiness, app install, and
   app launch.
 - Observation tools for screenshots, UIAutomator XML, normalized UI summaries,
@@ -29,6 +32,8 @@ backend details such as ADB and emulator gRPC remain implementation details.
 
 ## Documentation
 
+- [Agent Workflows and Recovery](docs/agent-workflows.md)
+- [Production Validation](docs/production-validation.md)
 - [Getting Started](docs/GETTING_STARTED.md)
 - [Tool Guide](docs/TOOL_GUIDE.md)
 - [Security Model](docs/SECURITY_MODEL.md)
@@ -52,6 +57,9 @@ backend details such as ADB and emulator gRPC remain implementation details.
   you provide.
 
 ## Quick Start
+
+Building requires Rust 1.99 or newer, a Protobuf compiler (`protoc`), and the
+Android SDK emulator package, which supplies the gRPC protocol definitions.
 
 Set the Android SDK paths for your machine and start the loopback server:
 
@@ -83,6 +91,9 @@ For a fuller setup walkthrough, see [Getting Started](docs/GETTING_STARTED.md).
 The server can be configured with CLI flags and environment variables. Important
 environment variables include:
 
+- `ANDROID_COMPUTER_USE_MCP_ENVIRONMENT_ID`
+- `ANDROID_COMPUTER_USE_MCP_PROVIDER_INSTANCE_ID`
+- `ANDROID_COMPUTER_USE_MCP_SESSION_ID`
 - `ANDROID_COMPUTER_USE_MCP_SDK_ROOT`
 - `ANDROID_COMPUTER_USE_MCP_ADB_PATH`
 - `ANDROID_COMPUTER_USE_MCP_EMULATOR_PATH`
@@ -108,6 +119,11 @@ are rejected by configuration validation in this release line.
 
 The committed schema snapshot currently includes these public tool groups:
 
+- Agent workflows: `android.observe`, `android.step`,
+  `android.install_build_from_run`, `android.get_action_status`
+- App/device control: `android.resolve_target`, `android.list_apps`,
+  `android.terminate_app`, `android.uninstall_app`, `android.open_url`,
+  `android.get_orientation`, `android.set_orientation`, `android.read_artifact`
 - Core health and discovery: `android.health`, `android.list_avds`,
   `android.list_devices`
 - Emulator lifecycle: `android.launch_avd`, `android.launch_avd_and_wait`,
@@ -118,7 +134,8 @@ The committed schema snapshot currently includes these public tool groups:
   `android.tap_element`, `android.type_into_element`,
   `android.scroll_until_visible`
 - Raw input: `android.input.tap`, `android.input.text`, `android.input.swipe`,
-  `android.input.keyevent`
+  `android.input.keyevent`, `android.input.double_tap`, `android.input.long_press`,
+  `android.input.multi_touch`, `android.input.keycombination`
 - Hosted interactive session: `interactive_session.get_status`,
   `interactive_session.get_current_build`,
   `interactive_session.install_build_from_run`,
@@ -136,18 +153,32 @@ and adapter guidance.
 
 ## Backend Notes
 
-ADB is the stable baseline backend. The server can opportunistically use the
-Android emulator gRPC endpoint for screenshot and raw input operations when a
-usable endpoint is discovered or configured:
+Screenshots and ordinary pointer gestures use exact-device ADB commands.
+Taps, double taps, long presses and swipes use Android's logical display pixels,
+the same coordinate space as UI hierarchy bounds and the captured PNG.
+`android.observe` enables coordinate actions only when the PNG dimensions agree
+with stable display geometry, rotation and window identity around capture.
+An unstable observation can still return its image, with coordinate actions
+disabled and an explicit degradation note.
 
-- if a running emulator publishes `grpc.port`, the MCP can prefer that endpoint
+Emulator gRPC remains available for verified clipboard transfers and atomic
+multi-touch:
+
+- a running emulator must publish an endpoint bound to the requested serial
 - if a `grpc.token` is published, the MCP attaches the required bearer token
 - if `ANDROID_COMPUTER_USE_MCP_EMULATOR_GRPC_PORT` is set, launched emulators include
-  `-grpc <port>`
-- if gRPC is unavailable or unhealthy, the MCP falls back to ADB
+  `-grpc <port>`; a global port setting alone cannot establish device identity
+- atomic multi-touch requires qualified full-panel display and touch geometry
+  before converting logical coordinates to emulator touch axes; unsupported
+  geometry is rejected before input, with no sequential ADB substitute
+- an uncertain mutation is never automatically replayed through another backend
 
-This keeps the tool contract stable while allowing lower-latency local emulator
-control where it is available.
+Qualify multi-touch with the provider gate's stock Android API 35 emulator
+configuration. Its checks of reported calibration do not establish support for
+arbitrary custom calibration.
+
+See [Production validation](docs/production-validation.md) for geometry checks,
+clipboard ownership and the real-device evidence required for a release.
 
 ## Adapter Packages
 
@@ -168,9 +199,9 @@ ownership, and truthful tool results.
 Useful local checks include:
 
 ```bash
-cargo test
-cargo fmt --all
-cargo clippy --all-targets --all-features
+cargo test --locked
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
 ```
 
 The tool schema snapshot is checked by the Rust test suite. Refresh it only when

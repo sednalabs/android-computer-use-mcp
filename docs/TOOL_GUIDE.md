@@ -4,19 +4,19 @@
 structured results and artifact paths. The tools are grouped by how an agent
 should normally use them.
 
-## Recommended Order
+## Recommended workflow
 
-1. Discover the harness state with `android.health`, `android.list_devices`, and
-   `android.list_avds`.
-2. Launch or attach to a device with `android.launch_avd_and_wait` or
-   `android.wait_for_boot`.
-3. Install and launch the target app with `android.install_apk` and
-   `android.launch_app`.
-4. Observe with `android.wait_for_stable_ui` or `android.inspect_ui`.
-5. Act with semantic tools such as `android.tap_element` and
-   `android.type_into_element`.
-6. Fall back to raw input only when semantic targeting cannot express the action.
-7. Capture proof with screenshots, UI XML, logcat, or scenario manifests.
+Discover and resolve an exact ready device, then use `android.observe` and
+`android.step` for ordinary agent interaction. Preserve each action ID and use
+`android.get_action_status` after a lost response or provider restart. Use
+`android.install_build_from_run` for a hosted build when its operator
+configuration is enabled. These tools run through generic MCP, with no native
+Codex Android integration.
+
+See [Agent workflows](agent-workflows.md) for complete examples, receipt fields,
+coordinate freshness and non-replay semantics. Low-level tools remain available
+for focused inspection and specialised input. They share device leases but do
+not inherit the composite workflow's durable action-ID guarantee.
 
 ## Core Discovery
 
@@ -24,6 +24,7 @@ should normally use them.
   directory state.
 - `android.list_avds` lists Android Virtual Devices known to the configured SDK.
 - `android.list_devices` lists attached or running Android devices.
+- `android.resolve_target` validates a ready serial and exact provider/session identity.
 
 ## Lifecycle
 
@@ -34,9 +35,17 @@ should normally use them.
 - `android.launch_app` launches a package/activity and verifies requested
   postconditions when supplied.
 
+- `android.list_apps`, `android.terminate_app`, `android.uninstall_app` and
+  `android.open_url` provide explicit app lifecycle operations.
+- `android.get_orientation` and `android.set_orientation` use observed default-display rotation.
+  The orientation read also returns `display_width` and `display_height` in
+  guest logical pixels.
+
 ## Observation
 
-- `android.capture_screenshot` writes a PNG artifact.
+- `android.observe` returns model-visible pixels, compact UI and an observation ID.
+- `android.capture_screenshot` writes a PNG artifact and returns a typed image.
+- `android.read_artifact` reads a bounded, root-confined artifact.
 - `android.dump_ui_hierarchy` writes a UIAutomator XML artifact.
 - `android.collect_logcat` writes a logcat artifact.
 - `android.inspect_ui` captures a paired screenshot/UI dump with normalized UI
@@ -47,6 +56,19 @@ should normally use them.
 Observation tools should be preferred whenever the next decision depends on
 what the user or model can actually see.
 
+Screenshots use exact-device ADB capture and contain the guest logical display.
+The provider validates the complete static PNG before saving it. An observation
+qualifies coordinates only when display size, rotation and window identity are
+unchanged around capture, and the PNG dimensions match that display size.
+Before a coordinate step, the provider repeats these checks along with the
+observation's boot identity, age and bounds.
+
+If geometry is unavailable or changes during capture, the image remains available
+with `coordinate_actions_available: false`, `degraded: true` and an explanatory
+note. Observe again before submitting a coordinate action. Map any client-resized
+image back to the receipt's native dimensions as described in
+[Codex image coordinates](codex-mcp-wiring.md#coordinates-after-client-image-resizing).
+
 ## Semantic UI
 
 - `android.find_ui_element` resolves a selector and reports whether it matched
@@ -56,7 +78,9 @@ what the user or model can actually see.
 - `android.type_into_element` focuses a resolved input and verifies visible text
   entry.
 - `android.scroll_until_visible` scrolls until a target selector appears or the
-  swipe budget is exhausted.
+  swipe budget is exhausted. Its direction describes vertical finger motion:
+  `up` (the default) swipes from bottom to top to reveal later rows in a list;
+  `down` swipes from top to bottom. Horizontal directions are unsupported.
 
 Selector-bearing tools accept a structured selector object. Some tools also
 accept a string shorthand such as `"Search"` for visible text. Ambiguity is a
@@ -69,10 +93,25 @@ nodes are valid targets.
 - `android.input.text`
 - `android.input.swipe`
 - `android.input.keyevent`
+- `android.input.double_tap` and `android.input.long_press`
+- `android.input.multi_touch` (atomic emulator gRPC only)
+- `android.input.keycombination`
 
 Raw input is useful for fallback control, but it should not be the first choice
 when a stable semantic selector exists. Raw actions can include postcondition
 checks so callers do not treat dispatch alone as proof of success.
+
+Taps, double taps, long presses and swipes use ADB in guest logical coordinates.
+Atomic multi-touch uses emulator gRPC only after the provider verifies a complete,
+unscaled panel viewport, physical dimensions, raw touch axes and reported identity
+calibration. The provider then converts logical points for the observed rotation.
+Missing or unsupported geometry fails before mutation; separate single-pointer
+gestures do not substitute for simultaneous touch.
+
+Android rounds the reported calibration coefficients, so that check does not
+measure full-precision calibration. Device qualification is scoped to the provider
+gate's stock API 35 emulator configuration; arbitrary custom calibration remains
+unqualified even if the rounded values appear unchanged.
 
 ## Hosted Interactive Sessions
 
@@ -101,7 +140,7 @@ app is the task.
 For clients that support deferred tool loading, keep the bootstrap tools eager
 and load heavier groups only when needed:
 
-- eager: health, device discovery, AVD launch, install, app launch
+- eager: health, target resolution, observe, step and action status
 - deferred observation: screenshots, UI XML, stable UI, logcat
 - deferred semantic UI: selector-driven find, wait, tap, type, scroll
 - deferred raw input: coordinate/key fallbacks

@@ -17,17 +17,22 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::tool;
 use rmcp::tool_router;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::fs;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::time::{sleep, timeout};
 
 use crate::McpError;
+use crate::config::{
+    ANDROID_PROVIDER_EXECUTION_CONTRACT_VERSION, AndroidAppTarget, AndroidExecutionTarget,
+    ProviderExecutionIdentity, ResolvedAndroidExecutionTarget,
+};
 use crate::discovery;
 use crate::grpc_backend;
 use crate::interactive_session::{
@@ -37,17 +42,18 @@ use crate::server::AndroidEmulatorMcp;
 use crate::ui::{
     NormalizedUiNode, SelectionFailure, SelectorCandidateSummary, UiNodeMatch, UiSelector,
     UiSelectorInput, actionable_center, ensure_selector_not_empty, find_interactive_ui_node,
-    find_ui_node_by_label, matches_text, matching_nodes, normalize_optional_selector_input,
-    normalize_selector_input, parse_ui_nodes_from_path, parse_ui_nodes_from_xml,
-    resolve_node_selection, selection_failure_json, selector_candidate_summary,
-    text_verification_target_selector,
+    find_ui_node_by_label, focus_verification_target_selector, matches_text, matching_nodes,
+    normalize_optional_selector_input, normalize_selector_input, parse_ui_nodes_from_path,
+    parse_ui_nodes_from_xml, resolve_node_selection, selection_failure_json,
+    selector_candidate_summary, selector_matches, text_verification_target_selector,
+    ui_nodes_for_tool_output, visible_ui_for_tool_output,
 };
 use crate::verification::{
     InternalNodeTracker, TapVerification, TapVerificationRequest, TextVerification,
-    TextVerificationRequest, ToolPostconditionRequest, ToolPostconditionResult,
-    VerifiedTextDispatchRequest, ensure_action_outcome_satisfied,
-    ensure_tool_postcondition_satisfied, tap_verification_fingerprint, tap_verification_json,
-    tap_verification_summary, text_verification_json, text_verification_summary,
+    TextVerificationRequest, ToolPostconditionEvidenceSource, ToolPostconditionRequest,
+    ToolPostconditionResult, VerifiedTextDispatchRequest, clipboard_text_nodes_from_xml,
+    ensure_action_outcome_satisfied, ensure_tool_postcondition_satisfied,
+    tap_verification_fingerprint, tap_verification_json, text_verification_json,
     tool_postcondition_json, tracker_matches_node,
 };
 #[cfg(test)]
@@ -55,24 +61,31 @@ use crate::verification::{
     TapVerificationStatus, derive_observed_package, tap_verification_is_confirmed,
     tap_verification_status, text_verification_fingerprint, text_verification_status,
 };
-use crate::window_views::{
-    normalized_visible_window_dump_fingerprint,
-    normalized_visible_window_dump_fingerprint_for_package,
-};
 
 const DEFAULT_BOOT_TIMEOUT_SECS: u64 = 180;
 const DEFAULT_SWIPE_DURATION_MS: u64 = 250;
+const DEFAULT_MULTI_TOUCH_DURATION_MS: u64 = 300;
+const MIN_MULTI_TOUCH_DURATION_MS: u64 = 50;
+const MAX_MULTI_TOUCH_DURATION_MS: u64 = 2_000;
+const MIN_MULTI_TOUCH_POINTERS: usize = 2;
+const MAX_MULTI_TOUCH_POINTERS: usize = 5;
 const DEFAULT_SOLARLAB_ACK_TIMEOUT_SECS: u64 = 8;
 const DEFAULT_SOLARLAB_ACK_POLL_MS: u64 = 400;
+const SOLARLAB_FOCUS_ACK_MARKER: &str = "solarlab semantic focus acknowledged";
+const SOLARLAB_SEMANTIC_REQUEST_ID_EXTRA: &str = "com.sednalabs.solarlab.extra.SEMANTIC_REQUEST_ID";
 const DEFAULT_ADB_COMMAND_TIMEOUT_SECS: u64 = 20;
 const DEFAULT_EMULATOR_COMMAND_TIMEOUT_SECS: u64 = 20;
-pub(crate) const DEFAULT_ACTION_TIMEOUT_SECS: u64 = 5;
+// A verified action may need an initial UIAutomator capture, dispatch and two
+// confirming captures. Keep that complete pipeline bounded without starving it
+// on a real emulator; callers can still request a shorter explicit deadline.
+pub(crate) const DEFAULT_ACTION_TIMEOUT_SECS: u64 = 30;
 const MIN_OBSERVATION_BUDGET_MS: u64 = 500;
-const MIN_FAST_UI_FINGERPRINT_BUDGET_MS: u64 = 1000;
-const GRPC_TEXT_VERIFICATION_BUDGET_MS: u64 = 1500;
-const MIN_TEXT_VERIFICATION_WINDOW_MS: u64 = 4500;
-const ADB_TEXT_FALLBACK_RESERVE_MS: u64 = 5000;
-const FULL_OBSERVATION_CAPTURE_RESERVE_MS: u64 = 4500;
+const MAX_ARTIFACT_READ_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_ARTIFACT_STORE_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_ARTIFACT_STORE_FILES: u64 = 4096;
+static ARTIFACT_WRITE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+const MAX_SCREENSHOT_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_GESTURE_DURATION_MS: u64 = 10_000;
 const UI_DUMP_PULL_MAX_ATTEMPTS: usize = 3;
 const UI_DUMP_PULL_RETRY_DELAY_MS: u64 = 100;
 static ARTIFACT_NAME_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -131,6 +144,19 @@ pub struct SerialArgs {
     pub serial: Option<String>,
 }
 
+/// Resolve and validate the exact Android provider session for a call.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ResolveAndroidTargetArgs {
+    /// Optional exact session target. Omitted fields resolve only from this
+    /// provider process's one configured identity tuple.
+    #[serde(default)]
+    pub target: Option<AndroidExecutionTarget>,
+    /// Compatibility serial hint. When both this and target.device_serial are
+    /// supplied, they must identify the same device.
+    #[serde(default)]
+    pub serial: Option<String>,
+}
+
 /// Arguments for waiting until an emulator reports boot completion.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct WaitForBootArgs {
@@ -180,6 +206,68 @@ pub struct LaunchAppArgs {
     pub timeout_secs: Option<u64>,
 }
 
+/// Arguments for listing installed Android apps.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ListAppsArgs {
+    /// ADB serial of the target device.
+    #[serde(default)]
+    pub serial: Option<String>,
+    /// Return only apps with launcher activities.
+    #[serde(default = "default_true")]
+    pub launcher_only: bool,
+}
+
+/// Arguments for app-management operations by package name.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct PackageNameArgs {
+    /// ADB serial of the target device.
+    #[serde(default)]
+    pub serial: Option<String>,
+    /// Android package name.
+    pub package_name: String,
+    /// Timeout in seconds for dispatch and optional verification.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
+/// Arguments for opening a URL on the Android device.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct OpenUrlArgs {
+    /// ADB serial of the target device.
+    #[serde(default)]
+    pub serial: Option<String>,
+    /// URL to open. http:// and https:// are allowed by default.
+    pub url: String,
+    /// Optional selector to verify after the URL is opened.
+    #[serde(default)]
+    pub wait_for_selector: Option<UiSelectorInput>,
+    /// Optional activity name expected after opening the URL.
+    #[serde(default)]
+    pub wait_for_activity: Option<String>,
+    /// Optional package name expected after opening the URL.
+    #[serde(default)]
+    pub wait_for_package: Option<String>,
+    /// Timeout in seconds for dispatch and postcondition verification.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
+/// Arguments for changing device orientation.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SetOrientationArgs {
+    /// ADB serial of the target device.
+    #[serde(default)]
+    pub serial: Option<String>,
+    /// Desired orientation: portrait, landscape, reverse_portrait, or reverse_landscape.
+    pub orientation: String,
+    /// Optional selector to verify after changing orientation.
+    #[serde(default)]
+    pub wait_for_selector: Option<UiSelectorInput>,
+    /// Timeout in seconds for dispatch and postcondition verification.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
 /// Arguments for capturing a device screenshot artifact.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ScreenshotArgs {
@@ -200,6 +288,16 @@ pub struct UiDumpArgs {
     /// Optional path to save the dumped hierarchy.
     #[serde(default)]
     pub filename: Option<String>,
+}
+
+/// Arguments for reading a previously generated artifact file.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ReadArtifactArgs {
+    /// Absolute or relative path to the artifact file previously returned by the harness.
+    pub path: String,
+    /// Encoding for the response payload. Use `utf8` for textual artifacts and `base64` for binary payloads.
+    #[serde(default)]
+    pub encoding: Option<String>,
 }
 
 /// Arguments for inspecting the current UI hierarchy and screenshot.
@@ -281,8 +379,8 @@ pub struct TapElementArgs {
     /// Timeout in seconds for the operation.
     #[serde(default)]
     pub timeout_secs: Option<u64>,
-    /// Whether to retry the operation using ADB if UI does not change.
-    #[serde(default = "default_true")]
+    /// Deprecated compatibility input. Mutations are never automatically replayed.
+    #[serde(default)]
     pub retry_with_adb_on_no_change: bool,
     /// Whether to allow the tool to succeed even if verification fails.
     #[serde(default)]
@@ -324,7 +422,7 @@ pub struct ScrollUntilVisibleArgs {
     pub serial: Option<String>,
     /// Selector for the element that should become visible.
     pub selector: UiSelectorInput,
-    /// Scroll direction such as `up`, `down`, `left`, or `right`.
+    /// Vertical finger swipe direction: `up` (default, bottom to top) or `down` (top to bottom).
     #[serde(default)]
     pub direction: Option<String>,
     /// Maximum number of swipe attempts before giving up.
@@ -374,9 +472,48 @@ pub struct TapArgs {
     /// Timeout in seconds for tap dispatch and verification.
     #[serde(default)]
     pub timeout_secs: Option<u64>,
-    /// Whether to retry with ADB if the first backend reports no UI change.
-    #[serde(default = "default_true")]
+    /// Deprecated compatibility input. Mutations are never automatically replayed.
+    #[serde(default)]
     pub retry_with_adb_on_no_change: bool,
+}
+
+/// Arguments for sending a double-tap input event to an absolute screen coordinate.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DoubleTapArgs {
+    /// ADB serial of the target device.
+    #[serde(default)]
+    pub serial: Option<String>,
+    /// Horizontal coordinate in device pixels.
+    pub x: u32,
+    /// Vertical coordinate in device pixels.
+    pub y: u32,
+    /// Optional selector to verify after the double tap.
+    #[serde(default)]
+    pub wait_for_selector: Option<UiSelectorInput>,
+    /// Timeout in seconds for dispatch and verification.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
+/// Arguments for sending a long-press input event to an absolute screen coordinate.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct LongPressArgs {
+    /// ADB serial of the target device.
+    #[serde(default)]
+    pub serial: Option<String>,
+    /// Horizontal coordinate in device pixels.
+    pub x: u32,
+    /// Vertical coordinate in device pixels.
+    pub y: u32,
+    /// Duration of the press in milliseconds.
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
+    /// Optional selector to verify after the long press.
+    #[serde(default)]
+    pub wait_for_selector: Option<UiSelectorInput>,
+    /// Timeout in seconds for dispatch and verification.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 /// Arguments for sending text input to the currently focused element.
@@ -448,6 +585,37 @@ pub struct SwipeArgs {
     pub timeout_secs: Option<u64>,
 }
 
+/// One pointer path in an atomic multi-touch gesture.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct MultiTouchPointer {
+    /// Starting horizontal coordinate in device pixels.
+    pub x1: u32,
+    /// Starting vertical coordinate in device pixels.
+    pub y1: u32,
+    /// Ending horizontal coordinate in device pixels.
+    pub x2: u32,
+    /// Ending vertical coordinate in device pixels.
+    pub y2: u32,
+}
+
+/// Arguments for sending an atomic multi-touch gesture.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct MultiTouchArgs {
+    /// ADB serial of the target emulator.
+    #[serde(default)]
+    pub serial: Option<String>,
+    /// Two to five pointer paths dispatched together in every frame.
+    #[schemars(length(min = 2, max = 5))]
+    pub pointers: Vec<MultiTouchPointer>,
+    /// Optional gesture duration in milliseconds, from 50 through 2000.
+    #[serde(default)]
+    #[schemars(range(min = 50, max = 2000))]
+    pub duration_ms: Option<u64>,
+    /// Timeout in seconds for multi-touch dispatch.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
 /// Arguments for sending a key event to the device.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct KeyeventArgs {
@@ -455,6 +623,7 @@ pub struct KeyeventArgs {
     #[serde(default)]
     pub serial: Option<String>,
     /// Android keycode name to dispatch, such as `KEYCODE_ENTER`.
+    #[serde(alias = "key")]
     pub keycode: String,
     /// Optional selector to verify after the key event.
     #[serde(default)]
@@ -463,6 +632,35 @@ pub struct KeyeventArgs {
     #[serde(default)]
     pub wait_for_activity: Option<String>,
     /// Optional package name expected after the key event.
+    #[serde(default)]
+    pub wait_for_package: Option<String>,
+    /// Timeout in seconds for dispatch and postcondition verification.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
+/// Arguments for sending a chorded Android key combination to the device.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct KeycombinationArgs {
+    /// ADB serial of the target device.
+    #[serde(default)]
+    pub serial: Option<String>,
+    /// Android keycode names to dispatch as one combination, such as `CTRL_LEFT` and `A`.
+    #[serde(default, alias = "keys")]
+    pub keycodes: Vec<String>,
+    /// Compatibility alias for callers that send one key as `keycode`.
+    #[serde(default)]
+    pub keycode: Option<String>,
+    /// Compatibility alias for callers that send one key as `key`.
+    #[serde(default)]
+    pub key: Option<String>,
+    /// Optional selector to verify after the key combination.
+    #[serde(default)]
+    pub wait_for_selector: Option<UiSelectorInput>,
+    /// Optional activity name expected after the key combination.
+    #[serde(default)]
+    pub wait_for_activity: Option<String>,
+    /// Optional package name expected after the key combination.
     #[serde(default)]
     pub wait_for_package: Option<String>,
     /// Timeout in seconds for dispatch and postcondition verification.
@@ -488,11 +686,67 @@ pub struct SolarLabSemanticActionArgs {
     pub package_name: Option<String>,
     #[serde(default)]
     pub activity: Option<String>,
-    pub action: String,
+    /// Canonical Solar Lab semantic action, or the generic
+    /// `semantic_action` envelope discriminator.
+    #[serde(default)]
+    pub action: Option<String>,
+    /// Generic Android action-name alias.
+    #[serde(default)]
+    pub action_name: Option<String>,
+    /// Computer-use action-name alias.
+    #[serde(default)]
+    pub name: Option<String>,
     #[serde(default)]
     pub body_query: Option<String>,
+    /// Compatibility target supplied by generic Android adapters. For
+    /// `focus_body`, string targets and selector-shaped text/label fields are
+    /// normalized to the canonical `body_query` contract.
+    #[serde(default)]
+    pub target: Option<serde_json::Value>,
+    /// Generic Android batched-action envelope. The semantic provider accepts
+    /// exactly one `semantic_action` entry per call.
+    #[serde(default)]
+    pub actions: Vec<SolarLabSemanticStepAction>,
+    /// Compatibility timeout accepted from generic Android adapters. The
+    /// provider retains its bounded acknowledgement policy.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
     #[serde(default = "default_true")]
     pub capture_state: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SolarLabSemanticStepAction {
+    /// Generic Android action discriminator. When present, this must be
+    /// `semantic_action`.
+    #[serde(rename = "type", default)]
+    pub action_type: Option<String>,
+    /// Canonical action or generic `semantic_action` envelope discriminator.
+    #[serde(default)]
+    pub action: Option<String>,
+    /// Generic Android action-name alias.
+    #[serde(default)]
+    pub action_name: Option<String>,
+    /// Computer-use action-name alias.
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub body_query: Option<String>,
+    #[serde(default)]
+    pub target: Option<serde_json::Value>,
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, PartialEq)]
+struct NormalizedSolarLabSemanticActionArgs {
+    serial: Option<String>,
+    package_name: Option<String>,
+    activity: Option<String>,
+    action: String,
+    body_query: Option<String>,
+    target: Option<serde_json::Value>,
+    capture_state: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -507,6 +761,8 @@ enum SolarLabSemanticCommand {
 struct SolarLabSemanticAck {
     acknowledged: bool,
     matcher: String,
+    request_id: Option<String>,
+    resolved_body_id: Option<String>,
     observed_ui_dump: String,
 }
 
@@ -540,13 +796,13 @@ impl AndroidEmulatorMcp {
         description = "Report SDK paths, known AVDs, and attached Android devices.",
         annotations(read_only_hint = true)
     )]
-    async fn android_health(
+    pub(crate) async fn android_health(
         &self,
         Parameters(_args): Parameters<EmptyArgs>,
     ) -> Result<CallToolResult, McpError> {
         let avds = self.list_avds_internal().await?;
         let devices = self.list_devices_internal(None).await?;
-        Ok(CallToolResult::structured(json!({
+        Ok(structured_receipt(json!({
             "ok": true,
             "sdk_root": self.config.sdk_root,
             "adb_path": self.config.adb_path,
@@ -554,12 +810,15 @@ impl AndroidEmulatorMcp {
             "avdmanager_path": self.config.avdmanager_path,
             "artifact_dir": self.config.artifact_dir,
             "emulator_grpc_port": self.config.emulator_grpc_port,
-            "io_backend_preference": if self.config.emulator_grpc_port.is_some() {
-                "grpc-preferred-with-adb-fallback"
-            } else if discovery::any_grpc_endpoint_published() {
-                "grpc-autodiscovery-with-adb-fallback"
-            } else {
-                "adb"
+            "io_backend_preference": "adb",
+            "io_backends": {
+                "screenshots": "adb-logical-display",
+                "ordinary_pointer_input": "adb-logical-display",
+                "printable_ascii_text": "adb",
+                "unicode_text": "verified-emulator-clipboard-with-adb-paste",
+                "multi_touch": "serial-bound-emulator-grpc-with-verified-geometry",
+                "grpc_endpoint_published": self.config.emulator_grpc_port.is_some()
+                    || discovery::any_grpc_endpoint_published(),
             },
             "use_sg_kvm": self.config.use_sg_kvm,
             "avds": avds,
@@ -572,11 +831,11 @@ impl AndroidEmulatorMcp {
         description = "List known local Android virtual devices.",
         annotations(read_only_hint = true)
     )]
-    async fn android_list_avds(
+    pub(crate) async fn android_list_avds(
         &self,
         Parameters(_args): Parameters<EmptyArgs>,
     ) -> Result<CallToolResult, McpError> {
-        Ok(CallToolResult::structured(json!({
+        Ok(structured_receipt(json!({
             "ok": true,
             "avds": self.list_avds_internal().await?,
         })))
@@ -587,13 +846,32 @@ impl AndroidEmulatorMcp {
         description = "List adb-visible Android devices.",
         annotations(read_only_hint = true)
     )]
-    async fn android_list_devices(
+    pub(crate) async fn android_list_devices(
         &self,
         Parameters(args): Parameters<SerialArgs>,
     ) -> Result<CallToolResult, McpError> {
-        Ok(CallToolResult::structured(json!({
+        Ok(structured_receipt(json!({
             "ok": true,
             "devices": self.list_devices_internal(args.serial.as_deref()).await?,
+        })))
+    }
+
+    #[tool(
+        name = "android.resolve_target",
+        description = "Resolve one exact Android provider/session/device target and reject a mismatched identity.",
+        annotations(read_only_hint = true)
+    )]
+    pub(crate) async fn android_resolve_target(
+        &self,
+        Parameters(args): Parameters<ResolveAndroidTargetArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let resolved_target = self
+            .resolve_android_execution_target(args.target.as_ref(), args.serial.as_deref())
+            .await?;
+        Ok(structured_receipt(json!({
+            "ok": true,
+            "contract_version": ANDROID_PROVIDER_EXECUTION_CONTRACT_VERSION,
+            "resolved_target": resolved_target,
         })))
     }
 
@@ -606,7 +884,7 @@ impl AndroidEmulatorMcp {
         &self,
         Parameters(_args): Parameters<EmptyArgs>,
     ) -> Result<CallToolResult, McpError> {
-        Ok(CallToolResult::structured(
+        Ok(structured_receipt(
             self.interactive_session_status_json().await?,
         ))
     }
@@ -620,7 +898,7 @@ impl AndroidEmulatorMcp {
         &self,
         Parameters(_args): Parameters<EmptyArgs>,
     ) -> Result<CallToolResult, McpError> {
-        Ok(CallToolResult::structured(
+        Ok(structured_receipt(
             self.interactive_session_current_build_json().await?,
         ))
     }
@@ -633,7 +911,7 @@ impl AndroidEmulatorMcp {
         &self,
         Parameters(args): Parameters<InteractiveSessionInstallBuildArgs>,
     ) -> Result<CallToolResult, McpError> {
-        Ok(CallToolResult::structured(
+        Ok(structured_receipt(
             self.interactive_session_install_build_from_run_json(&args)
                 .await?,
         ))
@@ -647,7 +925,7 @@ impl AndroidEmulatorMcp {
         &self,
         Parameters(args): Parameters<InteractiveSessionRelaunchArgs>,
     ) -> Result<CallToolResult, McpError> {
-        Ok(CallToolResult::structured(
+        Ok(structured_receipt(
             self.interactive_session_relaunch_current_build_json(&args)
                 .await?,
         ))
@@ -657,12 +935,12 @@ impl AndroidEmulatorMcp {
         name = "android.launch_avd",
         description = "Launch a named AVD in the background."
     )]
-    async fn android_launch_avd(
+    pub(crate) async fn android_launch_avd(
         &self,
         Parameters(args): Parameters<LaunchAvdArgs>,
     ) -> Result<CallToolResult, McpError> {
         let launched = self.spawn_avd_process(LaunchRequest::from(&args)).await?;
-        Ok(CallToolResult::structured(json!({
+        Ok(structured_receipt(json!({
             "ok": true,
             "pid": launched.pid,
             "avd_name": launched.avd_name,
@@ -676,7 +954,7 @@ impl AndroidEmulatorMcp {
         name = "android.launch_avd_and_wait",
         description = "Launch a named AVD, wait for its emulator serial to appear, and verify boot readiness."
     )]
-    async fn android_launch_avd_and_wait(
+    pub(crate) async fn android_launch_avd_and_wait(
         &self,
         Parameters(args): Parameters<LaunchAvdAndWaitArgs>,
     ) -> Result<CallToolResult, McpError> {
@@ -702,7 +980,7 @@ impl AndroidEmulatorMcp {
         })?;
         let readiness = self.wait_for_boot_readiness(&serial, remaining).await?;
 
-        Ok(CallToolResult::structured(json!({
+        Ok(structured_receipt(json!({
             "ok": true,
             "pid": launched.pid,
             "avd_name": launched.avd_name,
@@ -721,7 +999,7 @@ impl AndroidEmulatorMcp {
         description = "Wait until sys.boot_completed=1 and package manager is responsive.",
         annotations(read_only_hint = true)
     )]
-    async fn android_wait_for_boot(
+    pub(crate) async fn android_wait_for_boot(
         &self,
         Parameters(args): Parameters<WaitForBootArgs>,
     ) -> Result<CallToolResult, McpError> {
@@ -730,7 +1008,7 @@ impl AndroidEmulatorMcp {
             .await?;
         let timeout = Duration::from_secs(args.timeout_secs.unwrap_or(DEFAULT_BOOT_TIMEOUT_SECS));
         let readiness = self.wait_for_boot_readiness(&serial, timeout).await?;
-        Ok(CallToolResult::structured(json!({
+        Ok(structured_receipt(json!({
             "ok": true,
             "serial": serial,
             "elapsed_ms": readiness.elapsed_ms,
@@ -742,7 +1020,7 @@ impl AndroidEmulatorMcp {
         name = "android.install_apk",
         description = "Install an APK onto the target device."
     )]
-    async fn android_install_apk(
+    pub(crate) async fn android_install_apk(
         &self,
         Parameters(args): Parameters<InstallApkArgs>,
     ) -> Result<CallToolResult, McpError> {
@@ -762,7 +1040,7 @@ impl AndroidEmulatorMcp {
         }
         adb_args.push(apk_path.display().to_string());
         let output = self.run_adb(&serial, adb_args).await?;
-        Ok(CallToolResult::structured(json!({
+        Ok(structured_receipt(json!({
             "ok": true,
             "serial": serial,
             "apk_path": apk_path,
@@ -775,7 +1053,7 @@ impl AndroidEmulatorMcp {
         name = "android.launch_app",
         description = "Launch an installed Android app by package name and optional activity."
     )]
-    async fn android_launch_app(
+    pub(crate) async fn android_launch_app(
         &self,
         Parameters(args): Parameters<LaunchAppArgs>,
     ) -> Result<CallToolResult, McpError> {
@@ -818,30 +1096,45 @@ impl AndroidEmulatorMcp {
             .await?
         };
         let deadline = tool_deadline(args.timeout_secs, DEFAULT_ACTION_TIMEOUT_SECS);
-        let postcondition = self
-            .wait_for_tool_postcondition(ToolPostconditionRequest {
-                serial: &serial,
-                selector: wait_for_selector.as_ref(),
-                match_index: None,
-                wait_for_activity: args
-                    .wait_for_activity
-                    .as_deref()
-                    .or(args.activity.as_deref()),
-                wait_for_package: args
-                    .wait_for_package
-                    .as_deref()
-                    .or(Some(args.package_name.as_str())),
-                deadline,
-                include_screenshot: false,
-                artifact_prefix: "launch-app-postcondition",
-            })
-            .await?;
+        let wait_for_activity = args
+            .wait_for_activity
+            .as_deref()
+            .or(args.activity.as_deref());
+        let wait_for_package = args
+            .wait_for_package
+            .as_deref()
+            .or(Some(args.package_name.as_str()));
+        let postcondition =
+            match ToolPostconditionEvidenceSource::for_launch(wait_for_selector.is_some()) {
+                ToolPostconditionEvidenceSource::UiHierarchy => {
+                    self.wait_for_tool_postcondition(ToolPostconditionRequest {
+                        serial: &serial,
+                        selector: wait_for_selector.as_ref(),
+                        match_index: None,
+                        wait_for_activity,
+                        wait_for_package,
+                        deadline,
+                        include_screenshot: false,
+                        artifact_prefix: "launch-app-postcondition",
+                    })
+                    .await?
+                }
+                ToolPostconditionEvidenceSource::WindowState => {
+                    self.wait_for_window_state_postcondition(
+                        &serial,
+                        wait_for_activity,
+                        wait_for_package,
+                        deadline,
+                    )
+                    .await?
+                }
+            };
         ensure_tool_postcondition_satisfied(
             "android.launch_app",
             "postcondition failed after launch",
             &postcondition,
         )?;
-        Ok(CallToolResult::structured(json!({
+        Ok(structured_receipt(json!({
             "ok": postcondition.satisfied,
             "serial": serial,
             "package_name": args.package_name,
@@ -853,38 +1146,308 @@ impl AndroidEmulatorMcp {
     }
 
     #[tool(
-        name = "android.capture_screenshot",
-        description = "Capture a PNG screenshot, save it as an artifact, and return it as MCP image content."
+        name = "android.list_apps",
+        description = "List installed Android apps, optionally limited to launcher-visible apps.",
+        annotations(read_only_hint = true)
     )]
-    async fn android_capture_screenshot(
+    pub(crate) async fn android_list_apps(
+        &self,
+        Parameters(args): Parameters<ListAppsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let serial = self
+            .resolve_serial_for_tools(args.serial.as_deref())
+            .await?;
+        let apps = if args.launcher_only {
+            let output = self
+                .adb_shell_output(
+                    &serial,
+                    [
+                        "cmd",
+                        "package",
+                        "query-activities",
+                        "-a",
+                        "android.intent.action.MAIN",
+                        "-c",
+                        "android.intent.category.LAUNCHER",
+                    ],
+                )
+                .await?;
+            parse_launcher_package_names(&output)
+                .into_iter()
+                .map(|package_name| {
+                    json!({
+                        "package_name": package_name,
+                        "app_name": package_name,
+                        "launcher": true,
+                    })
+                })
+                .collect::<Vec<_>>()
+        } else {
+            let output = self
+                .adb_shell_output(&serial, ["pm", "list", "packages"])
+                .await?;
+            parse_pm_package_names(&output)
+                .into_iter()
+                .map(|package_name| {
+                    json!({
+                        "package_name": package_name,
+                        "app_name": package_name,
+                        "launcher": null,
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        Ok(structured_receipt(json!({
+            "ok": true,
+            "serial": serial,
+            "launcher_only": args.launcher_only,
+            "apps": apps,
+        })))
+    }
+
+    #[tool(
+        name = "android.terminate_app",
+        description = "Force-stop an installed Android app by package name."
+    )]
+    pub(crate) async fn android_terminate_app(
+        &self,
+        Parameters(args): Parameters<PackageNameArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let serial = self
+            .resolve_serial_for_tools(args.serial.as_deref())
+            .await?;
+        let package_name = normalize_android_package_name(&args.package_name)?;
+        let output = self
+            .run_adb_shell(&serial, ["am", "force-stop", package_name.as_str()])
+            .await?;
+        Ok(structured_receipt(json!({
+            "ok": true,
+            "serial": serial,
+            "package_name": package_name,
+            "stdout": output.stdout,
+            "stderr": output.stderr,
+        })))
+    }
+
+    #[tool(
+        name = "android.uninstall_app",
+        description = "Uninstall an Android app by package name."
+    )]
+    pub(crate) async fn android_uninstall_app(
+        &self,
+        Parameters(args): Parameters<PackageNameArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let serial = self
+            .resolve_serial_for_tools(args.serial.as_deref())
+            .await?;
+        let package_name = normalize_android_package_name(&args.package_name)?;
+        let output = self
+            .run_adb(&serial, ["uninstall", package_name.as_str()])
+            .await?;
+        Ok(structured_receipt(json!({
+            "ok": true,
+            "serial": serial,
+            "package_name": package_name,
+            "stdout": output.stdout,
+            "stderr": output.stderr,
+        })))
+    }
+
+    #[tool(
+        name = "android.open_url",
+        description = "Open an http:// or https:// URL on the Android device."
+    )]
+    pub(crate) async fn android_open_url(
+        &self,
+        Parameters(args): Parameters<OpenUrlArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let wait_for_selector = normalize_optional_selector_input(args.wait_for_selector);
+        if let Some(selector) = wait_for_selector.as_ref() {
+            ensure_selector_not_empty(selector)?;
+        }
+        let serial = self
+            .resolve_serial_for_tools(args.serial.as_deref())
+            .await?;
+        let url = normalize_safe_android_url(&args.url)?;
+        let output = self
+            .run_adb_shell(
+                &serial,
+                [
+                    "am",
+                    "start",
+                    "-a",
+                    "android.intent.action.VIEW",
+                    "-d",
+                    &url,
+                ],
+            )
+            .await?;
+        let deadline = tool_deadline(args.timeout_secs, DEFAULT_ACTION_TIMEOUT_SECS);
+        let postcondition = self
+            .wait_for_tool_postcondition(ToolPostconditionRequest {
+                serial: &serial,
+                selector: wait_for_selector.as_ref(),
+                match_index: None,
+                wait_for_activity: args.wait_for_activity.as_deref(),
+                wait_for_package: args.wait_for_package.as_deref(),
+                deadline,
+                include_screenshot: false,
+                artifact_prefix: "open-url-postcondition",
+            })
+            .await?;
+        ensure_tool_postcondition_satisfied(
+            "android.open_url",
+            "postcondition failed after opening URL",
+            &postcondition,
+        )?;
+        Ok(structured_receipt(json!({
+            "ok": postcondition.satisfied,
+            "serial": serial,
+            "url": url,
+            "stdout": output.stdout,
+            "stderr": output.stderr,
+            "postcondition": tool_postcondition_json(&postcondition),
+        })))
+    }
+
+    #[tool(
+        name = "android.get_orientation",
+        description = "Read the actual default-display rotation and normalized orientation class.",
+        annotations(read_only_hint = true)
+    )]
+    pub(crate) async fn android_get_orientation(
+        &self,
+        Parameters(args): Parameters<SerialArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let serial = self
+            .resolve_serial_for_tools(args.serial.as_deref())
+            .await?;
+        let raw_rotation = self
+            .current_display_rotation(
+                &serial,
+                Duration::from_secs(DEFAULT_ADB_COMMAND_TIMEOUT_SECS),
+            )
+            .await?;
+        let natural_size = self.natural_display_size_internal(&serial).await?;
+        let (display_width, display_height) = rotated_display_size(natural_size, raw_rotation);
+        Ok(structured_receipt(json!({
+            "ok": true,
+            "serial": serial,
+            "raw_rotation": raw_rotation,
+            "orientation": orientation_for_display_rotation(raw_rotation, natural_size),
+            "display_width": display_width,
+            "display_height": display_height,
+            "evidence_source": "dumpsys_input_default_display",
+        })))
+    }
+
+    #[tool(
+        name = "android.set_orientation",
+        description = "Set the device user_rotation after disabling accelerometer rotation."
+    )]
+    pub(crate) async fn android_set_orientation(
+        &self,
+        Parameters(args): Parameters<SetOrientationArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let wait_for_selector = normalize_optional_selector_input(args.wait_for_selector);
+        if let Some(selector) = wait_for_selector.as_ref() {
+            ensure_selector_not_empty(selector)?;
+        }
+        let serial = self
+            .resolve_serial_for_tools(args.serial.as_deref())
+            .await?;
+        let natural_size = self.natural_display_size_internal(&serial).await?;
+        let rotation = rotation_for_display_orientation(&args.orientation, natural_size)?;
+        let disable_rotation = self
+            .run_adb_shell(
+                &serial,
+                ["settings", "put", "system", "accelerometer_rotation", "0"],
+            )
+            .await?;
+        let rotation_value = rotation.to_string();
+        let output = self
+            .run_adb_shell(
+                &serial,
+                [
+                    "settings",
+                    "put",
+                    "system",
+                    "user_rotation",
+                    rotation_value.as_str(),
+                ],
+            )
+            .await?;
+        let deadline = tool_deadline(args.timeout_secs, DEFAULT_ACTION_TIMEOUT_SECS);
+        let observed_rotation = self
+            .wait_for_orientation_rotation(&serial, rotation, deadline)
+            .await?;
+        let postcondition = self
+            .wait_for_tool_postcondition(ToolPostconditionRequest {
+                serial: &serial,
+                selector: wait_for_selector.as_ref(),
+                match_index: None,
+                wait_for_activity: None,
+                wait_for_package: None,
+                deadline,
+                include_screenshot: false,
+                artifact_prefix: "set-orientation-postcondition",
+            })
+            .await?;
+        ensure_tool_postcondition_satisfied(
+            "android.set_orientation",
+            "postcondition failed after orientation change",
+            &postcondition,
+        )?;
+        Ok(structured_receipt(json!({
+            "ok": postcondition.satisfied,
+            "serial": serial,
+            "orientation": orientation_for_display_rotation(rotation, natural_size),
+            "raw_rotation": rotation,
+            "observed_orientation": orientation_for_display_rotation(observed_rotation, natural_size),
+            "evidence_source": "dumpsys_input_default_display",
+            "observed_raw_rotation": observed_rotation,
+            "stdout": output.stdout,
+            "stderr": output.stderr,
+            "disable_rotation_stdout": disable_rotation.stdout,
+            "disable_rotation_stderr": disable_rotation.stderr,
+            "postcondition": tool_postcondition_json(&postcondition),
+        })))
+    }
+
+    #[tool(
+        name = "android.capture_screenshot",
+        description = "Capture a PNG screenshot from the device and save it locally."
+    )]
+    pub(crate) async fn android_capture_screenshot(
         &self,
         Parameters(args): Parameters<ScreenshotArgs>,
     ) -> Result<CallToolResult, McpError> {
         let serial = self
             .resolve_serial_for_tools(args.serial.as_deref())
             .await?;
-        let (path, backend_used, screenshot_bytes) = self
+        let (path, backend_used) = self
             .capture_screenshot_internal(
                 &serial,
                 filename_or_timestamp(args.filename, "capture-screenshot", "png"),
             )
             .await?;
-        observation_result_with_optional_screenshot(
+        structured_result_with_optional_screenshot(
             json!({
-                "ok": true,
-                "serial": serial,
-                "path": path,
-                "backend_used": backend_used,
+            "ok": true,
+            "serial": serial,
+            "path": path.clone(),
+            "backend_used": backend_used,
             }),
-            Some(screenshot_bytes),
+            Some(&path),
         )
+        .await
     }
 
     #[tool(
         name = "android.dump_ui_hierarchy",
         description = "Dump the current UI hierarchy XML and save it locally."
     )]
-    async fn android_dump_ui_hierarchy(
+    pub(crate) async fn android_dump_ui_hierarchy(
         &self,
         Parameters(args): Parameters<UiDumpArgs>,
     ) -> Result<CallToolResult, McpError> {
@@ -894,7 +1457,7 @@ impl AndroidEmulatorMcp {
         let local_path = self
             .dump_ui_hierarchy_internal(&serial, args.filename.unwrap_or_default())
             .await?;
-        Ok(CallToolResult::structured(json!({
+        Ok(structured_receipt(json!({
             "ok": true,
             "serial": serial,
             "path": local_path,
@@ -902,10 +1465,47 @@ impl AndroidEmulatorMcp {
     }
 
     #[tool(
-        name = "android.inspect_ui",
-        description = "Capture the current UI hierarchy and normalized tree, optionally attaching the screenshot as MCP image content."
+        name = "android.read_artifact",
+        description = "Read a previously generated artifact file from the configured artifact directory and return its contents for remote consumers."
     )]
-    async fn android_inspect_ui(
+    pub(crate) async fn android_read_artifact(
+        &self,
+        Parameters(args): Parameters<ReadArtifactArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let encoding = normalize_artifact_read_encoding(args.encoding.as_deref())?;
+        let resolved_path = self.resolve_artifact_read_path(&args.path).await?;
+        let bytes = read_limited_artifact_bytes(&resolved_path, MAX_ARTIFACT_READ_BYTES).await?;
+        let size_bytes = bytes.len();
+        let mime_type = guess_artifact_mime_type(&resolved_path);
+
+        let payload = match encoding {
+            ArtifactReadEncoding::Utf8 => json!({
+                "ok": true,
+                "path": args.path,
+                "encoding": "utf8",
+                "mime_type": mime_type,
+                "size_bytes": size_bytes,
+                "text": String::from_utf8(bytes)
+                    .map_err(|_| McpError::invalid_params("artifact is not valid UTF-8", None))?,
+            }),
+            ArtifactReadEncoding::Base64 => json!({
+                "ok": true,
+                "path": args.path,
+                "encoding": "base64",
+                "mime_type": mime_type,
+                "size_bytes": size_bytes,
+                "data_base64": BASE64_STANDARD.encode(bytes),
+            }),
+        };
+
+        Ok(structured_receipt(payload))
+    }
+
+    #[tool(
+        name = "android.inspect_ui",
+        description = "Capture the current UI hierarchy, optionally pair it with a screenshot, and return a normalized UI tree."
+    )]
+    pub(crate) async fn android_inspect_ui(
         &self,
         Parameters(args): Parameters<InspectUiArgs>,
     ) -> Result<CallToolResult, McpError> {
@@ -920,30 +1520,47 @@ impl AndroidEmulatorMcp {
                 filename_or_timestamp(args.screenshot_filename, "inspect-ui", "png"),
             )
             .await?;
-        let screenshot_bytes = observation.screenshot_bytes;
-        observation_result_with_optional_screenshot(
-            json!({
-                "ok": true,
-                "serial": serial,
-                "artifacts": {
-                    "hierarchy_path": observation.hierarchy_path,
-                    "screenshot_path": observation.screenshot_path,
-                    "screenshot_backend": observation.screenshot_backend,
-                },
-                "current_focus": observation.window_state.current_focus,
-                "window_state": observation.window_state,
-                "node_count": observation.nodes.len(),
-                "nodes": observation.nodes,
-            }),
-            screenshot_bytes,
-        )
+        let output_nodes = ui_nodes_for_tool_output(&observation.nodes);
+        let node_output = json!({
+            "total_count": output_nodes.total_count,
+            "returned_count": output_nodes.returned_count,
+            "compacted_text_fields": output_nodes.compacted_text_fields,
+            "text_char_limit": output_nodes.text_char_limit,
+        });
+        let visible_ui = visible_ui_for_tool_output(&observation.nodes);
+        let visible_ui_output = json!({
+            "total_labeled_count": visible_ui.total_labeled_count,
+            "returned_count": visible_ui.returned_count,
+            "label_char_limit": visible_ui.label_char_limit,
+            "viewport": visible_ui.viewport,
+            "clipped_node_count": visible_ui.clipped_node_count,
+            "scrollable_node_count": visible_ui.scrollable_node_count,
+            "nodes": visible_ui.nodes,
+        });
+        let screenshot_path = observation.screenshot_path.clone();
+        let payload = json!({
+            "ok": true,
+            "serial": serial,
+            "artifacts": {
+                "hierarchy_path": observation.hierarchy_path,
+                "screenshot_path": observation.screenshot_path,
+                "screenshot_backend": observation.screenshot_backend,
+            },
+            "current_focus": observation.window_state.current_focus,
+            "window_state": observation.window_state,
+            "node_count": observation.nodes.len(),
+            "node_output": node_output,
+            "visible_ui": visible_ui_output,
+            "nodes": output_nodes.nodes,
+        });
+        structured_result_with_optional_screenshot(payload, screenshot_path.as_deref()).await
     }
 
     #[tool(
         name = "android.wait_for_stable_ui",
-        description = "Wait for a stable UI and return its structured observation, optionally attaching the screenshot as MCP image content."
+        description = "Wait until the UI hierarchy and top window state stop changing, then return a paired observation bundle."
     )]
-    async fn android_wait_for_stable_ui(
+    pub(crate) async fn android_wait_for_stable_ui(
         &self,
         Parameters(args): Parameters<WaitForStableUiArgs>,
     ) -> Result<CallToolResult, McpError> {
@@ -955,7 +1572,9 @@ impl AndroidEmulatorMcp {
             .wait_for_stable_ui_internal(StableUiWaitRequest {
                 serial: &serial,
                 deadline,
-                poll_interval: Duration::from_millis(args.poll_interval_ms.unwrap_or(500)),
+                poll_interval: Duration::from_millis(
+                    args.poll_interval_ms.unwrap_or(500).clamp(25, 5_000),
+                ),
                 required_stable_polls: args.stable_polls.unwrap_or(2).max(1),
                 hierarchy_filename: filename_or_timestamp(
                     args.hierarchy_filename.clone(),
@@ -970,36 +1589,53 @@ impl AndroidEmulatorMcp {
                 ),
             })
             .await?;
+        let output_nodes = ui_nodes_for_tool_output(&stable_result.observation.nodes);
+        let node_output = json!({
+            "total_count": output_nodes.total_count,
+            "returned_count": output_nodes.returned_count,
+            "compacted_text_fields": output_nodes.compacted_text_fields,
+            "text_char_limit": output_nodes.text_char_limit,
+        });
+        let visible_ui = visible_ui_for_tool_output(&stable_result.observation.nodes);
+        let visible_ui_output = json!({
+            "total_labeled_count": visible_ui.total_labeled_count,
+            "returned_count": visible_ui.returned_count,
+            "label_char_limit": visible_ui.label_char_limit,
+            "viewport": visible_ui.viewport,
+            "clipped_node_count": visible_ui.clipped_node_count,
+            "scrollable_node_count": visible_ui.scrollable_node_count,
+            "nodes": visible_ui.nodes,
+        });
 
-        let screenshot_bytes = stable_result.observation.screenshot_bytes;
-        observation_result_with_optional_screenshot(
-            json!({
-                "ok": stable_result.stabilized,
-                "serial": serial,
-                "stabilized": stable_result.stabilized,
-                "timed_out": stable_result.timed_out,
-                "elapsed_ms": stable_result.elapsed_ms,
-                "stable_polls_required": stable_result.stable_polls_required,
-                "stable_polls_observed": stable_result.stable_polls_observed,
-                "artifacts": {
-                    "hierarchy_path": stable_result.observation.hierarchy_path,
-                    "screenshot_path": stable_result.observation.screenshot_path,
-                    "screenshot_backend": stable_result.observation.screenshot_backend,
-                },
-                "current_focus": stable_result.observation.window_state.current_focus,
-                "window_state": stable_result.observation.window_state,
-                "node_count": stable_result.observation.nodes.len(),
-                "nodes": stable_result.observation.nodes,
-            }),
-            screenshot_bytes,
-        )
+        let screenshot_path = stable_result.observation.screenshot_path.clone();
+        let payload = json!({
+            "ok": stable_result.stabilized,
+            "serial": serial,
+            "stabilized": stable_result.stabilized,
+            "timed_out": stable_result.timed_out,
+            "elapsed_ms": stable_result.elapsed_ms,
+            "stable_polls_required": stable_result.stable_polls_required,
+            "stable_polls_observed": stable_result.stable_polls_observed,
+            "artifacts": {
+                "hierarchy_path": stable_result.observation.hierarchy_path,
+                "screenshot_path": stable_result.observation.screenshot_path,
+                "screenshot_backend": stable_result.observation.screenshot_backend,
+            },
+            "current_focus": stable_result.observation.window_state.current_focus,
+            "window_state": stable_result.observation.window_state,
+            "node_count": stable_result.observation.nodes.len(),
+            "node_output": node_output,
+            "visible_ui": visible_ui_output,
+            "nodes": output_nodes.nodes,
+        });
+        structured_result_with_optional_screenshot(payload, screenshot_path.as_deref()).await
     }
 
     #[tool(
         name = "android.find_ui_element",
         description = "Find the first normalized UI element matching a semantic selector in the current hierarchy."
     )]
-    async fn android_find_ui_element(
+    pub(crate) async fn android_find_ui_element(
         &self,
         Parameters(args): Parameters<FindUiElementArgs>,
     ) -> Result<CallToolResult, McpError> {
@@ -1018,7 +1654,7 @@ impl AndroidEmulatorMcp {
         let matches = matching_nodes(&nodes, &selector).matches;
         let current_focus = self.current_focus_internal(&serial).await.ok().flatten();
         match resolve_node_selection(matches, args.match_index) {
-            Ok(selection) => Ok(CallToolResult::structured(json!({
+            Ok(selection) => Ok(structured_receipt(json!({
                 "ok": true,
                 "serial": serial,
                 "matched": true,
@@ -1033,7 +1669,7 @@ impl AndroidEmulatorMcp {
                 "node": selection.node,
                 "candidate_summary": selection.candidates,
             }))),
-            Err(error) => Ok(CallToolResult::structured(json!({
+            Err(error) => Ok(structured_receipt(json!({
                 "ok": false,
                 "serial": serial,
                 "matched": false,
@@ -1051,7 +1687,7 @@ impl AndroidEmulatorMcp {
         name = "android.wait_for_ui_element",
         description = "Wait until a semantic UI selector is present or absent in the current hierarchy."
     )]
-    async fn android_wait_for_ui_element(
+    pub(crate) async fn android_wait_for_ui_element(
         &self,
         Parameters(args): Parameters<WaitUiElementArgs>,
     ) -> Result<CallToolResult, McpError> {
@@ -1082,7 +1718,12 @@ impl AndroidEmulatorMcp {
                 .await?;
             let nodes = parse_ui_nodes_from_path(&hierarchy_path)?;
             match self
-                .check_system_dialog(&serial, &hierarchy_path, &nodes)
+                .check_system_dialog(
+                    &serial,
+                    &hierarchy_path,
+                    &nodes,
+                    Some(started + timeout.min(Duration::from_secs(300))),
+                )
                 .await?
             {
                 SystemDialogCheck::Handled(report) => {
@@ -1090,7 +1731,7 @@ impl AndroidEmulatorMcp {
                     continue;
                 }
                 SystemDialogCheck::Blocked(report) => {
-                    return Ok(CallToolResult::structured(json!({
+                    return Ok(structured_receipt(json!({
                         "ok": false,
                         "serial": serial,
                         "selector": selector,
@@ -1130,7 +1771,7 @@ impl AndroidEmulatorMcp {
                     if satisfied {
                         let current_focus =
                             self.current_focus_internal(&serial).await.ok().flatten();
-                        return Ok(CallToolResult::structured(json!({
+                        return Ok(structured_receipt(json!({
                             "ok": true,
                             "serial": serial,
                             "selector": selector,
@@ -1154,7 +1795,7 @@ impl AndroidEmulatorMcp {
                 }
                 None if args.absent && !matched => {
                     let current_focus = self.current_focus_internal(&serial).await.ok().flatten();
-                    return Ok(CallToolResult::structured(json!({
+                    return Ok(structured_receipt(json!({
                         "ok": true,
                         "serial": serial,
                         "selector": selector,
@@ -1176,7 +1817,7 @@ impl AndroidEmulatorMcp {
                     })));
                 }
                 Some(Err(error)) if !args.absent => {
-                    return Ok(CallToolResult::structured(json!({
+                    return Ok(structured_receipt(json!({
                         "ok": false,
                         "serial": serial,
                         "selector": selector,
@@ -1204,7 +1845,7 @@ impl AndroidEmulatorMcp {
         }
 
         let current_focus = self.current_focus_internal(&serial).await.ok().flatten();
-        Ok(CallToolResult::structured(json!({
+        Ok(structured_receipt(json!({
             "ok": false,
             "serial": serial,
             "selector": selector,
@@ -1230,7 +1871,7 @@ impl AndroidEmulatorMcp {
         name = "android.tap_element",
         description = "Find a semantic UI element and tap its center point."
     )]
-    async fn android_tap_element(
+    pub(crate) async fn android_tap_element(
         &self,
         Parameters(args): Parameters<TapElementArgs>,
     ) -> Result<CallToolResult, McpError> {
@@ -1255,10 +1896,34 @@ impl AndroidEmulatorMcp {
                 .await?;
             let nodes = parse_ui_nodes_from_path(&hierarchy_path)?;
             match self
-                .check_system_dialog(&serial, &hierarchy_path, &nodes)
+                .check_system_dialog(&serial, &hierarchy_path, &nodes, Some(deadline))
                 .await?
             {
                 SystemDialogCheck::Handled(report) => {
+                    if system_dialog_action_matches_selector(&selector, &report) {
+                        return Ok(structured_receipt(json!({
+                            "ok": true,
+                            "serial": serial,
+                            "selector": selector,
+                            "tapped": true,
+                            "tap_dispatched": true,
+                            "match_count": 1,
+                            "ambiguous": false,
+                            "selected_match_index": 0,
+                            "allow_verification_failure": args.allow_verification_failure,
+                            "backend_used": "adb",
+                            "attempted_backends": ["adb"],
+                            "attempts": [],
+                            "artifacts": {
+                                "hierarchy_path": hierarchy_path.display().to_string(),
+                                "post_tap_hierarchy_path": serde_json::Value::Null,
+                            },
+                            "stdout": "",
+                            "stderr": "",
+                            "system_dialog": report,
+                            "note": "selector satisfied via system dialog auto-handle",
+                        })));
+                    }
                     dialog_report = Some(report);
                     continue;
                 }
@@ -1293,11 +1958,11 @@ impl AndroidEmulatorMcp {
         })?;
         let node = Some(selection.node.clone());
         let center = actionable_center(&node, &selector, "tap")?;
-        let mut attempted_backends = Vec::new();
-        let mut dispatch = self.tap_point_internal(&serial, center.0, center.1).await?;
-        attempted_backends.push(dispatch.backend);
-        let mut attempts = Vec::new();
-        let mut verification = self
+        let dispatch = self
+            .tap_point_internal(&serial, center.0, center.1, deadline)
+            .await?;
+        let attempted_backends = vec![dispatch.backend];
+        let verification = self
             .verify_tap_outcome(TapVerificationRequest {
                 serial: &serial,
                 tapped_selector: &selector,
@@ -1309,67 +1974,31 @@ impl AndroidEmulatorMcp {
                 hierarchy_filename: args.hierarchy_filename.clone(),
             })
             .await?;
-        attempts.push(json!({
+        let attempts = vec![json!({
             "backend": dispatch.backend,
             "dispatch_detail": dispatch.detail,
             "verification": tap_verification_json(&verification),
-        }));
-        let should_retry_with_adb = should_retry_tap_with_adb(
-            dispatch.backend,
-            args.retry_with_adb_on_no_change,
-            &verification,
-        );
-        if should_retry_with_adb {
-            let retry_reason = format!(
-                "initial grpc tap did not satisfy verification: {}",
-                tap_verification_summary(&verification)
-            );
-            dispatch = self
-                .tap_point_internal_adb(&serial, center.0, center.1)
-                .await?;
-            attempted_backends.push(dispatch.backend);
-            verification = self
-                .verify_tap_outcome(TapVerificationRequest {
-                    serial: &serial,
-                    tapped_selector: &selector,
-                    pre_tap_nodes: &pre_tap_nodes,
-                    wait_until_absent: args.wait_until_absent,
-                    wait_for_tracker: None,
-                    wait_for_selector: wait_for_selector.as_ref(),
-                    deadline,
-                    hierarchy_filename: args.hierarchy_filename.clone(),
-                })
-                .await?;
-            attempts.push(json!({
-                "backend": dispatch.backend,
-                "dispatch_detail": dispatch
-                    .detail
-                    .clone()
-                    .or(Some(retry_reason)),
-                "verification": tap_verification_json(&verification),
-            }));
-        }
+        })];
         let tap_satisfied = !verification.requested || verification.satisfied;
-        if !tap_satisfied && !args.allow_verification_failure {
-            return Err(McpError::internal_error(
-                format!(
-                    "android.tap_element verification failed after dispatch: {}",
-                    json!({
-                        "serial": serial,
-                        "selector": selector,
-                        "attempted_backends": attempted_backends,
-                        "attempts": attempts,
-                        "artifacts": {
-                            "hierarchy_path": pre_tap_hierarchy_path,
-                            "post_tap_hierarchy_path": verification.hierarchy_path,
-                        },
-                        "system_dialog": dialog_report,
-                    })
-                ),
-                None,
-            ));
-        }
-        Ok(CallToolResult::structured(json!({
+        ensure_action_outcome_satisfied(
+            "android.tap_element",
+            "verification failed after dispatch",
+            !args.allow_verification_failure,
+            tap_satisfied,
+            json!({
+                "serial": serial,
+                "selector": selector,
+                "attempted_backends": attempted_backends,
+                "attempts": attempts,
+                "verification": tap_verification_json(&verification),
+                "artifacts": {
+                    "hierarchy_path": pre_tap_hierarchy_path,
+                    "post_tap_hierarchy_path": verification.hierarchy_path,
+                },
+                "system_dialog": dialog_report,
+            }),
+        )?;
+        Ok(structured_receipt(json!({
             "ok": tap_satisfied,
             "serial": serial,
             "selector": selector,
@@ -1399,10 +2028,11 @@ impl AndroidEmulatorMcp {
         name = "android.type_into_element",
         description = "Find a semantic UI element, tap it, and send text input."
     )]
-    async fn android_type_into_element(
+    pub(crate) async fn android_type_into_element(
         &self,
         Parameters(args): Parameters<TypeIntoElementArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let requires_clipboard = grpc_backend::requires_clipboard_text(&args.text);
         let selector = normalize_selector_input(args.selector);
         ensure_selector_not_empty(&selector)?;
         let serial = self
@@ -1424,7 +2054,7 @@ impl AndroidEmulatorMcp {
                 .await?;
             let nodes = parse_ui_nodes_from_path(&hierarchy_path)?;
             match self
-                .check_system_dialog(&serial, &hierarchy_path, &nodes)
+                .check_system_dialog(&serial, &hierarchy_path, &nodes, Some(deadline))
                 .await?
             {
                 SystemDialogCheck::Handled(report) => {
@@ -1458,10 +2088,7 @@ impl AndroidEmulatorMcp {
             break (hierarchy_path, selection);
         };
         let node = Some(selection.node.clone());
-        let focus_target_selector = UiSelector {
-            focused: Some(true),
-            ..text_verification_target_selector(&selection.node)
-        };
+        let focus_target_selector = focus_verification_target_selector(&selection.node);
         let focus_target_tracker =
             InternalNodeTracker::from_target_node_with_focus(&selection.node, Some(true))
                 .unwrap_or_else(|| InternalNodeTracker::Selector(focus_target_selector.clone()));
@@ -1491,10 +2118,13 @@ impl AndroidEmulatorMcp {
                 tapped_selector_still_present: Some(true),
                 post_selector_matched: Some(true),
                 ui_changed_from_pre_tap: Some(false),
+                handled_system_dialogs: Vec::new(),
             }
         } else {
             let center = actionable_center(&node, &selector, "type into")?;
-            tap_dispatch = self.tap_point_internal(&serial, center.0, center.1).await?;
+            tap_dispatch = self
+                .tap_point_internal(&serial, center.0, center.1, deadline)
+                .await?;
             self.verify_tap_outcome(TapVerificationRequest {
                 serial: &serial,
                 tapped_selector: &selector,
@@ -1507,31 +2137,37 @@ impl AndroidEmulatorMcp {
             })
             .await?
         };
-        if !focus_verification.satisfied {
-            return Err(McpError::internal_error(
-                format!(
-                    "android.type_into_element could not confirm that the target field gained focus before typing: {}",
-                    json!({
-                        "serial": serial,
-                        "selector": selector,
-                        "tap_backend_used": tap_dispatch.backend,
-                        "focus_verification": tap_verification_json(&focus_verification),
-                    })
-                ),
-                None,
-            ));
-        }
+        ensure_action_outcome_satisfied(
+            "android.type_into_element",
+            "could not confirm that the target field gained focus before typing",
+            true,
+            focus_verification.satisfied,
+            json!({
+                "serial": serial,
+                "selector": selector,
+                "tap_backend_used": tap_dispatch.backend,
+                "focus_verification": tap_verification_json(&focus_verification),
+                "artifacts": {
+                    "hierarchy_path": hierarchy_path,
+                    "post_tap_hierarchy_path": focus_verification.hierarchy_path,
+                },
+            }),
+        )?;
         let focused_nodes = focus_verification
             .hierarchy_path
             .as_deref()
             .map(Path::new)
-            .map(parse_ui_nodes_from_path)
+            .map(|path| parse_text_verification_nodes(path, requires_clipboard))
             .transpose()?
             .unwrap_or_default();
-        let focused_node = focused_nodes
-            .iter()
-            .find(|node| tracker_matches_node(node, &focus_target_tracker))
-            .cloned();
+        let focused_node = if requires_clipboard {
+            Some(clipboard_text_target(&focused_nodes, Some(&focus_target_selector))?.clone())
+        } else {
+            focused_nodes
+                .iter()
+                .find(|node| tracker_matches_node(node, &focus_target_tracker))
+                .cloned()
+        };
         let public_text_target_selector = focused_node
             .as_ref()
             .map(text_verification_target_selector)
@@ -1540,10 +2176,13 @@ impl AndroidEmulatorMcp {
             .as_ref()
             .and_then(InternalNodeTracker::from_target_node)
             .unwrap_or_else(|| InternalNodeTracker::Selector(public_text_target_selector.clone()));
-        if focused_node
-            .as_ref()
-            .is_some_and(|node| node_matches_requested_text(node, &args.text))
-        {
+        if focused_node.as_ref().is_some_and(|node| {
+            if requires_clipboard {
+                node.text.as_deref() == Some(args.text.as_str())
+            } else {
+                node_matches_requested_text(node, &args.text)
+            }
+        }) {
             let no_op_verification = TextVerification {
                 requested: true,
                 target_selector: Some(public_text_target_selector.clone()),
@@ -1561,8 +2200,9 @@ impl AndroidEmulatorMcp {
                 target_text_matches_requested: Some(true),
                 post_selector_matched: None,
                 ui_changed_from_pre_text: Some(false),
+                handled_system_dialogs: Vec::new(),
             };
-            return Ok(CallToolResult::structured(json!({
+            return Ok(structured_receipt(json!({
                 "ok": true,
                 "serial": serial,
                 "selector": selector,
@@ -1595,7 +2235,6 @@ impl AndroidEmulatorMcp {
                 wait_for_selector: None,
                 deadline,
                 hierarchy_filename: Some("type-into-element-text.xml".to_string()),
-                retry_with_adb_on_no_change: true,
                 replace_existing_text_on_adb: true,
                 existing_text_for_adb_replace: focused_node
                     .as_ref()
@@ -1613,9 +2252,15 @@ impl AndroidEmulatorMcp {
                 "text": args.text,
                 "text_backend_used": text_dispatch.dispatch.backend,
                 "text_verification": text_verification_json(&text_dispatch.verification),
+                "focus_verification": tap_verification_json(&focus_verification),
+                "artifacts": {
+                    "hierarchy_path": hierarchy_path,
+                    "post_tap_hierarchy_path": focus_verification.hierarchy_path,
+                    "post_text_hierarchy_path": text_dispatch.verification.hierarchy_path,
+                },
             }),
         )?;
-        Ok(CallToolResult::structured(json!({
+        Ok(structured_receipt(json!({
             "ok": true,
             "serial": serial,
             "selector": selector,
@@ -1627,10 +2272,12 @@ impl AndroidEmulatorMcp {
             "tap_backend_used": tap_dispatch.backend,
             "text_backend_used": text_dispatch.dispatch.backend,
             "text_dispatch_detail": text_dispatch.dispatch.detail,
+            "clipboard_restore": text_dispatch.clipboard_restore,
             "artifacts": {
                 "hierarchy_path": hierarchy_path,
                 "focus_hierarchy_path": focus_verification.hierarchy_path,
                 "text_hierarchy_path": text_dispatch.verification.hierarchy_path,
+                "post_text_hierarchy_path": text_dispatch.verification.hierarchy_path,
             },
             "stdout": merge_stdout(&tap_dispatch.output, &text_dispatch.dispatch.output),
             "stderr": merge_stderr(&tap_dispatch.output, &text_dispatch.dispatch.output),
@@ -1647,7 +2294,7 @@ impl AndroidEmulatorMcp {
         name = "android.scroll_until_visible",
         description = "Swipe the viewport until a semantic UI selector becomes visible or the swipe budget is exhausted."
     )]
-    async fn android_scroll_until_visible(
+    pub(crate) async fn android_scroll_until_visible(
         &self,
         Parameters(args): Parameters<ScrollUntilVisibleArgs>,
     ) -> Result<CallToolResult, McpError> {
@@ -1681,7 +2328,7 @@ impl AndroidEmulatorMcp {
                 .await?;
             let nodes = parse_ui_nodes_from_path(&hierarchy_path)?;
             match self
-                .check_system_dialog(&serial, &hierarchy_path, &nodes)
+                .check_system_dialog(&serial, &hierarchy_path, &nodes, None)
                 .await?
             {
                 SystemDialogCheck::Handled(report) => {
@@ -1689,7 +2336,7 @@ impl AndroidEmulatorMcp {
                     continue;
                 }
                 SystemDialogCheck::Blocked(report) => {
-                    return Ok(CallToolResult::structured(json!({
+                    return Ok(structured_receipt(json!({
                         "ok": false,
                         "serial": serial,
                         "selector": selector,
@@ -1713,7 +2360,7 @@ impl AndroidEmulatorMcp {
             match resolve_node_selection(matches, args.match_index) {
                 Ok(selection) => {
                     last_node = Some(selection.node.clone());
-                    return Ok(CallToolResult::structured(json!({
+                    return Ok(structured_receipt(json!({
                         "ok": true,
                         "serial": serial,
                         "selector": selector,
@@ -1738,7 +2385,7 @@ impl AndroidEmulatorMcp {
                     last_selected_match_index = None;
                 }
                 Err(error) => {
-                    return Ok(CallToolResult::structured(json!({
+                    return Ok(structured_receipt(json!({
                         "ok": false,
                         "serial": serial,
                         "selector": selector,
@@ -1764,18 +2411,17 @@ impl AndroidEmulatorMcp {
                 let dispatch = self
                     .swipe_points_internal(
                         &serial,
-                        swipe_points.0,
-                        swipe_points.1,
-                        swipe_points.2,
-                        swipe_points.3,
+                        (swipe_points.0, swipe_points.1),
+                        (swipe_points.2, swipe_points.3),
                         DEFAULT_SWIPE_DURATION_MS,
+                        tool_deadline(None, DEFAULT_ADB_COMMAND_TIMEOUT_SECS),
                     )
                     .await?;
                 swipe_backend = Some(dispatch.backend);
             }
         }
 
-        Ok(CallToolResult::structured(json!({
+        Ok(structured_receipt(json!({
             "ok": false,
             "serial": serial,
             "selector": selector,
@@ -1802,14 +2448,14 @@ impl AndroidEmulatorMcp {
         name = "android.collect_logcat",
         description = "Capture recent logcat output and save it locally."
     )]
-    async fn android_collect_logcat(
+    pub(crate) async fn android_collect_logcat(
         &self,
         Parameters(args): Parameters<LogcatArgs>,
     ) -> Result<CallToolResult, McpError> {
         let serial = self
             .resolve_serial_for_tools(args.serial.as_deref())
             .await?;
-        let lines = args.lines.unwrap_or(400).to_string();
+        let lines = args.lines.unwrap_or(400).clamp(1, 10_000).to_string();
         let output = self
             .run_adb(
                 &serial,
@@ -1824,10 +2470,9 @@ impl AndroidEmulatorMcp {
         let path = self
             .artifact_path("logcat", args.filename, Some("txt"))
             .await?;
-        fs::write(&path, &output.stdout)
-            .await
-            .map_err(|err| McpError::internal_error(err.to_string(), None))?;
-        Ok(CallToolResult::structured(json!({
+        self.write_artifact_bytes(&path, output.stdout.as_bytes())
+            .await?;
+        Ok(structured_receipt(json!({
             "ok": true,
             "serial": serial,
             "path": path,
@@ -1839,7 +2484,7 @@ impl AndroidEmulatorMcp {
         name = "android.input.tap",
         description = "Send a tap input event to the device."
     )]
-    async fn android_input_tap(
+    pub(crate) async fn android_input_tap(
         &self,
         Parameters(args): Parameters<TapArgs>,
     ) -> Result<CallToolResult, McpError> {
@@ -1867,7 +2512,9 @@ impl AndroidEmulatorMcp {
         } else {
             None
         };
-        let dispatch = self.tap_point_internal(&serial, args.x, args.y).await?;
+        let dispatch = self
+            .tap_point_internal(&serial, args.x, args.y, deadline)
+            .await?;
         let verification = if let Some(tapped_selector) = tapped_selector.as_ref() {
             Some(
                 self.verify_tap_outcome(TapVerificationRequest {
@@ -1912,6 +2559,9 @@ impl AndroidEmulatorMcp {
                     .as_ref()
                     .map(|result| result.elapsed_ms)
                     .unwrap_or(0),
+                evidence_source: verification
+                    .as_ref()
+                    .map(|_| ToolPostconditionEvidenceSource::UiHierarchy),
                 hierarchy_path: verification
                     .as_ref()
                     .and_then(|result| result.hierarchy_path.clone()),
@@ -1922,6 +2572,10 @@ impl AndroidEmulatorMcp {
                 match_count: 0,
                 selected_match_index: None,
                 candidate_summary: Vec::new(),
+                handled_system_dialogs: verification
+                    .as_ref()
+                    .map(|result| result.handled_system_dialogs.clone())
+                    .unwrap_or_default(),
             }
         };
         ensure_tool_postcondition_satisfied(
@@ -1929,7 +2583,7 @@ impl AndroidEmulatorMcp {
             "postcondition failed after dispatch",
             &postcondition,
         )?;
-        Ok(CallToolResult::structured(json!({
+        Ok(structured_receipt(json!({
             "ok": postcondition.satisfied,
             "serial": serial,
             "x": args.x,
@@ -1944,13 +2598,114 @@ impl AndroidEmulatorMcp {
     }
 
     #[tool(
+        name = "android.input.double_tap",
+        description = "Send a double-tap input event to the device as one bounded gesture."
+    )]
+    pub(crate) async fn android_input_double_tap(
+        &self,
+        Parameters(args): Parameters<DoubleTapArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let wait_for_selector = normalize_optional_selector_input(args.wait_for_selector);
+        if let Some(selector) = wait_for_selector.as_ref() {
+            ensure_selector_not_empty(selector)?;
+        }
+        let serial = self
+            .resolve_serial_for_tools(args.serial.as_deref())
+            .await?;
+        let deadline = tool_deadline(args.timeout_secs, DEFAULT_ACTION_TIMEOUT_SECS);
+        let dispatch = self
+            .double_tap_point_internal(&serial, args.x, args.y, deadline)
+            .await?;
+        let postcondition = self
+            .wait_for_tool_postcondition(ToolPostconditionRequest {
+                serial: &serial,
+                selector: wait_for_selector.as_ref(),
+                match_index: None,
+                wait_for_activity: None,
+                wait_for_package: None,
+                deadline,
+                include_screenshot: false,
+                artifact_prefix: "raw-double-tap-postcondition",
+            })
+            .await?;
+        ensure_tool_postcondition_satisfied(
+            "android.input.double_tap",
+            "postcondition failed after dispatch",
+            &postcondition,
+        )?;
+        Ok(structured_receipt(json!({
+            "ok": postcondition.satisfied,
+            "serial": serial,
+            "x": args.x,
+            "y": args.y,
+            "backend_used": dispatch.backend,
+            "dispatch_detail": dispatch.detail,
+            "stdout": dispatch.output.stdout,
+            "stderr": dispatch.output.stderr,
+            "postcondition": tool_postcondition_json(&postcondition),
+        })))
+    }
+
+    #[tool(
+        name = "android.input.long_press",
+        description = "Send a long-press input event to the device as one bounded gesture."
+    )]
+    pub(crate) async fn android_input_long_press(
+        &self,
+        Parameters(args): Parameters<LongPressArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let wait_for_selector = normalize_optional_selector_input(args.wait_for_selector);
+        if let Some(selector) = wait_for_selector.as_ref() {
+            ensure_selector_not_empty(selector)?;
+        }
+        let serial = self
+            .resolve_serial_for_tools(args.serial.as_deref())
+            .await?;
+        let duration_ms = args.duration_ms.unwrap_or(500);
+        let deadline = tool_deadline(args.timeout_secs, DEFAULT_ACTION_TIMEOUT_SECS);
+        let dispatch = self
+            .long_press_point_internal(&serial, args.x, args.y, duration_ms, deadline)
+            .await?;
+        let postcondition = self
+            .wait_for_tool_postcondition(ToolPostconditionRequest {
+                serial: &serial,
+                selector: wait_for_selector.as_ref(),
+                match_index: None,
+                wait_for_activity: None,
+                wait_for_package: None,
+                deadline,
+                include_screenshot: false,
+                artifact_prefix: "raw-long-press-postcondition",
+            })
+            .await?;
+        ensure_tool_postcondition_satisfied(
+            "android.input.long_press",
+            "postcondition failed after dispatch",
+            &postcondition,
+        )?;
+        Ok(structured_receipt(json!({
+            "ok": postcondition.satisfied,
+            "serial": serial,
+            "x": args.x,
+            "y": args.y,
+            "duration_ms": duration_ms,
+            "backend_used": dispatch.backend,
+            "dispatch_detail": dispatch.detail,
+            "stdout": dispatch.output.stdout,
+            "stderr": dispatch.output.stderr,
+            "postcondition": tool_postcondition_json(&postcondition),
+        })))
+    }
+
+    #[tool(
         name = "android.input.text",
         description = "Send text input to the device."
     )]
-    async fn android_input_text(
+    pub(crate) async fn android_input_text(
         &self,
         Parameters(args): Parameters<TextArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let requires_clipboard = grpc_backend::requires_clipboard_text(&args.text);
         let expect_focus_selector = normalize_optional_selector_input(args.expect_focus_selector);
         let wait_for_selector = normalize_optional_selector_input(args.wait_for_selector);
         if let Some(selector) = expect_focus_selector.as_ref() {
@@ -1981,27 +2736,41 @@ impl AndroidEmulatorMcp {
             &focus_postcondition,
         )?;
         let pre_text_nodes = if let Some(path) = focus_postcondition.hierarchy_path.as_deref() {
-            parse_ui_nodes_from_path(Path::new(path))?
-        } else if expect_focus_selector.is_some() || wait_for_selector.is_some() {
-            self.capture_ui_observation_with_deadline(
-                &serial,
-                filename_or_timestamp(None, "input-text-pre", "xml"),
-                false,
-                filename_or_timestamp(None, "input-text-pre", "png"),
-                Some(deadline),
-            )
-            .await?
-            .nodes
+            parse_text_verification_nodes(Path::new(path), requires_clipboard)?
+        } else if expect_focus_selector.is_some()
+            || wait_for_selector.is_some()
+            || requires_clipboard
+        {
+            let observation = self
+                .capture_ui_observation_with_deadline(
+                    &serial,
+                    filename_or_timestamp(None, "input-text-pre", "xml"),
+                    false,
+                    filename_or_timestamp(None, "input-text-pre", "png"),
+                    Some(deadline),
+                )
+                .await?;
+            if requires_clipboard {
+                clipboard_text_nodes_from_xml(&observation.hierarchy_xml)?
+            } else {
+                observation.nodes
+            }
         } else {
             Vec::new()
         };
-        let public_text_target_selector = focus_postcondition
-            .node
-            .as_ref()
-            .map(text_verification_target_selector);
-        let text_target_tracker = focus_postcondition
-            .node
-            .as_ref()
+        // Clipboard paste is asynchronous from the provider's perspective. A
+        // focused editable target lets verification prove consumption before
+        // private clipboard cleanup, even when the raw caller gave no selector.
+        let text_target_node = if requires_clipboard {
+            Some(clipboard_text_target(
+                &pre_text_nodes,
+                expect_focus_selector.as_ref(),
+            )?)
+        } else {
+            focus_postcondition.node.as_ref()
+        };
+        let public_text_target_selector = text_target_node.map(text_verification_target_selector);
+        let text_target_tracker = text_target_node
             .and_then(InternalNodeTracker::from_target_node)
             .or_else(|| {
                 public_text_target_selector
@@ -2025,7 +2794,6 @@ impl AndroidEmulatorMcp {
                 wait_for_selector: wait_for_selector.as_ref(),
                 deadline,
                 hierarchy_filename: Some("input-text-verify.xml".to_string()),
-                retry_with_adb_on_no_change: true,
                 replace_existing_text_on_adb: false,
                 existing_text_for_adb_replace: None,
             })
@@ -2038,6 +2806,9 @@ impl AndroidEmulatorMcp {
             json!({
                 "focus_postcondition": tool_postcondition_json(&focus_postcondition),
                 "text_verification": text_verification_json(&verified_dispatch.verification),
+                "artifacts": {
+                    "post_text_hierarchy_path": verified_dispatch.verification.hierarchy_path,
+                },
             }),
         )?;
         let postcondition = self
@@ -2057,16 +2828,20 @@ impl AndroidEmulatorMcp {
             "postcondition failed after dispatch",
             &postcondition,
         )?;
-        Ok(CallToolResult::structured(json!({
+        Ok(structured_receipt(json!({
             "ok": postcondition.satisfied,
             "serial": serial,
             "text": args.text,
             "backend_used": verified_dispatch.dispatch.backend,
             "dispatch_detail": verified_dispatch.dispatch.detail,
+            "clipboard_restore": verified_dispatch.clipboard_restore,
             "stdout": verified_dispatch.dispatch.output.stdout,
             "stderr": verified_dispatch.dispatch.output.stderr,
             "focus_postcondition": tool_postcondition_json(&focus_postcondition),
             "text_verification": text_verification_json(&verified_dispatch.verification),
+            "artifacts": {
+                "post_text_hierarchy_path": verified_dispatch.verification.hierarchy_path,
+            },
             "postcondition": tool_postcondition_json(&postcondition),
         })))
     }
@@ -2075,7 +2850,7 @@ impl AndroidEmulatorMcp {
         name = "android.input.swipe",
         description = "Send a swipe gesture to the device."
     )]
-    async fn android_input_swipe(
+    pub(crate) async fn android_input_swipe(
         &self,
         Parameters(args): Parameters<SwipeArgs>,
     ) -> Result<CallToolResult, McpError> {
@@ -2111,7 +2886,13 @@ impl AndroidEmulatorMcp {
             None
         };
         let dispatch = self
-            .swipe_points_internal(&serial, args.x1, args.y1, args.x2, args.y2, duration)
+            .swipe_points_internal(
+                &serial,
+                (args.x1, args.y1),
+                (args.x2, args.y2),
+                duration,
+                deadline,
+            )
             .await?;
         let selector_postcondition = self
             .wait_for_tool_postcondition(ToolPostconditionRequest {
@@ -2148,7 +2929,11 @@ impl AndroidEmulatorMcp {
         } else {
             false
         };
-        let postcondition_ok = selector_postcondition.satisfied || scroll_changed;
+        let postcondition_ok = swipe_outcome_satisfied(
+            selector_postcondition.satisfied,
+            args.expect_scroll_change,
+            scroll_changed,
+        );
         ensure_action_outcome_satisfied(
             "android.input.swipe",
             "postcondition failed after dispatch",
@@ -2159,7 +2944,7 @@ impl AndroidEmulatorMcp {
                 "scroll_changed": scroll_changed,
             }),
         )?;
-        Ok(CallToolResult::structured(json!({
+        Ok(structured_receipt(json!({
             "ok": postcondition_ok,
             "serial": serial,
             "duration_ms": duration,
@@ -2173,10 +2958,54 @@ impl AndroidEmulatorMcp {
     }
 
     #[tool(
+        name = "android.input.multi_touch",
+        description = "Send two to five pointer paths as one atomic emulator gRPC gesture."
+    )]
+    pub(crate) async fn android_input_multi_touch(
+        &self,
+        Parameters(args): Parameters<MultiTouchArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let serial = self
+            .resolve_serial_for_tools(args.serial.as_deref())
+            .await?;
+        let duration_ms = args.duration_ms.unwrap_or(DEFAULT_MULTI_TOUCH_DURATION_MS);
+        let deadline = tool_deadline(args.timeout_secs, DEFAULT_ACTION_TIMEOUT_SECS);
+        let display_size = timeout(
+            require_remaining_budget(deadline, "multi-touch display preflight")?,
+            self.display_size_internal(&serial),
+        )
+        .await
+        .map_err(|_| multi_touch_capability_error("display geometry preflight timed out"))??;
+        validate_multi_touch_request(&args.pointers, duration_ms, display_size)?;
+        let dispatch = self
+            .multi_touch_internal(&serial, &args.pointers, duration_ms, display_size, deadline)
+            .await?;
+
+        Ok(structured_receipt(json!({
+            "ok": true,
+            "serial": serial,
+            "pointer_count": args.pointers.len(),
+            "duration_ms": duration_ms,
+            "display_size": display_size,
+            "backend_used": dispatch.backend,
+            "dispatch_detail": dispatch.detail,
+            "stdout": dispatch.output.stdout,
+            "stderr": dispatch.output.stderr,
+            "capability": {
+                "name": "multi_touch",
+                "status": "supported",
+                "transport": "emulator_grpc",
+                "coordinate_space": "android_logical_display",
+                "geometry_guard": "full_panel_reported_identity_calibration"
+            }
+        })))
+    }
+
+    #[tool(
         name = "android.input.keyevent",
         description = "Send a keyevent to the device."
     )]
-    async fn android_input_keyevent(
+    pub(crate) async fn android_input_keyevent(
         &self,
         Parameters(args): Parameters<KeyeventArgs>,
     ) -> Result<CallToolResult, McpError> {
@@ -2208,10 +3037,71 @@ impl AndroidEmulatorMcp {
             "postcondition failed after dispatch",
             &postcondition,
         )?;
-        Ok(CallToolResult::structured(json!({
+        Ok(structured_receipt(json!({
             "ok": postcondition.satisfied,
             "serial": serial,
             "keycode": args.keycode,
+            "stdout": output.stdout,
+            "stderr": output.stderr,
+            "postcondition": tool_postcondition_json(&postcondition),
+        })))
+    }
+
+    #[tool(
+        name = "android.input.keycombination",
+        description = "Send a chorded key combination to the device."
+    )]
+    pub(crate) async fn android_input_keycombination(
+        &self,
+        Parameters(args): Parameters<KeycombinationArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut raw_keycodes = args.keycodes;
+        raw_keycodes.extend(args.keycode);
+        raw_keycodes.extend(args.key);
+        let keycodes: Vec<String> = raw_keycodes
+            .iter()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .collect();
+        if keycodes.is_empty() {
+            return Err(McpError::invalid_params(
+                "keycodes must include at least one non-empty keycode".to_string(),
+                None,
+            ));
+        }
+        let wait_for_selector = normalize_optional_selector_input(args.wait_for_selector);
+        if let Some(selector) = wait_for_selector.as_ref() {
+            ensure_selector_not_empty(selector)?;
+        }
+        let serial = self
+            .resolve_serial_for_tools(args.serial.as_deref())
+            .await?;
+        let mut adb_args = vec!["input".to_string(), "keycombination".to_string()];
+        adb_args.extend(keycodes.iter().cloned());
+        let output = self.run_adb_shell(&serial, adb_args).await?;
+        let deadline = tool_deadline(args.timeout_secs, DEFAULT_ACTION_TIMEOUT_SECS);
+        let postcondition = self
+            .wait_for_tool_postcondition(ToolPostconditionRequest {
+                serial: &serial,
+                selector: wait_for_selector.as_ref(),
+                match_index: None,
+                wait_for_activity: args.wait_for_activity.as_deref(),
+                wait_for_package: args.wait_for_package.as_deref(),
+                deadline,
+                include_screenshot: false,
+                artifact_prefix: "input-keycombination-postcondition",
+            })
+            .await?;
+        ensure_tool_postcondition_satisfied(
+            "android.input.keycombination",
+            "postcondition failed after dispatch",
+            &postcondition,
+        )?;
+        Ok(structured_receipt(json!({
+            "ok": postcondition.satisfied,
+            "serial": serial,
+            "keycodes": keycodes,
             "stdout": output.stdout,
             "stderr": output.stderr,
             "postcondition": tool_postcondition_json(&postcondition),
@@ -2226,7 +3116,7 @@ impl AndroidEmulatorMcp {
         &self,
         Parameters(args): Parameters<SolarLabScenarioArgs>,
     ) -> Result<CallToolResult, McpError> {
-        Ok(CallToolResult::structured(
+        Ok(structured_receipt(
             self.run_stage_first_focus_earth(args).await?,
         ))
     }
@@ -2239,7 +3129,7 @@ impl AndroidEmulatorMcp {
         &self,
         Parameters(args): Parameters<SolarLabScenarioArgs>,
     ) -> Result<CallToolResult, McpError> {
-        Ok(CallToolResult::structured(
+        Ok(structured_receipt(
             self.run_stage_first_immersive_roundtrip(args).await?,
         ))
     }
@@ -2252,7 +3142,7 @@ impl AndroidEmulatorMcp {
         &self,
         Parameters(args): Parameters<SolarLabSemanticActionArgs>,
     ) -> Result<CallToolResult, McpError> {
-        Ok(CallToolResult::structured(
+        Ok(structured_receipt(
             self.run_solarlab_semantic_action(args).await?,
         ))
     }
@@ -2314,6 +3204,23 @@ struct StableUiWaitRequest<'a> {
 struct VerifiedTextDispatch {
     dispatch: ActionDispatch,
     verification: TextVerification,
+    clipboard_restore: Option<&'static str>,
+}
+
+trait ClipboardTransferCleanup: Send {
+    fn restore_if_owned(
+        &mut self,
+    ) -> impl std::future::Future<
+        Output = Result<grpc_backend::ClipboardRestoreOutcome, grpc_backend::GrpcMutationError>,
+    > + Send;
+}
+
+impl ClipboardTransferCleanup for grpc_backend::ClipboardTransfer {
+    async fn restore_if_owned(
+        &mut self,
+    ) -> Result<grpc_backend::ClipboardRestoreOutcome, grpc_backend::GrpcMutationError> {
+        grpc_backend::ClipboardTransfer::restore_if_owned(self).await
+    }
 }
 
 struct SolarLabAppArgs {
@@ -2328,7 +3235,7 @@ struct ScenarioBundleSpec<'a> {
 }
 
 pub(crate) fn tool_deadline(timeout_secs: Option<u64>, default_secs: u64) -> Instant {
-    Instant::now() + Duration::from_secs(timeout_secs.unwrap_or(default_secs))
+    Instant::now() + Duration::from_secs(timeout_secs.unwrap_or(default_secs).clamp(1, 300))
 }
 
 pub(crate) fn remaining_until(deadline: Instant) -> Duration {
@@ -2351,75 +3258,13 @@ pub(crate) fn has_meaningful_observation_budget(deadline: Instant) -> bool {
     remaining_until(deadline) >= Duration::from_millis(MIN_OBSERVATION_BUDGET_MS)
 }
 
-pub(crate) fn has_meaningful_fast_ui_fingerprint_budget(deadline: Instant) -> bool {
-    remaining_until(deadline)
-        >= Duration::from_millis(
-            FULL_OBSERVATION_CAPTURE_RESERVE_MS + MIN_FAST_UI_FINGERPRINT_BUDGET_MS,
-        )
-}
-
-fn bounded_deadline(deadline: Instant, soft_budget: Duration) -> Instant {
-    let soft_deadline = Instant::now() + soft_budget;
-    if soft_deadline < deadline {
-        soft_deadline
-    } else {
-        deadline
-    }
-}
-
-fn reserved_fallback_deadline(deadline: Instant, reserve_budget: Duration) -> Instant {
-    let now = Instant::now();
-    let remaining = remaining_until(deadline);
-    if remaining <= reserve_budget {
-        deadline
-    } else {
-        now + (remaining - reserve_budget)
-    }
-}
-
-fn initial_text_verification_deadline(
-    dispatch_backend: &str,
-    deadline: Instant,
-    retry_with_adb_on_no_change: bool,
-) -> Instant {
-    if dispatch_backend != "grpc" || !retry_with_adb_on_no_change {
-        return deadline;
-    }
-
-    let reserve_budget = Duration::from_millis(ADB_TEXT_FALLBACK_RESERVE_MS);
-    let minimum_verification_window = Duration::from_millis(MIN_TEXT_VERIFICATION_WINDOW_MS);
-    let remaining = remaining_until(deadline);
-
-    if remaining <= reserve_budget + minimum_verification_window {
-        return deadline;
-    }
-
-    bounded_deadline(
-        deadline,
-        Duration::from_millis(GRPC_TEXT_VERIFICATION_BUDGET_MS),
-    )
-    .max(reserved_fallback_deadline(deadline, reserve_budget))
-}
-
-fn has_meaningful_text_fallback_budget(deadline: Instant) -> bool {
-    remaining_until(deadline) >= Duration::from_millis(ADB_TEXT_FALLBACK_RESERVE_MS)
-}
-
-fn fast_ui_fingerprint_deadline(deadline: Instant) -> Instant {
-    bounded_deadline(
-        reserved_fallback_deadline(
-            deadline,
-            Duration::from_millis(FULL_OBSERVATION_CAPTURE_RESERVE_MS),
-        ),
-        Duration::from_millis(MIN_FAST_UI_FINGERPRINT_BUDGET_MS),
-    )
-}
-
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct AndroidWindowState {
     pub(crate) current_focus: Option<String>,
     pub(crate) focused_app: Option<String>,
     pub(crate) resumed_activity: Option<String>,
+    pub(crate) input_method_visible: bool,
+    pub(crate) input_method_target: Option<String>,
 }
 
 pub(crate) struct UiObservation {
@@ -2428,20 +3273,21 @@ pub(crate) struct UiObservation {
     pub(crate) nodes: Vec<NormalizedUiNode>,
     pub(crate) screenshot_path: Option<PathBuf>,
     pub(crate) screenshot_backend: Option<&'static str>,
-    pub(crate) screenshot_bytes: Option<Vec<u8>>,
     pub(crate) window_state: AndroidWindowState,
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct SystemDialogReport {
+pub(crate) struct SystemDialogReport {
     detected: bool,
     kind: String,
     labels: Vec<String>,
     action_taken: Option<String>,
+    action_label: Option<String>,
+    action_resource_id: Option<String>,
     artifact_path: String,
 }
 
-enum SystemDialogCheck {
+pub(crate) enum SystemDialogCheck {
     None,
     Handled(SystemDialogReport),
     Blocked(SystemDialogReport),
@@ -2486,6 +3332,7 @@ impl AndroidEmulatorMcp {
         &self,
         args: SolarLabSemanticActionArgs,
     ) -> Result<serde_json::Value, McpError> {
+        let args = normalize_solarlab_semantic_action_args(args)?;
         let serial = self
             .resolve_serial_for_tools(args.serial.as_deref())
             .await?;
@@ -2495,24 +3342,21 @@ impl AndroidEmulatorMcp {
                 .unwrap_or_else(|| "com.sednalabs.solarlab".to_string()),
             activity: Some(args.activity.unwrap_or_else(|| ".MainActivity".to_string())),
         };
-        let body_query = args
-            .body_query
-            .as_deref()
-            .map(str::trim)
-            .filter(|query| !query.is_empty())
-            .map(str::to_string);
+        let body_query = resolve_solarlab_semantic_body_query(args.body_query, args.target);
         let action = validate_solarlab_semantic_action(&args.action, body_query)?;
+        let request_id = timestamp_filename("semantic-request", None);
 
         self.dispatch_solarlab_semantic_action(
             &serial,
             &app,
             action.action_name(),
             action.body_query(),
+            &request_id,
         )
         .await?;
 
         let acknowledgment = self
-            .wait_for_solarlab_semantic_ack(&serial, &action)
+            .wait_for_solarlab_semantic_ack(&serial, &action, &request_id)
             .await?;
         if let Some(ack) = acknowledgment.as_ref().filter(|ack| !ack.acknowledged) {
             let artifacts = if args.capture_state {
@@ -2562,6 +3406,7 @@ impl AndroidEmulatorMcp {
             "activity": app.activity,
             "action": action.action_name(),
             "body_query": action.body_query(),
+            "request_id": request_id,
             "acknowledgment": acknowledgment,
             "artifacts": artifacts,
         }))
@@ -2612,10 +3457,50 @@ impl AndroidEmulatorMcp {
         serial: Option<&str>,
     ) -> Result<String, McpError> {
         if let Some(explicit) = serial.map(str::trim).filter(|value| !value.is_empty()) {
-            return Ok(explicit.to_string());
+            let devices = self.list_devices_internal(Some(explicit)).await?;
+            return resolve_explicit_ready_serial(explicit, &devices);
         }
         let devices = self.list_devices_internal(None).await?;
         resolve_serial_from_devices(None, &devices)
+    }
+
+    pub(crate) async fn resolve_android_execution_target(
+        &self,
+        target: Option<&AndroidExecutionTarget>,
+        serial_hint: Option<&str>,
+    ) -> Result<ResolvedAndroidExecutionTarget, McpError> {
+        let target_serial = target
+            .and_then(|target| target.device_serial.as_deref())
+            .map(str::trim)
+            .filter(|serial| !serial.is_empty());
+        let serial_hint = serial_hint
+            .map(str::trim)
+            .filter(|serial| !serial.is_empty());
+        if let (Some(target_serial), Some(serial_hint)) = (target_serial, serial_hint)
+            && target_serial != serial_hint
+        {
+            return Err(McpError::invalid_params(
+                "target.device_serial and serial must match when both are supplied",
+                None,
+            ));
+        }
+        let serial = self
+            .resolve_serial_for_tools(target_serial.or(serial_hint))
+            .await?;
+        let configured_app =
+            self.config
+                .interactive_session
+                .as_ref()
+                .map(|config| AndroidAppTarget {
+                    package_name: config.app_package.clone(),
+                    activity: Some(config.app_activity.clone()),
+                });
+        resolve_android_execution_target(
+            &self.config.execution_identity,
+            target,
+            serial,
+            configured_app,
+        )
     }
 
     async fn spawn_avd_process(&self, request: LaunchRequest) -> Result<EmulatorLaunch, McpError> {
@@ -2632,7 +3517,7 @@ impl AndroidEmulatorMcp {
                 .await?;
             None
         } else {
-            let stdout = std::fs::File::create(&log_path)
+            let stdout = create_new_artifact_file(&log_path)
                 .map_err(|err| McpError::internal_error(err.to_string(), None))?;
             let stderr = stdout
                 .try_clone()
@@ -2643,6 +3528,7 @@ impl AndroidEmulatorMcp {
                 .stdout(Stdio::from(stdout))
                 .stderr(Stdio::from(stderr))
                 .stdin(Stdio::null());
+            ensure_mutation_not_cancelled()?;
             command
                 .spawn()
                 .map_err(|err| McpError::internal_error(err.to_string(), None))?
@@ -2731,7 +3617,7 @@ impl AndroidEmulatorMcp {
             timestamp_filename(&sanitize_filename(&request.avd_name), None)
         );
         let absolute_log_path = absolute_path(log_path)?;
-        std::fs::File::create(&absolute_log_path)
+        create_new_artifact_file(&absolute_log_path)
             .map_err(|err| McpError::internal_error(err.to_string(), None))?;
         let mut command = Command::new("systemd-run");
         command.args([
@@ -2759,6 +3645,7 @@ impl AndroidEmulatorMcp {
         } else {
             command.arg(&self.config.emulator_path).args(emulator_args);
         }
+        ensure_mutation_not_cancelled()?;
         run_command_with_timeout(
             command,
             Duration::from_secs(DEFAULT_EMULATOR_COMMAND_TIMEOUT_SECS),
@@ -2773,18 +3660,10 @@ impl AndroidEmulatorMcp {
             return None;
         }
 
-        let discovered = discovery::grpc_endpoint_for_serial(serial);
-        match (self.config.emulator_grpc_port, discovered) {
-            (Some(port), Some(endpoint)) => Some(discovery::GrpcEndpoint {
-                port,
-                auth_token: endpoint.auth_token,
-            }),
-            (Some(port), None) => Some(discovery::GrpcEndpoint {
-                port,
-                auth_token: None,
-            }),
-            (None, discovered) => discovered,
-        }
+        select_serial_bound_grpc_endpoint(
+            self.config.emulator_grpc_port,
+            discovery::grpc_endpoint_for_serial(serial),
+        )
     }
 
     fn build_emulator_launch_command(&self, emulator_args: &[String]) -> Command {
@@ -2819,6 +3698,32 @@ impl AndroidEmulatorMcp {
         .await
     }
 
+    /// Run an ADB command while preserving a non-zero process result for a
+    /// caller that needs to inspect and recover from an expected ADB failure.
+    /// Spawn, wait, and timeout failures are still returned as MCP errors.
+    pub(crate) async fn run_adb_allow_failure<I, S>(
+        &self,
+        serial: &str,
+        args: I,
+    ) -> Result<CommandOutput, McpError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut argv = vec!["-s".to_string(), serial.to_string()];
+        argv.extend(args.into_iter().map(|value| value.as_ref().to_string()));
+        ensure_adb_mutation_not_cancelled(&argv[2..])?;
+        let mut command = Command::new(&self.config.adb_path);
+        command.args(&argv);
+        let output = run_command_with_timeout_allow_failure(
+            command,
+            Duration::from_secs(DEFAULT_ADB_COMMAND_TIMEOUT_SECS),
+            "adb command",
+        )
+        .await?;
+        Ok(command_output_from_process(output))
+    }
+
     async fn run_adb_with_timeout<I, S>(
         &self,
         serial: &str,
@@ -2831,6 +3736,7 @@ impl AndroidEmulatorMcp {
     {
         let mut argv = vec!["-s".to_string(), serial.to_string()];
         argv.extend(args.into_iter().map(|value| value.as_ref().to_string()));
+        ensure_adb_mutation_not_cancelled(&argv[2..])?;
         self.run_adb_raw_with_timeout(argv, timeout_duration).await
     }
 
@@ -2858,12 +3764,7 @@ impl AndroidEmulatorMcp {
             .collect::<Vec<_>>();
         let mut command = Command::new(&self.config.adb_path);
         command.args(&argv);
-        let output = run_command_with_timeout(
-            command,
-            timeout_duration,
-            &format!("adb {}", argv.join(" ")),
-        )
-        .await?;
+        let output = run_command_with_timeout(command, timeout_duration, "adb command").await?;
         Ok(command_output_from_process(output))
     }
 
@@ -2894,9 +3795,19 @@ impl AndroidEmulatorMcp {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        let mut argv = vec!["shell".to_string()];
-        argv.extend(args.into_iter().map(|value| value.as_ref().to_string()));
-        self.run_adb_with_timeout(serial, argv, timeout_duration)
+        let shell_args = args
+            .into_iter()
+            .map(|value| value.as_ref().to_string())
+            .collect::<Vec<_>>();
+        if adb_shell_command_mutates(&shell_args) {
+            ensure_mutation_not_cancelled()?;
+        }
+        let remote_command = shell_args
+            .iter()
+            .map(|value| shell_quote(value))
+            .collect::<Vec<_>>()
+            .join(" ");
+        self.run_adb_with_timeout(serial, ["shell", &remote_command], timeout_duration)
             .await
     }
 
@@ -2937,7 +3848,7 @@ impl AndroidEmulatorMcp {
         .await
     }
 
-    async fn window_state_internal_with_timeout(
+    pub(crate) async fn window_state_internal_with_timeout(
         &self,
         serial: &str,
         timeout_duration: Duration,
@@ -2959,11 +3870,77 @@ impl AndroidEmulatorMcp {
         Ok(parse_android_window_state(&window_output, &activity_output))
     }
 
+    async fn wait_for_orientation_rotation(
+        &self,
+        serial: &str,
+        expected_rotation: u8,
+        deadline: Instant,
+    ) -> Result<u8, McpError> {
+        let expected_rotation = expected_rotation % 4;
+        let mut last_observed: Option<u8> = None;
+        loop {
+            let remaining = remaining_until(deadline);
+            if remaining.is_zero() {
+                let observed = last_observed
+                    .map(|rotation| rotation.to_string())
+                    .unwrap_or_else(|| "none".to_string());
+                return Err(McpError::internal_error(
+                    format!(
+                        "timed out waiting for actual Android display rotation={expected_rotation}; last observed {observed}"
+                    ),
+                    None,
+                ));
+            }
+
+            let command_timeout =
+                remaining.min(Duration::from_secs(DEFAULT_ADB_COMMAND_TIMEOUT_SECS));
+            let rotation = self
+                .current_display_rotation(serial, command_timeout)
+                .await?;
+            last_observed = Some(rotation);
+            if rotation == expected_rotation {
+                return Ok(rotation);
+            }
+
+            let sleep_for = remaining_until(deadline).min(Duration::from_millis(100));
+            if !sleep_for.is_zero() {
+                sleep(sleep_for).await;
+            }
+        }
+    }
+
     async fn current_focus_internal(&self, serial: &str) -> Result<Option<String>, McpError> {
         Ok(self.window_state_internal(serial).await?.current_focus)
     }
 
+    async fn current_display_rotation(
+        &self,
+        serial: &str,
+        timeout: Duration,
+    ) -> Result<u8, McpError> {
+        let input = self
+            .adb_shell_output_with_timeout(serial, ["dumpsys", "input"], timeout)
+            .await?;
+        parse_default_display_rotation(&input).ok_or_else(|| {
+            McpError::internal_error(
+                "actual default-display rotation is unavailable from dumpsys input",
+                None,
+            )
+        })
+    }
+
     async fn display_size_internal(&self, serial: &str) -> Result<(u32, u32), McpError> {
+        let natural_size = self.natural_display_size_internal(serial).await?;
+        let rotation = self
+            .current_display_rotation(
+                serial,
+                Duration::from_secs(DEFAULT_ADB_COMMAND_TIMEOUT_SECS),
+            )
+            .await?;
+        Ok(rotated_display_size(natural_size, rotation))
+    }
+
+    async fn natural_display_size_internal(&self, serial: &str) -> Result<(u32, u32), McpError> {
         let output = self.adb_shell_output(serial, ["wm", "size"]).await?;
         parse_display_size(&output).ok_or_else(|| {
             McpError::internal_error(
@@ -2976,65 +3953,259 @@ impl AndroidEmulatorMcp {
         })
     }
 
+    async fn run_adb_pointer_with_deadline<I, S>(
+        &self,
+        serial: &str,
+        args: I,
+        deadline: Instant,
+        gesture_duration: Duration,
+        operation: &str,
+    ) -> Result<CommandOutput, McpError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let budget =
+            remaining_until(deadline).min(Duration::from_secs(DEFAULT_ADB_COMMAND_TIMEOUT_SECS));
+        if budget.is_zero() || budget < gesture_duration {
+            return Err(McpError::invalid_params(
+                format!(
+                    "android.input.{operation} has insufficient time remaining before dispatch"
+                ),
+                Some(json!({
+                    // A parent semantic action may already have handled a dialog
+                    // or completed an earlier gesture. Only this dispatch is known
+                    // not to have started; the whole action must not be replayed.
+                    "outcome": "rejected", "retry_safe": false, "do_not_replay": true,
+                    "next_mutation_dispatched": false,
+                })),
+            ));
+        }
+        self.run_adb_shell_with_timeout(serial, args, budget)
+            .await
+            .map_err(|error| {
+                if error
+                    .data
+                    .as_ref()
+                    .is_some_and(|data| data["outcome"] == "cancelled")
+                {
+                    error
+                } else {
+                    uncertain_mutation_error(operation, "adb", &error.to_string())
+                }
+            })
+    }
+
     async fn tap_point_internal(
         &self,
         serial: &str,
         x: u32,
         y: u32,
+        deadline: Instant,
     ) -> Result<ActionDispatch, McpError> {
-        if let Some(endpoint) = self.grpc_endpoint_for_serial(serial) {
-            match grpc_backend::send_tap(endpoint.port, endpoint.auth_token.as_deref(), x, y).await
-            {
-                Ok(()) => {
-                    return Ok(ActionDispatch {
-                        backend: "grpc",
-                        output: CommandOutput::default(),
-                        detail: None,
-                    });
-                }
-                Err(err) => {
-                    let output = self
-                        .run_adb_shell(serial, ["input", "tap", &x.to_string(), &y.to_string()])
-                        .await?;
-                    return Ok(ActionDispatch {
-                        backend: "adb",
-                        output,
-                        detail: Some(format!(
-                            "gRPC tap transport failed, fell back to adb: {err}"
-                        )),
-                    });
-                }
-            }
-        }
-
+        // Android input uses the same logical display coordinates as hierarchy
+        // bounds and screencap, including guest rotation and display overrides.
         let output = self
-            .run_adb_shell(serial, ["input", "tap", &x.to_string(), &y.to_string()])
+            .run_adb_pointer_with_deadline(
+                serial,
+                ["input", "tap", &x.to_string(), &y.to_string()],
+                deadline,
+                Duration::ZERO,
+                "tap",
+            )
             .await?;
         Ok(ActionDispatch {
             backend: "adb",
             output,
-            detail: None,
+            detail: Some("selected ADB input in guest logical coordinates".to_string()),
         })
     }
 
-    async fn tap_point_internal_adb(
+    async fn double_tap_point_internal(
         &self,
         serial: &str,
         x: u32,
         y: u32,
+        deadline: Instant,
     ) -> Result<ActionDispatch, McpError> {
+        let command = format!("input tap {x} {y} && sleep 0.08 && input tap {x} {y}");
+        // This fixed script is one gesture; do not cancel between its two taps.
+        ensure_mutation_not_cancelled()?;
         let output = self
-            .run_adb_shell(serial, ["input", "tap", &x.to_string(), &y.to_string()])
+            .run_adb_pointer_with_deadline(
+                serial,
+                ["sh", "-c", &command],
+                deadline,
+                Duration::from_millis(80),
+                "double_tap",
+            )
             .await?;
         Ok(ActionDispatch {
             backend: "adb",
             output,
-            detail: None,
+            detail: Some(
+                "sent both taps in guest logical coordinates through one ADB shell with an 80 ms interval"
+                    .to_string(),
+            ),
+        })
+    }
+
+    async fn long_press_point_internal(
+        &self,
+        serial: &str,
+        x: u32,
+        y: u32,
+        duration_ms: u64,
+        deadline: Instant,
+    ) -> Result<ActionDispatch, McpError> {
+        validate_gesture_duration(duration_ms)?;
+        let output = self
+            .run_adb_pointer_with_deadline(
+                serial,
+                [
+                    "input".to_string(),
+                    "swipe".to_string(),
+                    x.to_string(),
+                    y.to_string(),
+                    x.to_string(),
+                    y.to_string(),
+                    duration_ms.to_string(),
+                ],
+                deadline,
+                Duration::from_millis(duration_ms),
+                "long_press",
+            )
+            .await?;
+        Ok(ActionDispatch {
+            backend: "adb",
+            output,
+            detail: Some("sent long press as a zero-distance adb swipe".to_string()),
         })
     }
 
     async fn send_text_with_verification(
         &self,
+        request: VerifiedTextDispatchRequest<'_>,
+    ) -> Result<VerifiedTextDispatch, McpError> {
+        if grpc_backend::requires_clipboard_text(request.text) {
+            return self.send_clipboard_text_with_verification(request).await;
+        }
+        let VerifiedTextDispatchRequest {
+            serial,
+            text,
+            pre_text_nodes,
+            public_target_selector,
+            target_tracker,
+            target_selector,
+            wait_for_selector,
+            deadline,
+            hierarchy_filename,
+            replace_existing_text_on_adb,
+            existing_text_for_adb_replace,
+        } = request;
+        let dispatch = if replace_existing_text_on_adb {
+            self.send_text_replacing_via_adb_internal(serial, text, existing_text_for_adb_replace)
+                .await?
+        } else {
+            self.send_text_internal(serial, text).await?
+        };
+        let verification = self
+            .verify_text_outcome(TextVerificationRequest {
+                serial,
+                pre_text_nodes,
+                public_target_selector,
+                target_tracker,
+                target_selector,
+                expected_text: Some(text),
+                exact_editable_text: false,
+                wait_for_selector,
+                deadline,
+                hierarchy_filename: hierarchy_filename.clone(),
+            })
+            .await?;
+        Ok(VerifiedTextDispatch {
+            dispatch,
+            verification,
+            clipboard_restore: None,
+        })
+    }
+
+    async fn send_clipboard_text_with_verification(
+        &self,
+        request: VerifiedTextDispatchRequest<'_>,
+    ) -> Result<VerifiedTextDispatch, McpError> {
+        require_remaining_budget(request.deadline, "Clipboard text input")?;
+        ensure_mutation_not_cancelled()?;
+        if request.target_tracker.is_none() && request.target_selector.is_none() {
+            return Err(clipboard_text_capability_error(
+                "Clipboard text input requires an observable focused editable target",
+            ));
+        }
+        let target = clipboard_text_target(request.pre_text_nodes, None)?;
+        if !request
+            .target_tracker
+            .map(|tracker| tracker_matches_node(target, tracker))
+            .or_else(|| {
+                request
+                    .target_selector
+                    .map(|selector| selector_matches(target, selector))
+            })
+            .unwrap_or(false)
+        {
+            return Err(clipboard_text_capability_error(
+                "Clipboard text input could not confirm the requested focused editable target",
+            ));
+        }
+        if !request.replace_existing_text_on_adb && target.text.as_deref() == Some(request.text) {
+            return Err(clipboard_text_capability_error(
+                "Raw clipboard input cannot distinguish paste consumption from the field's existing matching text",
+            ));
+        }
+        let endpoint = self.grpc_endpoint_for_serial(request.serial).ok_or_else(|| {
+            clipboard_text_capability_error(
+                "Exact Unicode, control-character, and literal %s input requires a serial-bound emulator clipboard",
+            )
+        })?;
+        let mut transfer = match grpc_backend::begin_clipboard_transfer(
+            endpoint.port,
+            endpoint.auth_token.as_deref(),
+            request.text,
+        )
+        .await
+        {
+            Ok(transfer) => transfer,
+            Err(grpc_backend::GrpcMutationError::CancelledBeforeDispatch) => {
+                return Err(cancelled_mutation_error());
+            }
+            Err(grpc_backend::GrpcMutationError::BeforeDispatch(reason)) => {
+                return Err(McpError::internal_error(
+                    "Clipboard transfer could not start; no text was dispatched",
+                    Some(json!({
+                        "outcome": "provider_unavailable",
+                        "phase": "clipboard_preflight",
+                        "detail": reason,
+                        "next_mutation_dispatched": false,
+                        "retry_safe": false,
+                        "do_not_replay": true,
+                    })),
+                ));
+            }
+            Err(grpc_backend::GrpcMutationError::OutcomeUnknown(_)) => {
+                return Err(clipboard_text_failure(
+                    "clipboard_staging",
+                    false,
+                    false,
+                    "unknown",
+                ));
+            }
+        };
+        self.dispatch_staged_clipboard_text(&mut transfer, request)
+            .await
+    }
+
+    async fn dispatch_staged_clipboard_text(
+        &self,
+        transfer: &mut impl ClipboardTransferCleanup,
         request: VerifiedTextDispatchRequest<'_>,
     ) -> Result<VerifiedTextDispatch, McpError> {
         let VerifiedTextDispatchRequest {
@@ -3047,53 +4218,36 @@ impl AndroidEmulatorMcp {
             wait_for_selector,
             deadline,
             hierarchy_filename,
-            retry_with_adb_on_no_change,
             replace_existing_text_on_adb,
-            existing_text_for_adb_replace,
+            existing_text_for_adb_replace: _,
         } = request;
-        let dispatch = if replace_existing_text_on_adb {
-            self.send_text_replacing_via_adb_internal(serial, text, existing_text_for_adb_replace)
-                .await?
-        } else {
-            self.send_text_internal(serial, text).await?
-        };
-        let initial_verification_deadline = initial_text_verification_deadline(
-            dispatch.backend,
-            deadline,
-            retry_with_adb_on_no_change,
-        );
-        let verification = self
-            .verify_text_outcome(TextVerificationRequest {
-                serial,
-                pre_text_nodes,
-                public_target_selector,
-                target_tracker,
-                target_selector,
-                expected_text: Some(text),
-                wait_for_selector,
-                deadline: initial_verification_deadline,
-                hierarchy_filename: hierarchy_filename.clone(),
-            })
-            .await?;
-        if should_retry_text_with_adb(dispatch.backend, retry_with_adb_on_no_change, &verification)
-        {
-            if !has_meaningful_text_fallback_budget(deadline) {
-                let remaining_ms = remaining_until(deadline).as_millis();
-                return Ok(VerifiedTextDispatch {
-                    dispatch: ActionDispatch {
-                        backend: dispatch.backend,
-                        output: dispatch.output,
-                        detail: Some(format!(
-                            "gRPC text transport did not produce a verified UI change, but adb fallback was skipped because only {remaining_ms} ms remained: {}",
-                            text_verification_summary(&verification)
-                        )),
-                    },
-                    verification,
-                });
-            }
-            require_remaining_budget(deadline, "android.input.text adb fallback")?;
-            let retry_dispatch = self.send_text_via_adb_internal(serial, text).await?;
-            let retry_verification = self
+        let mut paste_attempted = false;
+        let mut text_verified = false;
+        let mut verification_evidence = None;
+        let mut verification_hierarchy = None;
+        // All exits after staging pass through explicit cleanup. Never put this
+        // mutation sequence in an outer timeout or choose another input lane.
+        let result = async {
+            let selection_output = if replace_existing_text_on_adb {
+                let budget = clipboard_mutation_budget(deadline)?;
+                self.run_adb_shell_with_timeout(
+                    serial,
+                    ["input", "keycombination", "CTRL_LEFT", "A"],
+                    budget,
+                )
+                .await
+                .map_err(|_| "selection_dispatch")?
+            } else {
+                CommandOutput::default()
+            };
+            let budget = clipboard_mutation_budget(deadline)?;
+            paste_attempted = true;
+            let paste_output = self
+                .run_adb_shell_with_timeout(serial, ["input", "keyevent", "KEYCODE_PASTE"], budget)
+                .await;
+            // A command acknowledgement cannot prove the app consumed paste.
+            // Observe even after an uncertain command result, without replay.
+            let verification = self
                 .verify_text_outcome(TextVerificationRequest {
                     serial,
                     pre_text_nodes,
@@ -3101,27 +4255,98 @@ impl AndroidEmulatorMcp {
                     target_tracker,
                     target_selector,
                     expected_text: Some(text),
+                    exact_editable_text: true,
                     wait_for_selector,
                     deadline,
                     hierarchy_filename,
                 })
-                .await?;
-            return Ok(VerifiedTextDispatch {
+                .await;
+            text_verified = verification
+                .as_ref()
+                .is_ok_and(|verification| verification.requested && verification.satisfied);
+            if let Ok(verification) = &verification {
+                let mut evidence = text_verification_json(verification);
+                if let Some(evidence) = evidence.as_object_mut() {
+                    // Clipboard diagnostics never expose text or selectors.
+                    evidence.remove("target_selector");
+                    evidence.remove("wait_for_selector");
+                }
+                verification_evidence = Some(evidence);
+                verification_hierarchy = verification.hierarchy_path.clone();
+            } else if let Err(error) = &verification
+                && let Some(data) = error.data.as_ref()
+            {
+                verification_evidence = data.get("text_verification").cloned();
+                verification_hierarchy = data
+                    .get("artifacts")
+                    .and_then(|artifacts| artifacts.get("post_text_hierarchy_path"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned);
+            }
+            let paste_output = paste_output.map_err(|_| "paste_dispatch")?;
+            let verification = verification.map_err(|_| "text_verification")?;
+            if !text_verified {
+                return Err("text_verification");
+            }
+            Ok(VerifiedTextDispatch {
                 dispatch: ActionDispatch {
-                    backend: retry_dispatch.backend,
-                    output: retry_dispatch.output,
-                    detail: Some(format!(
-                        "gRPC text transport did not produce a verified UI change, fell back to adb: {}",
-                        text_verification_summary(&verification)
-                    )),
+                    backend: "emulator_clipboard_adb",
+                    output: merge_command_outputs(selection_output, paste_output),
+                    detail: None,
                 },
-                verification: retry_verification,
-            });
+                verification,
+                clipboard_restore: None,
+            })
         }
-        Ok(VerifiedTextDispatch {
-            dispatch,
-            verification,
-        })
+        .await;
+
+        if paste_attempted && !text_verified {
+            // An app may defer its clipboard read, and ADB discards Android's
+            // input-injection success flag. Preserve the staged value through
+            // the original verification budget before bounded failure cleanup.
+            sleep(remaining_until(deadline)).await;
+        }
+        let restoration = transfer.restore_if_owned().await;
+        let failure = |phase, restoration_status| {
+            let mut error =
+                clipboard_text_failure(phase, paste_attempted, text_verified, restoration_status);
+            if let Some(data) = error
+                .data
+                .as_mut()
+                .and_then(serde_json::Value::as_object_mut)
+                && let Some(evidence) = verification_evidence.as_ref()
+            {
+                data.insert("text_verification".into(), evidence.clone());
+                data.insert(
+                    "artifacts".into(),
+                    json!({ "post_text_hierarchy_path": verification_hierarchy }),
+                );
+            }
+            error
+        };
+        let restoration_status = match restoration {
+            Ok(grpc_backend::ClipboardRestoreOutcome::Restored) => "restored",
+            Ok(grpc_backend::ClipboardRestoreOutcome::PreservedInterveningChange) => {
+                "preserved_intervening_change"
+            }
+            Err(_) => {
+                return Err(failure("clipboard_restore", "unknown"));
+            }
+        };
+        match result {
+            Ok(mut result) => {
+                let prefix = if replace_existing_text_on_adb {
+                    "selected the focused field once and pasted via emulator clipboard and exact-serial ADB"
+                } else {
+                    "pasted via emulator clipboard and exact-serial ADB"
+                };
+                result.dispatch.detail =
+                    Some(format!("{prefix}; clipboard cleanup: {restoration_status}"));
+                result.clipboard_restore = Some(restoration_status);
+                Ok(result)
+            }
+            Err(phase) => Err(failure(phase, restoration_status)),
+        }
     }
 
     async fn wait_for_stable_ui_internal(
@@ -3139,8 +4364,6 @@ impl AndroidEmulatorMcp {
         } = request;
         let started = Instant::now();
         let mut last_fingerprint: Option<String> = None;
-        let mut last_fast_fingerprint: Option<String> = None;
-        let mut use_fast_stability_backend: Option<bool> = None;
         let mut stable_polls = 0u32;
         let mut final_observation: Option<UiObservation> = None;
 
@@ -3149,34 +4372,6 @@ impl AndroidEmulatorMcp {
                 break;
             }
             let final_poll = remaining_until(deadline) <= poll_interval;
-            let fast_fingerprint = if use_fast_stability_backend == Some(false) {
-                None
-            } else {
-                self.capture_fast_ui_fingerprint_until_deadline(serial, deadline, None)
-                    .await?
-            };
-            if use_fast_stability_backend.is_none() {
-                use_fast_stability_backend = Some(fast_fingerprint.is_some());
-            }
-            if use_fast_stability_backend == Some(true) {
-                if let Some(fast_fingerprint) = fast_fingerprint {
-                    if last_fast_fingerprint.as_deref() == Some(fast_fingerprint.as_str()) {
-                        stable_polls += 1;
-                    } else {
-                        stable_polls = 1;
-                        last_fast_fingerprint = Some(fast_fingerprint);
-                    }
-                } else {
-                    use_fast_stability_backend = Some(false);
-                }
-                if use_fast_stability_backend == Some(true)
-                    && stable_polls < required_stable_polls
-                    && !final_poll
-                {
-                    sleep(poll_interval).await;
-                    continue;
-                }
-            }
             let Some(observation) = self
                 .capture_ui_observation_until_deadline(
                     serial,
@@ -3191,13 +4386,11 @@ impl AndroidEmulatorMcp {
             };
             let fingerprint =
                 ui_observation_fingerprint(&observation.hierarchy_xml, &observation.window_state);
-            if use_fast_stability_backend == Some(false) {
-                if last_fingerprint.as_deref() == Some(fingerprint.as_str()) {
-                    stable_polls += 1;
-                } else {
-                    stable_polls = 1;
-                    last_fingerprint = Some(fingerprint);
-                }
+            if last_fingerprint.as_deref() == Some(fingerprint.as_str()) {
+                stable_polls += 1;
+            } else {
+                stable_polls = 1;
+                last_fingerprint = Some(fingerprint);
             }
             final_observation = Some(observation);
             if stable_polls >= required_stable_polls {
@@ -3231,44 +4424,17 @@ impl AndroidEmulatorMcp {
         serial: &str,
         text: &str,
     ) -> Result<ActionDispatch, McpError> {
-        if let Some(endpoint) = self.grpc_endpoint_for_serial(serial) {
-            match grpc_backend::send_text(endpoint.port, endpoint.auth_token.as_deref(), text).await
-            {
-                Ok(()) => {
-                    return Ok(ActionDispatch {
-                        backend: "grpc",
-                        output: CommandOutput::default(),
-                        detail: None,
-                    });
-                }
-                Err(err) => {
-                    let fallback = self.send_text_via_adb_internal(serial, text).await?;
-                    return Ok(ActionDispatch {
-                        backend: fallback.backend,
-                        output: fallback.output,
-                        detail: Some(format!(
-                            "gRPC text transport failed, fell back to adb: {err}"
-                        )),
-                    });
-                }
-            }
-        }
-
-        self.send_text_via_adb_internal(serial, text).await
-    }
-
-    async fn send_text_via_adb_internal(
-        &self,
-        serial: &str,
-        text: &str,
-    ) -> Result<ActionDispatch, McpError> {
+        // Emulator keyboard acknowledgement does not establish text delivery.
+        // Select ADB for printable ASCII before dispatch; Unicode and other
+        // lossy keyboard cases use the verified clipboard lane above.
+        validate_adb_text(text)?;
         let output = self
             .run_adb_shell(serial, ["input", "text", &escape_adb_text(text)])
             .await?;
         Ok(ActionDispatch {
             backend: "adb",
             output,
-            detail: None,
+            detail: Some("selected ADB text input for printable ASCII".to_string()),
         })
     }
 
@@ -3278,29 +4444,12 @@ impl AndroidEmulatorMcp {
         text: &str,
         existing_text: Option<&str>,
     ) -> Result<ActionDispatch, McpError> {
-        let selection_output = match self
+        // Validate the chosen transport before select-all changes device state.
+        validate_adb_text(text)?;
+        let _ = existing_text;
+        let selection_output = self
             .run_adb_shell(serial, ["input", "keycombination", "CTRL_LEFT", "A"])
-            .await
-        {
-            Ok(output) => output,
-            Err(selection_error) => {
-                self.clear_focused_text_via_delete_fallback(serial, existing_text)
-                    .await?;
-                let replacement_output = self
-                    .send_replacement_text_after_selection(serial, text)
-                    .await?;
-                return Ok(ActionDispatch {
-                    backend: replacement_output.backend,
-                    output: replacement_output.output,
-                    detail: Some(merge_dispatch_detail(
-                        format!(
-                            "replaced focused field contents via adb delete fallback after select-all failed: {selection_error}"
-                        ),
-                        replacement_output.detail.as_deref(),
-                    )),
-                });
-            }
-        };
+            .await?;
 
         let replacement_output = self
             .send_replacement_text_after_selection(serial, text)
@@ -3313,20 +4462,6 @@ impl AndroidEmulatorMcp {
                 replacement_output.detail.as_deref(),
             )),
         })
-    }
-
-    async fn clear_focused_text_via_delete_fallback(
-        &self,
-        serial: &str,
-        existing_text: Option<&str>,
-    ) -> Result<(), McpError> {
-        self.run_adb_shell(serial, ["input", "keyevent", "KEYCODE_MOVE_END"])
-            .await?;
-        for _ in 0..fallback_clear_delete_count(existing_text) {
-            self.run_adb_shell(serial, ["input", "keyevent", "KEYCODE_DEL"])
-                .await?;
-        }
-        Ok(())
     }
 
     async fn send_replacement_text_after_selection(
@@ -3352,75 +4487,152 @@ impl AndroidEmulatorMcp {
     async fn swipe_points_internal(
         &self,
         serial: &str,
-        x1: u32,
-        y1: u32,
-        x2: u32,
-        y2: u32,
+        start: (u32, u32),
+        end: (u32, u32),
         duration_ms: u64,
+        deadline: Instant,
     ) -> Result<ActionDispatch, McpError> {
-        if let Some(endpoint) = self.grpc_endpoint_for_serial(serial) {
-            match grpc_backend::send_swipe(
-                endpoint.port,
-                endpoint.auth_token.as_deref(),
-                x1,
-                y1,
-                x2,
-                y2,
-                duration_ms,
-            )
-            .await
-            {
-                Ok(()) => {
-                    return Ok(ActionDispatch {
-                        backend: "grpc",
-                        output: CommandOutput::default(),
-                        detail: None,
-                    });
-                }
-                Err(err) => {
-                    let output = self
-                        .run_adb_shell(
-                            serial,
-                            [
-                                "input",
-                                "swipe",
-                                &x1.to_string(),
-                                &y1.to_string(),
-                                &x2.to_string(),
-                                &y2.to_string(),
-                                &duration_ms.to_string(),
-                            ],
-                        )
-                        .await?;
-                    return Ok(ActionDispatch {
-                        backend: "adb",
-                        output,
-                        detail: Some(format!(
-                            "gRPC swipe transport failed, fell back to adb: {err}"
-                        )),
-                    });
-                }
-            }
-        }
-
+        validate_gesture_duration(duration_ms)?;
         let output = self
-            .run_adb_shell(
+            .run_adb_pointer_with_deadline(
                 serial,
                 [
                     "input",
                     "swipe",
-                    &x1.to_string(),
-                    &y1.to_string(),
-                    &x2.to_string(),
-                    &y2.to_string(),
+                    &start.0.to_string(),
+                    &start.1.to_string(),
+                    &end.0.to_string(),
+                    &end.1.to_string(),
                     &duration_ms.to_string(),
                 ],
+                deadline,
+                Duration::from_millis(duration_ms),
+                "swipe",
             )
             .await?;
         Ok(ActionDispatch {
             backend: "adb",
             output,
-            detail: None,
+            detail: Some("selected ADB swipe in guest logical coordinates".to_string()),
+        })
+    }
+
+    async fn multi_touch_internal(
+        &self,
+        serial: &str,
+        pointers: &[MultiTouchPointer],
+        duration_ms: u64,
+        expected_display_size: (u32, u32),
+        deadline: Instant,
+    ) -> Result<ActionDispatch, McpError> {
+        let Some(endpoint) = self.grpc_endpoint_for_serial(serial) else {
+            return Err(multi_touch_capability_error(
+                "a serial-bound emulator gRPC endpoint is required",
+            ));
+        };
+        let panel_size = timeout(
+            require_remaining_budget(deadline, "multi-touch panel preflight")?,
+            grpc_backend::default_panel_size(endpoint.port, endpoint.auth_token.as_deref()),
+        )
+        .await
+        .map_err(|_| multi_touch_capability_error("emulator panel query timed out"))?
+        .map_err(|detail| multi_touch_capability_error(&detail))?;
+        let wm_size = self
+            .adb_shell_output_with_timeout(
+                serial,
+                ["wm", "size"],
+                require_remaining_budget(deadline, "multi-touch wm size")?,
+            )
+            .await?;
+        let input = self
+            .adb_shell_output_with_timeout(
+                serial,
+                ["dumpsys", "input"],
+                require_remaining_budget(deadline, "multi-touch input geometry")?,
+            )
+            .await?;
+        let geometry =
+            grpc_backend::LogicalTouchGeometry::from_diagnostics(panel_size, &wm_size, &input)
+                .map_err(multi_touch_capability_error)?;
+        if geometry.logical_size() != expected_display_size {
+            return Err(multi_touch_capability_error(
+                "logical display changed during gesture preflight; observe again",
+            ));
+        }
+        let paths = pointers
+            .iter()
+            .map(|pointer| {
+                let (x1, y1) = geometry
+                    .panel_point(pointer.x1, pointer.y1)
+                    .map_err(multi_touch_capability_error)?;
+                let (x2, y2) = geometry
+                    .panel_point(pointer.x2, pointer.y2)
+                    .map_err(multi_touch_capability_error)?;
+                Ok(grpc_backend::MultiTouchPath { x1, y1, x2, y2 })
+            })
+            .collect::<Result<Vec<_>, McpError>>()?;
+        let confirmed_wm_size = self
+            .adb_shell_output_with_timeout(
+                serial,
+                ["wm", "size"],
+                require_remaining_budget(deadline, "multi-touch geometry confirmation")?,
+            )
+            .await?;
+        let confirmed_input = self
+            .adb_shell_output_with_timeout(
+                serial,
+                ["dumpsys", "input"],
+                require_remaining_budget(deadline, "multi-touch input confirmation")?,
+            )
+            .await?;
+        let confirmed = grpc_backend::LogicalTouchGeometry::from_diagnostics(
+            panel_size,
+            &confirmed_wm_size,
+            &confirmed_input,
+        )
+        .map_err(multi_touch_capability_error)?;
+        if confirmed != geometry {
+            return Err(multi_touch_capability_error(
+                "display changed before gesture dispatch; observe again",
+            ));
+        }
+        let remaining = require_remaining_budget(deadline, "android.input.multi_touch dispatch")?;
+        if remaining < Duration::from_millis(duration_ms) {
+            return Err(McpError::internal_error(
+                format!(
+                    "android.input.multi_touch timeout budget is shorter than the {duration_ms} ms gesture"
+                ),
+                None,
+            ));
+        }
+        // The backend owns the movement and release sequence. Do not wrap this
+        // future in an outer timeout: cancellation between frames could strand
+        // active pointers before the guaranteed release attempt runs.
+        grpc_backend::send_multi_touch_with_deadline(
+            endpoint.port,
+            endpoint.auth_token.as_deref(),
+            &paths,
+            duration_ms,
+            deadline,
+        )
+        .await
+        .map_err(|err| match err {
+            grpc_backend::GrpcMutationError::CancelledBeforeDispatch => cancelled_mutation_error(),
+            grpc_backend::GrpcMutationError::BeforeDispatch(detail) => {
+                multi_touch_capability_error(&detail)
+            }
+            grpc_backend::GrpcMutationError::OutcomeUnknown(detail) => {
+                uncertain_mutation_error("multi_touch", "grpc", &detail)
+            }
+        })?;
+
+        Ok(ActionDispatch {
+            backend: "grpc",
+            output: CommandOutput::default(),
+            detail: Some(format!(
+                "dispatched all pointers through emulator gRPC after verifying full-panel geometry and mapping logical rotation {} to panel coordinates",
+                geometry.rotation()
+            )),
         })
     }
 
@@ -3430,15 +4642,57 @@ impl AndroidEmulatorMcp {
         filename: Option<String>,
         extension: Option<&str>,
     ) -> Result<PathBuf, McpError> {
-        let dir = self.config.artifact_dir.join(group);
-        fs::create_dir_all(&dir)
-            .await
-            .map_err(|err| McpError::internal_error(err.to_string(), None))?;
-        let name = filename
+        if let Some(name) = filename.as_deref() {
+            ensure_public_artifact_path(Path::new(name))?;
+        }
+        let dir = ensure_artifact_directory(&self.config.artifact_dir, group).await?;
+        ensure_artifact_store_capacity(
+            &self.config.artifact_dir,
+            0,
+            MAX_ARTIFACT_STORE_BYTES,
+            MAX_ARTIFACT_STORE_FILES,
+        )
+        .await?;
+        let label = filename
             .as_deref()
             .and_then(|value| normalize_artifact_name(value, extension))
-            .unwrap_or_else(|| timestamp_filename(group, extension));
-        Ok(dir.join(name))
+            .unwrap_or_else(|| group.to_string());
+        let label_path = Path::new(&label);
+        let stem = label_path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("artifact");
+        let extension =
+            extension.or_else(|| label_path.extension().and_then(|value| value.to_str()));
+        Ok(dir.join(timestamp_filename(stem, extension)))
+    }
+
+    async fn write_artifact_bytes(&self, path: &Path, bytes: &[u8]) -> Result<(), McpError> {
+        write_public_artifact(&self.config.artifact_dir, path, bytes).await
+    }
+
+    async fn resolve_artifact_read_path(&self, requested_path: &str) -> Result<PathBuf, McpError> {
+        let trimmed = requested_path.trim();
+        if trimmed.is_empty() {
+            return Err(McpError::invalid_params("path must not be empty", None));
+        }
+        ensure_public_artifact_path(Path::new(trimmed))?;
+
+        let cwd = std::env::current_dir()
+            .map_err(|err| McpError::internal_error(err.to_string(), None))?;
+        let artifact_root = if self.config.artifact_dir.is_absolute() {
+            self.config.artifact_dir.clone()
+        } else {
+            cwd.join(&self.config.artifact_dir)
+        };
+        let requested = PathBuf::from(trimmed);
+        let candidate = if requested.is_absolute() {
+            requested
+        } else {
+            cwd.join(requested)
+        };
+
+        resolve_public_artifact_path(&artifact_root, &candidate).await
     }
 
     async fn launch_solarlab_app(
@@ -3484,6 +4738,7 @@ impl AndroidEmulatorMcp {
         app: &SolarLabAppArgs,
         action: &str,
         body_query: Option<&str>,
+        request_id: &str,
     ) -> Result<(), McpError> {
         let mut adb_args = vec![
             "am".to_string(),
@@ -3499,6 +4754,9 @@ impl AndroidEmulatorMcp {
             "--es".to_string(),
             "com.sednalabs.solarlab.extra.SEMANTIC_COMMAND".to_string(),
             action.to_string(),
+            "--es".to_string(),
+            SOLARLAB_SEMANTIC_REQUEST_ID_EXTRA.to_string(),
+            request_id.to_string(),
         ];
         if let Some(body_query) = body_query {
             adb_args.extend([
@@ -3516,6 +4774,7 @@ impl AndroidEmulatorMcp {
         &self,
         serial: &str,
         action: &SolarLabSemanticCommand,
+        request_id: &str,
     ) -> Result<Option<SolarLabSemanticAck>, McpError> {
         let matcher = match action {
             SolarLabSemanticCommand::ResetCamera => return Ok(None),
@@ -3535,10 +4794,14 @@ impl AndroidEmulatorMcp {
                 .await
                 .map_err(|err| McpError::internal_error(err.to_string(), None))?;
             let observed_ui_dump = path.display().to_string();
-            if solarlab_semantic_ack_matches(action, &hierarchy) {
+            if solarlab_semantic_ack_matches(action, &hierarchy, Some(request_id)) {
                 return Ok(Some(SolarLabSemanticAck {
                     acknowledged: true,
                     matcher: matcher.description.clone(),
+                    request_id: Some(request_id.to_string()),
+                    resolved_body_id: solarlab_semantic_resolved_body_id(
+                        action, &hierarchy, request_id,
+                    ),
                     observed_ui_dump,
                 }));
             }
@@ -3546,6 +4809,8 @@ impl AndroidEmulatorMcp {
                 return Ok(Some(SolarLabSemanticAck {
                     acknowledged: false,
                     matcher: matcher.description,
+                    request_id: Some(request_id.to_string()),
+                    resolved_body_id: None,
                     observed_ui_dump,
                 }));
             }
@@ -3559,12 +4824,9 @@ impl AndroidEmulatorMcp {
         scenario: &str,
         step: &str,
     ) -> Result<serde_json::Value, McpError> {
-        let (screenshot, screenshot_backend) = {
-            let (path, backend, _screenshot_bytes) = self
-                .capture_screenshot_internal(serial, format!("{scenario}-{step}.png"))
-                .await?;
-            (path, backend)
-        };
+        let (screenshot, screenshot_backend) = self
+            .capture_screenshot_internal(serial, format!("{scenario}-{step}.png"))
+            .await?;
         let ui_dump = self
             .dump_ui_hierarchy_internal(serial, format!("{scenario}-{step}.xml"))
             .await?;
@@ -3596,9 +4858,8 @@ impl AndroidEmulatorMcp {
         let path = self
             .artifact_path("logcat", Some(filename), Some("txt"))
             .await?;
-        fs::write(&path, &output.stdout)
-            .await
-            .map_err(|err| McpError::internal_error(err.to_string(), None))?;
+        self.write_artifact_bytes(&path, output.stdout.as_bytes())
+            .await?;
         Ok(path)
     }
 
@@ -3607,20 +4868,16 @@ impl AndroidEmulatorMcp {
         scenario: &str,
         manifest: &serde_json::Value,
     ) -> Result<(PathBuf, PathBuf), McpError> {
-        let bundle_dir = self
-            .config
-            .artifact_dir
-            .join("scenario-bundles")
-            .join(timestamp_filename(&sanitize_filename(scenario), None));
-        fs::create_dir_all(&bundle_dir)
-            .await
-            .map_err(|err| McpError::internal_error(err.to_string(), None))?;
+        let relative_dir = format!(
+            "scenario-bundles/{}",
+            timestamp_filename(&sanitize_filename(scenario), None)
+        );
+        let bundle_dir =
+            ensure_artifact_directory(&self.config.artifact_dir, &relative_dir).await?;
         let manifest_path = bundle_dir.join("manifest.json");
         let bytes = serde_json::to_vec_pretty(manifest)
             .map_err(|err| McpError::internal_error(err.to_string(), None))?;
-        fs::write(&manifest_path, bytes)
-            .await
-            .map_err(|err| McpError::internal_error(err.to_string(), None))?;
+        self.write_artifact_bytes(&manifest_path, &bytes).await?;
         Ok((bundle_dir, manifest_path))
     }
 
@@ -3678,7 +4935,7 @@ impl AndroidEmulatorMcp {
         &self,
         serial: &str,
         filename: String,
-    ) -> Result<(PathBuf, &'static str, Vec<u8>), McpError> {
+    ) -> Result<(PathBuf, &'static str), McpError> {
         self.capture_screenshot_internal_with_timeout(
             serial,
             filename,
@@ -3692,20 +4949,13 @@ impl AndroidEmulatorMcp {
         serial: &str,
         filename: String,
         timeout_duration: Duration,
-    ) -> Result<(PathBuf, &'static str, Vec<u8>), McpError> {
+    ) -> Result<(PathBuf, &'static str), McpError> {
         let path = self
             .artifact_path("screenshots", Some(filename), Some("png"))
             .await?;
-        if let Some(endpoint) = self.grpc_endpoint_for_serial(serial)
-            && let Ok(png_bytes) =
-                grpc_backend::capture_screenshot_png(endpoint.port, endpoint.auth_token.as_deref())
-                    .await
-        {
-            fs::write(&path, &png_bytes)
-                .await
-                .map_err(|err| McpError::internal_error(err.to_string(), None))?;
-            return Ok((path, "grpc", png_bytes));
-        }
+        // Emulator screenshots use sensor orientation, which can disagree with
+        // guest user_rotation. ADB captures the logical display used by UI
+        // hierarchy bounds and ordinary pointer input. Select it before capture.
         let mut command = Command::new(&self.config.adb_path);
         command
             .arg("-s")
@@ -3717,11 +4967,9 @@ impl AndroidEmulatorMcp {
             &format!("adb -s {serial} exec-out screencap -p"),
         )
         .await?;
-        let png_bytes = output.stdout;
-        fs::write(&path, &png_bytes)
-            .await
-            .map_err(|err| McpError::internal_error(err.to_string(), None))?;
-        Ok((path, "adb", png_bytes))
+        crate::workflow::png_dimensions(&output.stdout)?;
+        self.write_artifact_bytes(&path, &output.stdout).await?;
+        Ok((path, "adb"))
     }
 
     async fn dump_ui_hierarchy_internal(
@@ -3757,14 +5005,21 @@ impl AndroidEmulatorMcp {
         {
             Ok(output) => {
                 if let Some(xml) = extract_uiautomator_hierarchy_xml(&output.stdout) {
-                    fs::write(&local_path, xml)
-                        .await
-                        .map_err(|err| McpError::internal_error(err.to_string(), None))?;
+                    self.write_artifact_bytes(&local_path, xml.as_bytes())
+                        .await?;
                     return Ok(local_path);
                 }
             }
             Err(error) if is_exec_out_uiautomator_supported_failure(&error) => {}
             Err(error) => return Err(error),
+        }
+
+        let stream_error = self
+            .dump_ui_hierarchy_via_shell_stream(serial, &local_path, deadline)
+            .await
+            .err();
+        if stream_error.is_none() {
+            return Ok(local_path);
         }
 
         let remote_path = remote_ui_dump_path();
@@ -3789,25 +5044,34 @@ impl AndroidEmulatorMcp {
                 .run_adb_with_timeout(
                     serial,
                     [
-                        "pull".to_string(),
+                        "exec-out".to_string(),
+                        "cat".to_string(),
                         remote_path.clone(),
-                        local_path.display().to_string(),
                     ],
                     pull_timeout,
                 )
                 .await
             {
-                Ok(_) => {
+                Ok(output) => {
+                    let xml =
+                        extract_uiautomator_hierarchy_xml(&output.stdout).ok_or_else(|| {
+                            McpError::internal_error(
+                                "UI hierarchy file did not contain complete XML",
+                                None,
+                            )
+                        })?;
+                    self.write_artifact_bytes(&local_path, xml.as_bytes())
+                        .await?;
                     let _ = self.run_adb_shell(serial, ["rm", "-f", &remote_path]).await;
                     return Ok(local_path);
                 }
-                Err(error)
-                    if should_retry_ui_dump_pull(&error)
-                        && attempt + 1 < UI_DUMP_PULL_MAX_ATTEMPTS =>
-                {
+                Err(error) if should_retry_ui_dump_pull(&error) => {
                     last_pull_error = Some(error);
                     remove_artifact_if_exists(Some(local_path.display().to_string())).await;
                     let _ = self.run_adb_shell(serial, ["rm", "-f", &remote_path]).await;
+                    if attempt + 1 >= UI_DUMP_PULL_MAX_ATTEMPTS {
+                        break;
+                    }
                     if let Some(deadline) = deadline {
                         let retry_delay = Duration::from_millis(UI_DUMP_PULL_RETRY_DELAY_MS)
                             .min(remaining_until(deadline));
@@ -3827,68 +5091,68 @@ impl AndroidEmulatorMcp {
         }
 
         let _ = self.run_adb_shell(serial, ["rm", "-f", &remote_path]).await;
-        Err(last_pull_error.unwrap_or_else(|| {
+        Err(ui_hierarchy_capture_error(last_pull_error, stream_error))
+    }
+
+    async fn dump_ui_hierarchy_via_shell_stream(
+        &self,
+        serial: &str,
+        local_path: &Path,
+        deadline: Option<Instant>,
+    ) -> Result<(), McpError> {
+        let mut last_error: Option<McpError> = None;
+
+        for attempt in 0..UI_DUMP_PULL_MAX_ATTEMPTS {
+            let remote_path = remote_ui_dump_path();
+            let timeout = deadline
+                .map(|deadline| require_remaining_budget(deadline, "UI hierarchy stream"))
+                .transpose()?
+                .unwrap_or(Duration::from_secs(DEFAULT_ADB_COMMAND_TIMEOUT_SECS));
+            let script = ui_dump_shell_stream_script(&remote_path);
+
+            match self
+                .run_adb_shell_with_timeout(serial, ["sh", "-c", &script], timeout)
+                .await
+            {
+                Ok(output) => {
+                    if let Some(xml) = extract_uiautomator_hierarchy_xml(&output.stdout) {
+                        self.write_artifact_bytes(local_path, xml.as_bytes())
+                            .await?;
+                        return Ok(());
+                    }
+                    last_error = Some(McpError::internal_error(
+                        "UI hierarchy stream completed without hierarchy XML",
+                        None,
+                    ));
+                }
+                Err(error) if should_retry_ui_dump_pull(&error) => {
+                    last_error = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+
+            remove_artifact_if_exists(Some(local_path.display().to_string())).await;
+            if attempt + 1 >= UI_DUMP_PULL_MAX_ATTEMPTS {
+                break;
+            }
+            if let Some(deadline) = deadline {
+                let retry_delay = Duration::from_millis(UI_DUMP_PULL_RETRY_DELAY_MS)
+                    .min(remaining_until(deadline));
+                if retry_delay.is_zero() {
+                    break;
+                }
+                sleep(retry_delay).await;
+            } else {
+                sleep(Duration::from_millis(UI_DUMP_PULL_RETRY_DELAY_MS)).await;
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
             McpError::internal_error(
-                "UI hierarchy dump pull failed without a captured adb error",
+                "UI hierarchy stream failed without a captured adb error",
                 None,
             )
         }))
-    }
-
-    async fn capture_fast_ui_fingerprint_with_timeout(
-        &self,
-        serial: &str,
-        timeout_duration: Duration,
-        target_package: Option<&str>,
-    ) -> Result<String, McpError> {
-        let mut command = Command::new(&self.config.adb_path);
-        command.arg("-s").arg(serial).args([
-            "exec-out",
-            "cmd",
-            "window",
-            "dump-visible-window-views",
-        ]);
-        let output = run_command_with_timeout(
-            command,
-            timeout_duration,
-            &format!("adb -s {serial} exec-out cmd window dump-visible-window-views"),
-        )
-        .await?;
-        let fingerprint = match target_package {
-            Some(target_package) => normalized_visible_window_dump_fingerprint_for_package(
-                &output.stdout,
-                Some(target_package),
-            ),
-            None => normalized_visible_window_dump_fingerprint(&output.stdout),
-        };
-        fingerprint.map_err(|error| {
-            McpError::internal_error(
-                format!("failed to normalize visible-window dump fingerprint: {error}"),
-                None,
-            )
-        })
-    }
-
-    pub(crate) async fn capture_fast_ui_fingerprint_until_deadline(
-        &self,
-        serial: &str,
-        deadline: Instant,
-        target_package: Option<&str>,
-    ) -> Result<Option<String>, McpError> {
-        if !has_meaningful_fast_ui_fingerprint_budget(deadline) {
-            return Ok(None);
-        }
-        let timeout_duration = require_remaining_budget(
-            fast_ui_fingerprint_deadline(deadline),
-            "fast visible-window dump",
-        )?;
-        match self
-            .capture_fast_ui_fingerprint_with_timeout(serial, timeout_duration, target_package)
-            .await
-        {
-            Ok(fingerprint) => Ok(Some(fingerprint)),
-            Err(_) => Ok(None),
-        }
     }
 
     async fn capture_ui_observation(
@@ -3950,21 +5214,21 @@ impl AndroidEmulatorMcp {
             .await
             .map_err(|err| McpError::internal_error(err.to_string(), None))?;
         let nodes = parse_ui_nodes_from_xml(&hierarchy_xml)?;
-        let (screenshot_path, screenshot_backend, screenshot_bytes) = if include_screenshot {
+        let (screenshot_path, screenshot_backend) = if include_screenshot {
             let screenshot_timeout = deadline
                 .map(|deadline| require_remaining_budget(deadline, "screenshot capture"))
                 .transpose()?
                 .unwrap_or(Duration::from_secs(DEFAULT_ADB_COMMAND_TIMEOUT_SECS));
-            let (path, backend, bytes) = self
+            let (path, backend) = self
                 .capture_screenshot_internal_with_timeout(
                     serial,
                     screenshot_filename,
                     screenshot_timeout,
                 )
                 .await?;
-            (Some(path), Some(backend), Some(bytes))
+            (Some(path), Some(backend))
         } else {
-            (None, None, None)
+            (None, None)
         };
         let window_state_timeout = deadline
             .map(|deadline| require_remaining_budget(deadline, "window-state capture"))
@@ -3979,7 +5243,6 @@ impl AndroidEmulatorMcp {
             nodes,
             screenshot_path,
             screenshot_backend,
-            screenshot_bytes,
             window_state,
         })
     }
@@ -3989,6 +5252,39 @@ impl AndroidEmulatorMcp {
         serial: &str,
         ui_path: &Path,
         nodes: &[NormalizedUiNode],
+        deadline: Option<Instant>,
+    ) -> Result<SystemDialogCheck, McpError> {
+        self.check_system_dialog_with_deadline(serial, ui_path, nodes, deadline, true, false)
+            .await
+    }
+
+    pub(crate) async fn check_postcondition_system_dialog(
+        &self,
+        serial: &str,
+        ui_path: &Path,
+        nodes: &[NormalizedUiNode],
+        deadline: Instant,
+        allow_anr_wait: bool,
+    ) -> Result<SystemDialogCheck, McpError> {
+        self.check_system_dialog_with_deadline(
+            serial,
+            ui_path,
+            nodes,
+            Some(deadline),
+            allow_anr_wait,
+            true,
+        )
+        .await
+    }
+
+    async fn check_system_dialog_with_deadline(
+        &self,
+        serial: &str,
+        ui_path: &Path,
+        nodes: &[NormalizedUiNode],
+        deadline: Option<Instant>,
+        allow_action: bool,
+        restrict_to_anr: bool,
     ) -> Result<SystemDialogCheck, McpError> {
         let labels = labels_from_nodes(nodes);
         if labels.is_empty() {
@@ -3998,22 +5294,62 @@ impl AndroidEmulatorMcp {
         let Some(plan) = classify_system_dialog(&labels) else {
             return Ok(SystemDialogCheck::None);
         };
-        if let Some(label) = plan.action_label
-            && let Ok(button) = find_ui_node_by_label(ui_path, label)
+        if restrict_to_anr && plan.kind != "anr" {
+            // Other dialogs may themselves be the requested selector. Preserve
+            // their normal verification without granting permissions or closing.
+            return Ok(SystemDialogCheck::None);
+        }
+        let action = if !allow_action {
+            None
+        } else if restrict_to_anr {
+            // Verification may recover only Android's real ANR Wait button.
+            // It must never grant permissions or choose a destructive button.
+            postcondition_anr_wait_button(&plan, nodes).and_then(|node| {
+                node.bounds
+                    .map(|bounds| (bounds.center(), node.resource_id.clone()))
+            })
+        } else {
+            plan.action_label.and_then(|label| {
+                let button = find_ui_node_by_label(ui_path, label).ok()?;
+                let action_resource_id = matching_nodes(
+                    nodes,
+                    &UiSelector {
+                        text: Some(label.to_string()),
+                        ..UiSelector::default()
+                    },
+                )
+                .matches
+                .into_iter()
+                .next()
+                .and_then(|node| node.resource_id);
+                Some((button.bounds.center(), action_resource_id))
+            })
+        };
+        if let Some(((x, y), action_resource_id)) = action
+            && let Some(label) = plan.action_label
+            && deadline.is_none_or(|deadline| Instant::now() < deadline)
         {
-            let (x, y) = button.bounds.center();
-            self.tap_point_internal(serial, x, y).await?;
-            sleep(if plan.kind == "anr" {
+            // Bound dispatch by the action budget and never replay an uncertain tap.
+            self.tap_point_internal(
+                serial,
+                x,
+                y,
+                deadline.unwrap_or_else(|| tool_deadline(None, DEFAULT_ADB_COMMAND_TIMEOUT_SECS)),
+            )
+            .await?;
+            let settle = if plan.kind == "anr" {
                 Duration::from_secs(2)
             } else {
                 Duration::from_millis(750)
-            })
-            .await;
+            };
+            sleep(deadline.map_or(settle, |deadline| settle.min(remaining_until(deadline)))).await;
             return Ok(SystemDialogCheck::Handled(SystemDialogReport {
                 detected: true,
                 kind: plan.kind.to_string(),
                 labels,
                 action_taken: Some(format!("tap:{label}")),
+                action_label: Some(label.to_string()),
+                action_resource_id,
                 artifact_path,
             }));
         }
@@ -4022,6 +5358,8 @@ impl AndroidEmulatorMcp {
             kind: plan.kind.to_string(),
             labels,
             action_taken: None,
+            action_label: plan.action_label.map(str::to_string),
+            action_resource_id: None,
             artifact_path,
         }))
     }
@@ -4039,7 +5377,10 @@ impl AndroidEmulatorMcp {
                 )
                 .await?;
             let nodes = parse_ui_nodes_from_path(&ui_path)?;
-            match self.check_system_dialog(serial, &ui_path, &nodes).await? {
+            match self
+                .check_system_dialog(serial, &ui_path, &nodes, None)
+                .await?
+            {
                 SystemDialogCheck::Handled(_) => continue,
                 SystemDialogCheck::Blocked(report) => {
                     return Err(McpError::internal_error(
@@ -4055,7 +5396,13 @@ impl AndroidEmulatorMcp {
             }
             let node = find_ui_node_by_label(&ui_path, label)?;
             let (x, y) = node.bounds.center();
-            self.tap_point_internal(serial, x, y).await?;
+            self.tap_point_internal(
+                serial,
+                x,
+                y,
+                tool_deadline(None, DEFAULT_ADB_COMMAND_TIMEOUT_SECS),
+            )
+            .await?;
             sleep(Duration::from_millis(500)).await;
             return Ok(node);
         }
@@ -4084,7 +5431,15 @@ impl AndroidEmulatorMcp {
                 )
                 .await?;
             let nodes = parse_ui_nodes_from_path(&ui_path)?;
-            match self.check_system_dialog(serial, &ui_path, &nodes).await? {
+            match self
+                .check_system_dialog(
+                    serial,
+                    &ui_path,
+                    &nodes,
+                    Some(started + Duration::from_secs(timeout_secs.min(300))),
+                )
+                .await?
+            {
                 SystemDialogCheck::Handled(_) => continue,
                 SystemDialogCheck::Blocked(report) => {
                     return Err(McpError::internal_error(
@@ -4299,6 +5654,147 @@ fn validate_solarlab_semantic_action(
     }
 }
 
+fn resolve_solarlab_semantic_body_query(
+    body_query: Option<String>,
+    target: Option<serde_json::Value>,
+) -> Option<String> {
+    fn normalized_string(value: &str) -> Option<String> {
+        let normalized = value.trim();
+        (!normalized.is_empty()).then(|| normalized.to_string())
+    }
+
+    let body_query = body_query.and_then(|value| {
+        let normalized = value.trim();
+        if normalized.is_empty() {
+            None
+        } else if normalized.len() == value.len() {
+            Some(value)
+        } else {
+            Some(normalized.to_string())
+        }
+    });
+
+    body_query.or_else(|| {
+        target.and_then(|target| match target {
+            serde_json::Value::String(value) => normalized_string(&value),
+            serde_json::Value::Object(fields) => [
+                "text",
+                "text_exact",
+                "label",
+                "label_exact",
+                "content_desc",
+                "content_description",
+                "contentDescription",
+            ]
+            .into_iter()
+            .find_map(|field| fields.get(field).and_then(serde_json::Value::as_str))
+            .and_then(normalized_string),
+            _ => None,
+        })
+    })
+}
+
+fn normalize_solarlab_semantic_action_args(
+    args: SolarLabSemanticActionArgs,
+) -> Result<NormalizedSolarLabSemanticActionArgs, McpError> {
+    let SolarLabSemanticActionArgs {
+        serial,
+        package_name,
+        activity,
+        action,
+        action_name,
+        name,
+        body_query,
+        target,
+        actions,
+        timeout_secs: _,
+        capture_state,
+    } = args;
+
+    let mut action_candidates = Vec::new();
+    for candidate in [action.as_deref(), action_name.as_deref(), name.as_deref()] {
+        collect_solarlab_semantic_action_candidate(&mut action_candidates, candidate);
+    }
+
+    let (body_query, target) = match actions.as_slice() {
+        [] => (body_query, target),
+        [step] => {
+            if let Some(action_type) = step.action_type.as_deref()
+                && action_type.trim() != "semantic_action"
+            {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "solarlab.semantic_action actions[0].type must be 'semantic_action', got '{action_type}'"
+                    ),
+                    None,
+                ));
+            }
+            for candidate in [
+                step.action.as_deref(),
+                step.action_name.as_deref(),
+                step.name.as_deref(),
+            ] {
+                collect_solarlab_semantic_action_candidate(&mut action_candidates, candidate);
+            }
+            (
+                step.body_query.clone().or(body_query),
+                step.target.clone().or(target),
+            )
+        }
+        many => {
+            return Err(McpError::invalid_params(
+                format!(
+                    "solarlab.semantic_action accepts exactly one batched semantic action, got {}",
+                    many.len()
+                ),
+                None,
+            ));
+        }
+    };
+
+    action_candidates.sort();
+    action_candidates.dedup();
+    let action = match action_candidates.as_slice() {
+        [action] => action.clone(),
+        [] => {
+            return Err(McpError::invalid_params(
+                "solarlab.semantic_action requires action, action_name, name, or one semantic actions[] entry",
+                None,
+            ));
+        }
+        conflicting => {
+            return Err(McpError::invalid_params(
+                format!(
+                    "solarlab.semantic_action received conflicting semantic action names: {}",
+                    conflicting.join(", ")
+                ),
+                None,
+            ));
+        }
+    };
+
+    Ok(NormalizedSolarLabSemanticActionArgs {
+        serial,
+        package_name,
+        activity,
+        action,
+        body_query,
+        target,
+        capture_state,
+    })
+}
+
+fn collect_solarlab_semantic_action_candidate(
+    candidates: &mut Vec<String>,
+    candidate: Option<&str>,
+) {
+    if let Some(candidate) = candidate.map(str::trim).filter(|value| !value.is_empty())
+        && candidate != "semantic_action"
+    {
+        candidates.push(candidate.to_string());
+    }
+}
+
 fn matcher_for_action(action: &SolarLabSemanticCommand) -> SolarLabSemanticAckMatcher {
     match action {
         SolarLabSemanticCommand::FocusBody { body_query } => SolarLabSemanticAckMatcher {
@@ -4316,10 +5812,75 @@ fn matcher_for_action(action: &SolarLabSemanticCommand) -> SolarLabSemanticAckMa
     }
 }
 
-fn solarlab_semantic_ack_matches(action: &SolarLabSemanticCommand, hierarchy: &str) -> bool {
+fn normalize_solarlab_semantic_ack_token(value: &str) -> String {
+    let mut normalized = String::new();
+    for character in value.chars() {
+        if character.is_ascii_alphanumeric() {
+            normalized.push(character.to_ascii_lowercase());
+        } else if !normalized.is_empty() && !normalized.ends_with('-') {
+            normalized.push('-');
+        }
+    }
+    normalized.trim_matches('-').to_string()
+}
+
+fn solarlab_semantic_ack_field(hierarchy_lower: &str, field: &str) -> Option<String> {
+    let marker_start = hierarchy_lower.find(SOLARLAB_FOCUS_ACK_MARKER)?;
+    let marker_tail = &hierarchy_lower[marker_start..];
+    let field_prefix = format!("{field}=");
+    let value_start = marker_tail.find(&field_prefix)? + field_prefix.len();
+    let value = marker_tail[value_start..]
+        .chars()
+        .take_while(|character| character.is_ascii_alphanumeric() || *character == '-')
+        .collect::<String>();
+    (!value.is_empty()).then_some(value)
+}
+
+fn solarlab_semantic_focus_ack_resolved_body_id(
+    hierarchy: &str,
+    body_query: &str,
+    request_id: &str,
+) -> Option<String> {
+    let hierarchy_lower = hierarchy.to_lowercase();
+    let observed_request_id = solarlab_semantic_ack_field(&hierarchy_lower, "request-id")?;
+    let observed_query = solarlab_semantic_ack_field(&hierarchy_lower, "query")?;
+    if observed_request_id != normalize_solarlab_semantic_ack_token(request_id)
+        || observed_query != normalize_solarlab_semantic_ack_token(body_query)
+    {
+        return None;
+    }
+    solarlab_semantic_ack_field(&hierarchy_lower, "resolved-body")
+}
+
+fn solarlab_semantic_resolved_body_id(
+    action: &SolarLabSemanticCommand,
+    hierarchy: &str,
+    request_id: &str,
+) -> Option<String> {
+    match action {
+        SolarLabSemanticCommand::FocusBody { body_query } => {
+            solarlab_semantic_focus_ack_resolved_body_id(hierarchy, body_query, request_id)
+        }
+        SolarLabSemanticCommand::ResetCamera
+        | SolarLabSemanticCommand::OpenImmersive
+        | SolarLabSemanticCommand::ReturnToSandbox => None,
+    }
+}
+
+fn solarlab_semantic_ack_matches(
+    action: &SolarLabSemanticCommand,
+    hierarchy: &str,
+    request_id: Option<&str>,
+) -> bool {
     let hierarchy_lower = hierarchy.to_lowercase();
     match action {
         SolarLabSemanticCommand::FocusBody { body_query } => {
+            if hierarchy_lower.contains(SOLARLAB_FOCUS_ACK_MARKER) {
+                return request_id.is_some_and(|request_id| {
+                    solarlab_semantic_focus_ack_resolved_body_id(hierarchy, body_query, request_id)
+                        .is_some()
+                });
+            }
             hierarchy_lower.contains(&body_query.to_lowercase())
         }
         SolarLabSemanticCommand::OpenImmersive => {
@@ -4390,6 +5951,544 @@ fn normalize_artifact_name(filename: &str, extension: Option<&str>) -> Option<St
     }
 
     Some(normalized)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArtifactReadEncoding {
+    Utf8,
+    Base64,
+}
+
+fn normalize_artifact_read_encoding(value: Option<&str>) -> Result<ArtifactReadEncoding, McpError> {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        None | Some("base64") => Ok(ArtifactReadEncoding::Base64),
+        Some("utf8") | Some("utf-8") => Ok(ArtifactReadEncoding::Utf8),
+        Some(other) => Err(McpError::invalid_params(
+            format!("encoding must be one of: utf8, base64 (got '{other}')"),
+            None,
+        )),
+    }
+}
+
+fn guess_artifact_mime_type(path: &Path) -> &'static str {
+    match path.extension().and_then(|value| value.to_str()) {
+        Some("png") => "image/png",
+        Some("xml") => "application/xml",
+        Some("json") => "application/json",
+        Some("txt") | Some("log") => "text/plain",
+        Some("md") => "text/markdown",
+        Some("svg") => "image/svg+xml",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        _ => "application/octet-stream",
+    }
+}
+
+pub(crate) fn structured_receipt(value: serde_json::Value) -> CallToolResult {
+    let failed = value.get("ok").and_then(serde_json::Value::as_bool) == Some(false);
+    let mut result = CallToolResult::structured(value);
+    result.is_error = Some(failed);
+    result
+}
+
+pub(crate) async fn structured_result_with_optional_screenshot(
+    value: serde_json::Value,
+    screenshot_path: Option<&Path>,
+) -> Result<CallToolResult, McpError> {
+    let bytes = match screenshot_path {
+        Some(path) => Some(read_limited_artifact_bytes(path, MAX_SCREENSHOT_BYTES).await?),
+        None => None,
+    };
+    observation_result_with_optional_screenshot(value, bytes)
+}
+
+pub(crate) fn observation_result_with_optional_screenshot(
+    value: serde_json::Value,
+    screenshot_bytes: Option<Vec<u8>>,
+) -> Result<CallToolResult, McpError> {
+    let is_error = value.get("ok").and_then(serde_json::Value::as_bool) == Some(false);
+    let Some(bytes) = screenshot_bytes else {
+        let mut result = structured_receipt(value);
+        result.is_error = Some(is_error);
+        return Ok(result);
+    };
+    if bytes.len() > MAX_SCREENSHOT_BYTES as usize || !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Err(McpError::internal_error(
+            "observation screenshot is not a bounded PNG image",
+            None,
+        ));
+    }
+    let receipt = serde_json::to_string(&value).map_err(|err| {
+        McpError::internal_error(
+            format!("Failed to serialize Android observation receipt: {err}"),
+            None,
+        )
+    })?;
+    // Codex prefers structured_content and drops accompanying image content.
+    // Keep both blocks in content until the generic consumer supports both channels.
+    let mut result = CallToolResult::success(vec![
+        ContentBlock::text(receipt),
+        ContentBlock::image(BASE64_STANDARD.encode(bytes), "image/png"),
+    ]);
+    result.is_error = Some(is_error);
+    Ok(result)
+}
+
+async fn read_limited_artifact_bytes(path: &Path, limit: u64) -> Result<Vec<u8>, McpError> {
+    let file = fs::File::open(path)
+        .await
+        .map_err(|err| McpError::invalid_params(format!("artifact is unavailable: {err}"), None))?;
+    let metadata = file
+        .metadata()
+        .await
+        .map_err(|err| McpError::internal_error(err.to_string(), None))?;
+    if !metadata.is_file() || metadata.len() > limit {
+        return Err(McpError::invalid_params(
+            format!("artifact must be a regular file no larger than {limit} bytes"),
+            None,
+        ));
+    }
+    // Limit the read itself as well as metadata; a file may grow after opening.
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(limit + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|err| McpError::internal_error(err.to_string(), None))?;
+    if bytes.len() as u64 > limit {
+        return Err(McpError::invalid_params(
+            format!("artifact grew beyond {limit} bytes while being read"),
+            None,
+        ));
+    }
+    Ok(bytes)
+}
+
+async fn ensure_artifact_directory(root: &Path, relative: &str) -> Result<PathBuf, McpError> {
+    fs::create_dir_all(root)
+        .await
+        .map_err(|err| McpError::internal_error(err.to_string(), None))?;
+    let canonical_root = fs::canonicalize(root)
+        .await
+        .map_err(|err| McpError::internal_error(err.to_string(), None))?;
+    let relative = Path::new(relative);
+    ensure_public_artifact_path(relative)?;
+    let mut directory = canonical_root.clone();
+    for component in relative.components() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(McpError::invalid_params(
+                "artifact group must be a relative directory",
+                None,
+            ));
+        };
+        directory.push(component);
+        match fs::create_dir(&directory).await {
+            Ok(()) => (),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => (),
+            Err(err) => return Err(McpError::internal_error(err.to_string(), None)),
+        }
+        let metadata = fs::symlink_metadata(&directory)
+            .await
+            .map_err(|err| McpError::internal_error(err.to_string(), None))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(McpError::invalid_params(
+                "artifact directory must be a real directory, not a symlink",
+                None,
+            ));
+        }
+        let canonical = fs::canonicalize(&directory)
+            .await
+            .map_err(|err| McpError::internal_error(err.to_string(), None))?;
+        if !canonical.starts_with(&canonical_root) {
+            return Err(McpError::invalid_params(
+                "artifact directory escaped its configured root",
+                None,
+            ));
+        }
+    }
+    Ok(directory)
+}
+
+async fn ensure_artifact_store_capacity(
+    root: &Path,
+    incoming: u64,
+    max_bytes: u64,
+    max_files: u64,
+) -> Result<(), McpError> {
+    let mut directories = vec![root.to_path_buf()];
+    let mut bytes = incoming;
+    let mut files = 1u64; // Reserve the file about to be created.
+    let mut entries_seen = 0usize;
+    while let Some(directory) = directories.pop() {
+        let mut entries = fs::read_dir(directory)
+            .await
+            .map_err(|err| McpError::internal_error(err.to_string(), None))?;
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|err| McpError::internal_error(err.to_string(), None))?
+        {
+            entries_seen += 1;
+            let metadata = fs::symlink_metadata(entry.path())
+                .await
+                .map_err(|err| McpError::internal_error(err.to_string(), None))?;
+            if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                directories.push(entry.path());
+            } else {
+                files = files.saturating_add(1);
+                bytes = bytes.saturating_add(metadata.len());
+            }
+            if bytes > max_bytes || files > max_files || entries_seen > 16_384 {
+                return Err(McpError::internal_error(
+                    "artifact capacity exhausted; archive or remove unneeded artifacts before continuing",
+                    Some(
+                        json!({"outcome": "artifact_capacity_exhausted", "max_bytes": max_bytes, "max_files": max_files}),
+                    ),
+                ));
+            }
+        }
+    }
+    if bytes > max_bytes || files > max_files {
+        return Err(McpError::internal_error(
+            "artifact capacity exhausted",
+            None,
+        ));
+    }
+    Ok(())
+}
+
+fn create_new_artifact_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+async fn write_public_artifact(root: &Path, path: &Path, bytes: &[u8]) -> Result<(), McpError> {
+    ensure_public_artifact_path(path)?;
+    if bytes.len() as u64 > MAX_SCREENSHOT_BYTES {
+        return Err(McpError::internal_error(
+            "artifact exceeds the 32 MiB per-file limit",
+            None,
+        ));
+    }
+    let _write_guard = ARTIFACT_WRITE_LOCK.lock().await;
+    let canonical_root = fs::canonicalize(root)
+        .await
+        .map_err(|err| McpError::internal_error(err.to_string(), None))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| McpError::invalid_params("artifact needs a parent directory", None))?;
+    let canonical_parent = fs::canonicalize(parent)
+        .await
+        .map_err(|err| McpError::invalid_params(err.to_string(), None))?;
+    ensure_public_artifact_path(&canonical_parent)?;
+    if !canonical_parent.starts_with(&canonical_root)
+        || fs::symlink_metadata(parent)
+            .await
+            .map_err(|err| McpError::invalid_params(err.to_string(), None))?
+            .file_type()
+            .is_symlink()
+    {
+        return Err(McpError::invalid_params(
+            "artifact write must stay within a real configured directory",
+            None,
+        ));
+    }
+    ensure_artifact_store_capacity(
+        root,
+        bytes.len() as u64,
+        MAX_ARTIFACT_STORE_BYTES,
+        MAX_ARTIFACT_STORE_FILES,
+    )
+    .await?;
+    let file = create_new_artifact_file(path).map_err(|err| {
+        McpError::invalid_params(format!("artifact output must be a new file: {err}"), None)
+    })?;
+    let mut file = fs::File::from_std(file);
+    file.write_all(bytes)
+        .await
+        .map_err(|err| McpError::internal_error(err.to_string(), None))?;
+    file.flush()
+        .await
+        .map_err(|err| McpError::internal_error(err.to_string(), None))?;
+    Ok(())
+}
+
+async fn resolve_public_artifact_path(root: &Path, candidate: &Path) -> Result<PathBuf, McpError> {
+    ensure_public_artifact_path(candidate)?;
+    let canonical_root = fs::canonicalize(root).await.map_err(|err| {
+        McpError::internal_error(
+            format!("configured artifact directory is unavailable: {err}"),
+            None,
+        )
+    })?;
+    let canonical_candidate = fs::canonicalize(candidate)
+        .await
+        .map_err(|err| McpError::invalid_params(format!("artifact is unavailable: {err}"), None))?;
+    ensure_public_artifact_path(&canonical_candidate)?;
+    if !canonical_candidate.starts_with(&canonical_root) {
+        return Err(McpError::invalid_params(
+            "artifact path must resolve inside the configured artifact directory",
+            None,
+        ));
+    }
+    Ok(canonical_candidate)
+}
+
+fn ensure_public_artifact_path(path: &Path) -> Result<(), McpError> {
+    if path
+        .components()
+        .any(|part| part.as_os_str() == ".action-ledger")
+    {
+        return Err(McpError::invalid_params(
+            "internal action ledger is not a public artifact",
+            None,
+        ));
+    }
+    Ok(())
+}
+
+fn cancelled_mutation_error() -> McpError {
+    McpError::internal_error(
+        "Android request was cancelled before the next device mutation",
+        Some(json!({
+            "outcome": "cancelled",
+            "next_mutation_dispatched": false,
+            // A semantic helper may already have completed earlier mutations.
+            "retry_safe": false,
+            "do_not_replay": true,
+        })),
+    )
+}
+
+fn ensure_mutation_not_cancelled() -> Result<(), McpError> {
+    if crate::execution::request_cancelled() {
+        Err(cancelled_mutation_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn ensure_adb_mutation_not_cancelled(args: &[String]) -> Result<(), McpError> {
+    let mutates = match args.first().map(String::as_str) {
+        Some("install" | "install-multiple" | "install-multi-package" | "uninstall") => true,
+        Some("shell") => adb_shell_command_mutates(&args[1..]),
+        _ => false,
+    };
+    if mutates {
+        ensure_mutation_not_cancelled()?;
+    }
+    Ok(())
+}
+
+fn adb_shell_command_mutates(args: &[String]) -> bool {
+    match args.first().map(String::as_str) {
+        Some("input" | "am" | "monkey") => true,
+        Some("settings") => {
+            let mut index = 1;
+            while let Some(option) = args.get(index).map(String::as_str) {
+                match option {
+                    "--user" => index += 2,
+                    "--cm" => index += 1,
+                    _ => break,
+                }
+            }
+            !matches!(args.get(index).map(String::as_str), Some("get" | "list"))
+        }
+        _ => false,
+    }
+}
+
+fn uncertain_mutation_error(action: &str, backend: &str, detail: &str) -> McpError {
+    McpError::internal_error(
+        format!(
+            "{action} dispatch outcome is unknown; observe before issuing another action; the mutation was not replayed"
+        ),
+        Some(json!({
+            "outcome": "outcome_unknown",
+            "retry_safe": false,
+            "do_not_replay": true,
+            "backend": backend,
+            "detail": detail.chars().take(1024).collect::<String>(),
+        })),
+    )
+}
+
+fn select_serial_bound_grpc_endpoint(
+    configured_port: Option<u16>,
+    discovered: Option<discovery::GrpcEndpoint>,
+) -> Option<discovery::GrpcEndpoint> {
+    // Only discovery establishes that a gRPC controller belongs to this serial.
+    // A global port override cannot redirect a request to a different emulator.
+    discovered.filter(|endpoint| configured_port.is_none_or(|port| port == endpoint.port))
+}
+
+fn validate_gesture_duration(duration_ms: u64) -> Result<(), McpError> {
+    if !(1..=MAX_GESTURE_DURATION_MS).contains(&duration_ms) {
+        return Err(McpError::invalid_params(
+            format!("duration_ms must be between 1 and {MAX_GESTURE_DURATION_MS}"),
+            None,
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_android_package_name(value: &str) -> Result<String, McpError> {
+    let package_name = value.trim();
+    if package_name.is_empty() {
+        return Err(McpError::invalid_params(
+            "package_name must not be empty",
+            None,
+        ));
+    }
+    if !package_name
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.'))
+    {
+        return Err(McpError::invalid_params(
+            format!("invalid Android package name: {package_name}"),
+            None,
+        ));
+    }
+    Ok(package_name.to_string())
+}
+
+fn parse_launcher_package_names(output: &str) -> Vec<String> {
+    let mut packages = Vec::new();
+    for line in output.lines().map(str::trim) {
+        let Some(package_name) = line.strip_prefix("packageName=") else {
+            continue;
+        };
+        if !package_name.is_empty() && !packages.iter().any(|seen| seen == package_name) {
+            packages.push(package_name.to_string());
+        }
+    }
+    packages
+}
+
+fn parse_pm_package_names(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .map(str::trim)
+        .filter_map(|line| line.strip_prefix("package:"))
+        .filter(|package_name| !package_name.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn normalize_safe_android_url(value: &str) -> Result<String, McpError> {
+    let url = value.trim();
+    if url.is_empty() {
+        return Err(McpError::invalid_params("url must not be empty", None));
+    }
+    let lower = url.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        return Ok(url.to_string());
+    }
+    if std::env::var("ANDROID_COMPUTER_USE_MCP_ALLOW_UNSAFE_URLS").as_deref() == Ok("1") {
+        return Ok(url.to_string());
+    }
+    Err(McpError::invalid_params(
+        "android.open_url only allows http:// and https:// URLs by default; set ANDROID_COMPUTER_USE_MCP_ALLOW_UNSAFE_URLS=1 to allow other schemes",
+        None,
+    ))
+}
+
+// AOSP DisplayViewport::toString emits displayId and orientation for the
+// logical display. Read display 0 explicitly; never infer it from user_rotation.
+fn parse_default_display_rotation(output: &str) -> Option<u8> {
+    for line in output.lines() {
+        if !line.contains("Viewport") && !line.contains("viewport") {
+            continue;
+        }
+        let Some(after_id) = line.split_once("displayId=").map(|(_, value)| value) else {
+            continue;
+        };
+        let id = after_id.split([',', ' ', '}']).next().unwrap_or_default();
+        if id != "0" {
+            continue;
+        }
+        let rotation = line
+            .split_once("orientation=")?
+            .1
+            .split([',', ' ', '}'])
+            .next()?
+            .parse::<u8>()
+            .ok()?;
+        return (rotation < 4).then_some(rotation);
+    }
+    // Older single-display input dumps use SurfaceOrientation. Ambiguous dumps
+    // with several surfaces must not select the first one silently.
+    let rotations = output
+        .lines()
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix("SurfaceOrientation:")?
+                .trim()
+                .parse::<u8>()
+                .ok()
+                .filter(|value| *value < 4)
+        })
+        .collect::<Vec<_>>();
+    match rotations.as_slice() {
+        [rotation] => Some(*rotation),
+        _ => None,
+    }
+}
+
+fn rotated_display_size((width, height): (u32, u32), rotation: u8) -> (u32, u32) {
+    if rotation % 2 == 1 {
+        (height, width)
+    } else {
+        (width, height)
+    }
+}
+
+fn rotation_for_display_orientation(value: &str, natural_size: (u32, u32)) -> Result<u8, McpError> {
+    let rotation = rotation_for_orientation(value)?;
+    Ok(if natural_size.0 > natural_size.1 {
+        rotation ^ 1
+    } else {
+        rotation
+    })
+}
+
+fn orientation_for_display_rotation(rotation: u8, natural_size: (u32, u32)) -> &'static str {
+    orientation_name_from_rotation(if natural_size.0 > natural_size.1 {
+        rotation ^ 1
+    } else {
+        rotation
+    })
+}
+
+fn rotation_for_orientation(value: &str) -> Result<u8, McpError> {
+    match value.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+        "portrait" => Ok(0),
+        "landscape" => Ok(1),
+        "reverse_portrait" | "reverseportrait" => Ok(2),
+        "reverse_landscape" | "reverselandscape" => Ok(3),
+        other => Err(McpError::invalid_params(
+            format!(
+                "orientation must be one of: portrait, landscape, reverse_portrait, reverse_landscape (got '{other}')"
+            ),
+            None,
+        )),
+    }
+}
+
+fn orientation_name_from_rotation(rotation: u8) -> &'static str {
+    match rotation % 4 {
+        0 => "portrait",
+        1 => "landscape",
+        2 => "reverse_portrait",
+        3 => "reverse_landscape",
+        _ => unreachable!(),
+    }
 }
 
 impl From<&LaunchAvdArgs> for LaunchRequest {
@@ -4473,6 +6572,150 @@ fn systemd_run_is_available() -> bool {
         .unwrap_or(false)
 }
 
+fn resolve_android_execution_target(
+    configured_identity: &ProviderExecutionIdentity,
+    requested_target: Option<&AndroidExecutionTarget>,
+    device_serial: String,
+    configured_app: Option<AndroidAppTarget>,
+) -> Result<ResolvedAndroidExecutionTarget, McpError> {
+    let requested_target = requested_target.cloned().unwrap_or_default();
+    require_matching_target_field(
+        "environment_id",
+        requested_target.environment_id.as_deref(),
+        &configured_identity.environment_id,
+    )?;
+    require_matching_target_field(
+        "provider_instance_id",
+        requested_target.provider_instance_id.as_deref(),
+        &configured_identity.provider_instance_id,
+    )?;
+    require_matching_target_field(
+        "provider_epoch",
+        requested_target.provider_epoch.as_deref(),
+        &configured_identity.provider_epoch,
+    )?;
+    require_matching_target_field(
+        "session_id",
+        requested_target.session_id.as_deref(),
+        &configured_identity.session_id,
+    )?;
+    require_matching_target_field(
+        "device_serial",
+        requested_target.device_serial.as_deref(),
+        &device_serial,
+    )?;
+
+    let requested_app = requested_target
+        .app
+        .map(normalize_android_app_target)
+        .transpose()?;
+    let app = match (configured_app, requested_app) {
+        (Some(configured_app), Some(requested_app)) => {
+            if configured_app.package_name != requested_app.package_name
+                || configured_app.activity != requested_app.activity
+            {
+                return Err(McpError::invalid_params(
+                    "target.app must match the configured interactive-session app",
+                    None,
+                ));
+            }
+            Some(configured_app)
+        }
+        (Some(configured_app), None) => Some(configured_app),
+        (None, requested_app) => requested_app,
+    };
+
+    if let Some(expected_build) = requested_target.expected_build.as_ref() {
+        for (field, value) in [
+            (
+                "target.expected_build.repository",
+                &expected_build.repository,
+            ),
+            (
+                "target.expected_build.commit_sha",
+                &expected_build.commit_sha,
+            ),
+            (
+                "target.expected_build.artifact_name",
+                &expected_build.artifact_name,
+            ),
+            (
+                "target.expected_build.artifact_sha256",
+                &expected_build.artifact_sha256,
+            ),
+        ] {
+            if value.trim().is_empty() {
+                return Err(McpError::invalid_params(
+                    format!("{field} must not be empty"),
+                    None,
+                ));
+            }
+        }
+    }
+
+    Ok(ResolvedAndroidExecutionTarget {
+        environment_id: configured_identity.environment_id.clone(),
+        provider_instance_id: configured_identity.provider_instance_id.clone(),
+        provider_epoch: configured_identity.provider_epoch.clone(),
+        session_id: configured_identity.session_id.clone(),
+        device_serial,
+        app,
+    })
+}
+
+fn require_matching_target_field(
+    field: &str,
+    requested: Option<&str>,
+    resolved: &str,
+) -> Result<(), McpError> {
+    let Some(requested) = requested else {
+        return Ok(());
+    };
+    let requested = requested.trim();
+    if requested.is_empty() {
+        return Err(McpError::invalid_params(
+            format!("target.{field} must not be empty when supplied"),
+            None,
+        ));
+    }
+    if requested != resolved {
+        return Err(McpError::invalid_params(
+            format!("target.{field} does not match the resolved provider target"),
+            None,
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_android_app_target(target: AndroidAppTarget) -> Result<AndroidAppTarget, McpError> {
+    let package_name = target.package_name.trim();
+    if package_name.is_empty() {
+        return Err(McpError::invalid_params(
+            "target.app.package_name must not be empty",
+            None,
+        ));
+    }
+    let activity = target
+        .activity
+        .as_deref()
+        .map(str::trim)
+        .map(|activity| {
+            if activity.is_empty() {
+                Err(McpError::invalid_params(
+                    "target.app.activity must not be empty when supplied",
+                    None,
+                ))
+            } else {
+                Ok(activity.to_string())
+            }
+        })
+        .transpose()?;
+    Ok(AndroidAppTarget {
+        package_name: package_name.to_string(),
+        activity,
+    })
+}
+
 fn resolve_serial_from_devices(
     serial: Option<&str>,
     devices: &[serde_json::Value],
@@ -4504,6 +6747,23 @@ fn resolve_serial_from_devices(
             None,
         )),
     }
+}
+
+fn resolve_explicit_ready_serial(
+    serial: &str,
+    devices: &[serde_json::Value],
+) -> Result<String, McpError> {
+    let ready = devices.iter().any(|device| {
+        device.get("serial").and_then(|value| value.as_str()) == Some(serial)
+            && device.get("state").and_then(|value| value.as_str()) == Some("device")
+    });
+    if ready {
+        return Ok(serial.to_string());
+    }
+    Err(McpError::invalid_params(
+        format!("requested Android serial {serial} is not a ready connected device"),
+        None,
+    ))
 }
 
 fn ready_emulator_serials(devices: &[serde_json::Value]) -> Vec<String> {
@@ -4569,6 +6829,13 @@ fn remote_ui_dump_path() -> String {
     format!("/sdcard/{}", timestamp_filename("window-dump", Some("xml")))
 }
 
+fn ui_dump_shell_stream_script(remote_path: &str) -> String {
+    let quoted_remote_path = shell_quote(remote_path);
+    format!(
+        "remote={quoted_remote_path}; trap 'rm -f \"$remote\"' EXIT; uiautomator dump \"$remote\" >/dev/null && cat \"$remote\""
+    )
+}
+
 fn extract_uiautomator_hierarchy_xml(output: &str) -> Option<&str> {
     let start = output.find("<?xml").or_else(|| output.find("<hierarchy"))?;
     let end = output.rfind("</hierarchy>")?;
@@ -4588,18 +6855,46 @@ fn is_exec_out_uiautomator_supported_failure(error: &McpError) -> bool {
 
 fn is_deadline_limited_observation_timeout(error: &McpError) -> bool {
     let message = error.to_string();
-    if !message.contains("timed out after") {
+    if !is_command_timeout_error(error) {
         return false;
     }
-    message.contains("exec-out uiautomator dump /dev/tty")
+    // The bounded ADB runner uses this generic label. This classifier is only
+    // called by read-only observation capture, never by mutation dispatch.
+    error.message.starts_with("adb command timed out after ")
+        || message.contains("exec-out uiautomator dump /dev/tty")
         || message.contains(" shell uiautomator dump ")
         || (message.contains(" pull ") && message.contains("window-dump"))
+}
+
+pub(crate) fn is_command_timeout_error(error: &McpError) -> bool {
+    error.to_string().contains("timed out after")
 }
 
 fn should_retry_ui_dump_pull(error: &McpError) -> bool {
     let message = error.to_string();
     message.contains("failed to stat remote object")
         || message.contains("No such file or directory")
+}
+
+fn ui_hierarchy_capture_error(
+    pull_error: Option<McpError>,
+    stream_error: Option<McpError>,
+) -> McpError {
+    if pull_error.as_ref().is_some_and(should_retry_ui_dump_pull)
+        || stream_error.as_ref().is_some_and(should_retry_ui_dump_pull)
+    {
+        return McpError::internal_error(
+            "UI hierarchy capture was unavailable after atomic stream and legacy retry paths; retry observation",
+            None,
+        );
+    }
+
+    pull_error.or(stream_error).unwrap_or_else(|| {
+        McpError::internal_error(
+            "UI hierarchy capture failed without a captured adb error",
+            None,
+        )
+    })
 }
 
 fn parse_adb_device_line(line: &str) -> Option<serde_json::Value> {
@@ -4619,12 +6914,106 @@ fn parse_adb_device_line(line: &str) -> Option<serde_json::Value> {
     }))
 }
 
-fn escape_adb_text(text: &str) -> String {
-    text.replace(' ', "%s")
+fn clipboard_text_capability_error(message: &'static str) -> McpError {
+    McpError::invalid_params(
+        message,
+        Some(json!({
+            "outcome": "unsupported_capability",
+            "next_mutation_dispatched": false,
+            "retry_safe": false,
+            "do_not_replay": true,
+        })),
+    )
 }
 
-fn fallback_clear_delete_count(existing_text: Option<&str>) -> usize {
-    existing_text.unwrap_or_default().chars().count()
+fn parse_text_verification_nodes(
+    path: &Path,
+    exact_editable_text: bool,
+) -> Result<Vec<NormalizedUiNode>, McpError> {
+    if exact_editable_text {
+        let xml = std::fs::read_to_string(path).map_err(|_| {
+            McpError::internal_error("Clipboard text observation could not be read", None)
+        })?;
+        clipboard_text_nodes_from_xml(&xml)
+    } else {
+        parse_ui_nodes_from_path(path)
+    }
+}
+
+pub(crate) fn is_editable_text_node(node: &NormalizedUiNode) -> bool {
+    node.class_name
+        .as_deref()
+        .is_some_and(|class| class.ends_with("EditText") || class.ends_with("AutoCompleteTextView"))
+}
+
+fn clipboard_text_target<'a>(
+    nodes: &'a [NormalizedUiNode],
+    expected_focus_selector: Option<&UiSelector>,
+) -> Result<&'a NormalizedUiNode, McpError> {
+    let mut candidates = nodes.iter().filter(|node| {
+        node.focused && node.focusable && node.enabled && is_editable_text_node(node)
+    });
+    let target = candidates.next().ok_or_else(|| {
+        clipboard_text_capability_error(
+            "Clipboard text input requires one observable focused editable field",
+        )
+    })?;
+    if candidates.next().is_some()
+        || expected_focus_selector.is_some_and(|selector| !selector_matches(target, selector))
+    {
+        return Err(clipboard_text_capability_error(
+            "Clipboard text input could not uniquely confirm the requested focused editable field",
+        ));
+    }
+    Ok(target)
+}
+
+fn clipboard_mutation_budget(deadline: Instant) -> Result<Duration, &'static str> {
+    if crate::execution::request_cancelled() {
+        return Err("cancelled_before_next_input");
+    }
+    let remaining = remaining_until(deadline);
+    if remaining.is_zero() {
+        return Err("deadline_before_next_input");
+    }
+    Ok(remaining.min(Duration::from_secs(DEFAULT_ADB_COMMAND_TIMEOUT_SECS)))
+}
+
+fn clipboard_text_failure(
+    phase: &'static str,
+    paste_attempted: bool,
+    text_verified: bool,
+    clipboard_restore: &'static str,
+) -> McpError {
+    McpError::internal_error(
+        "Clipboard text operation did not complete; observe before another text action; input was not replayed",
+        Some(json!({
+            "outcome": "outcome_unknown",
+            "backend": "emulator_clipboard_adb",
+            "phase": phase,
+            "paste_attempted": paste_attempted,
+            "text_verified": text_verified,
+            "clipboard_restore": clipboard_restore,
+            "retry_safe": false,
+            "do_not_replay": true,
+        })),
+    )
+}
+
+fn validate_adb_text(text: &str) -> Result<(), McpError> {
+    if grpc_backend::requires_clipboard_text(text) {
+        return Err(McpError::invalid_params(
+            "ADB input text cannot preserve this text exactly; use verified text input with a serial-bound emulator clipboard for Unicode, control characters, or literal %s",
+            Some(
+                json!({"outcome": "unsupported_capability", "retry_safe": true, "do_not_replay": false}),
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn escape_adb_text(text: &str) -> String {
+    text.replace(' ', "%s")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4757,31 +7146,12 @@ fn command_failure_message(command_label: &str, output: &Output) -> String {
 }
 
 async fn run_command_with_timeout(
-    mut command: Command,
+    command: Command,
     timeout_duration: Duration,
     command_label: &str,
 ) -> Result<Output, McpError> {
-    command.kill_on_drop(true);
-    command.stdin(Stdio::null());
-    command.stdout(Stdio::piped());
-    command.stderr(Stdio::piped());
-    let child = command.spawn().map_err(|err| {
-        McpError::internal_error(format!("{command_label} spawn failed: {err}"), None)
-    })?;
-    let output = timeout(timeout_duration, child.wait_with_output())
-        .await
-        .map_err(|_| {
-            McpError::internal_error(
-                format!(
-                    "{command_label} timed out after {} ms",
-                    timeout_duration.as_millis()
-                ),
-                None,
-            )
-        })?
-        .map_err(|err| {
-            McpError::internal_error(format!("{command_label} wait failed: {err}"), None)
-        })?;
+    let output =
+        run_command_with_timeout_allow_failure(command, timeout_duration, command_label).await?;
     if !output.status.success() {
         return Err(McpError::internal_error(
             command_failure_message(command_label, &output),
@@ -4789,6 +7159,77 @@ async fn run_command_with_timeout(
         ));
     }
     Ok(output)
+}
+
+async fn run_command_with_timeout_allow_failure(
+    command: Command,
+    timeout_duration: Duration,
+    command_label: &str,
+) -> Result<Output, McpError> {
+    run_command_with_output_limits(
+        command,
+        timeout_duration,
+        command_label,
+        32 * 1024 * 1024,
+        256 * 1024,
+    )
+    .await
+}
+
+async fn run_command_with_output_limits(
+    mut command: Command,
+    timeout_duration: Duration,
+    command_label: &str,
+    stdout_limit: u64,
+    stderr_limit: u64,
+) -> Result<Output, McpError> {
+    command.kill_on_drop(true);
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(|err| {
+        McpError::internal_error(format!("{command_label} spawn failed: {err}"), None)
+    })?;
+    let stdout = child.stdout.take().expect("stdout was configured as piped");
+    let stderr = child.stderr.take().expect("stderr was configured as piped");
+    let output = timeout(timeout_duration, async {
+        let (stdout, stderr, status) = tokio::try_join!(
+            read_command_stream(stdout, stdout_limit, "stdout"),
+            read_command_stream(stderr, stderr_limit, "stderr"),
+            child.wait(),
+        )?;
+        Ok::<Output, std::io::Error>(Output { status, stdout, stderr })
+    })
+    .await
+    .map_err(|_| {
+        McpError::internal_error(
+            format!("{command_label} timed out after {} ms", timeout_duration.as_millis()),
+            Some(json!({"outcome": "outcome_unknown", "phase": "command_wait", "retry_safe": false, "do_not_replay": true})),
+        )
+    })?
+    .map_err(|err| {
+        McpError::internal_error(
+            format!("{command_label} output or wait failed: {err}"),
+            Some(json!({"outcome": "outcome_unknown", "phase": "command_output", "retry_safe": false, "do_not_replay": true})),
+        )
+    })?;
+    Ok(output)
+}
+
+async fn read_command_stream(
+    stream: impl AsyncRead + Unpin,
+    limit: u64,
+    label: &str,
+) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    stream.take(limit + 1).read_to_end(&mut bytes).await?;
+    if bytes.len() as u64 > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{label} exceeded the {limit}-byte capture limit"),
+        ));
+    }
+    Ok(bytes)
 }
 
 fn labels_from_nodes(nodes: &[NormalizedUiNode]) -> Vec<String> {
@@ -4863,6 +7304,61 @@ fn classify_system_dialog(labels: &[String]) -> Option<SystemDialogPlan> {
     None
 }
 
+fn postcondition_anr_wait_button<'a>(
+    plan: &SystemDialogPlan,
+    nodes: &'a [NormalizedUiNode],
+) -> Option<&'a NormalizedUiNode> {
+    if plan.kind != "anr" || plan.action_label != Some("Wait") {
+        return None;
+    }
+    let mut matches = nodes.iter().filter(|node| {
+        node.package_name.as_deref() == Some("android")
+            && node.resource_id.as_deref() == Some("android:id/aerr_wait")
+            && node.clickable
+            && node.enabled
+            && node
+                .bounds
+                .is_some_and(|bounds| bounds.right > bounds.left && bounds.bottom > bounds.top)
+    });
+    let button = matches.next()?;
+    matches.next().is_none().then_some(button)
+}
+
+fn system_dialog_action_matches_selector(
+    selector: &UiSelector,
+    report: &SystemDialogReport,
+) -> bool {
+    let Some(action_label) = report.action_label.as_deref().or_else(|| {
+        report
+            .action_taken
+            .as_deref()
+            .and_then(|action| action.strip_prefix("tap:"))
+    }) else {
+        return false;
+    };
+
+    let synthetic_node = NormalizedUiNode {
+        class_name: Some("android.widget.Button".to_string()),
+        package_name: Some("android".to_string()),
+        text: Some(action_label.to_string()),
+        semantic_label: Some(action_label.to_string()),
+        content_desc: Some(action_label.to_string()),
+        resource_id: report.action_resource_id.clone(),
+        clickable: true,
+        focusable: true,
+        enabled: true,
+        selected: false,
+        checked: false,
+        focused: false,
+        scrollable: false,
+        long_clickable: false,
+        bounds: None,
+        center: None,
+    };
+
+    selector_matches(&synthetic_node, selector)
+}
+
 pub(crate) async fn remove_artifact_if_exists(path: Option<String>) {
     if let Some(path) = path {
         let _ = fs::remove_file(path).await;
@@ -4873,28 +7369,12 @@ fn ui_observation_fingerprint(hierarchy_xml: &str, window_state: &AndroidWindowS
     format!("{hierarchy_xml}\n{window_state:?}")
 }
 
-fn should_retry_tap_with_adb(
-    backend: &str,
-    retry_with_adb_on_no_change: bool,
-    verification: &TapVerification,
+fn swipe_outcome_satisfied(
+    selector_satisfied: bool,
+    expect_scroll_change: bool,
+    scroll_changed: bool,
 ) -> bool {
-    verification.requested
-        && !verification.satisfied
-        && retry_with_adb_on_no_change
-        && backend == "grpc"
-}
-
-fn should_retry_text_with_adb(
-    backend: &str,
-    retry_with_adb_on_no_change: bool,
-    verification: &TextVerification,
-) -> bool {
-    verification.requested
-        && !verification.satisfied
-        && retry_with_adb_on_no_change
-        && backend == "grpc"
-        && verification.ui_changed_from_pre_text == Some(false)
-        && verification.target_text_matches_requested != Some(true)
+    selector_satisfied && (!expect_scroll_change || scroll_changed)
 }
 
 fn normalize_scroll_direction(raw: Option<&str>) -> Result<ScrollDirection, McpError> {
@@ -4945,12 +7425,68 @@ fn parse_display_size(output: &str) -> Option<(u32, u32)> {
         })
 }
 
+fn multi_touch_capability_error(detail: &str) -> McpError {
+    McpError::invalid_params(
+        format!("android.input.multi_touch unsupported capability: {detail}"),
+        Some(json!({
+            "outcome": "rejected", "retry_safe": true, "do_not_replay": false,
+            "next_mutation_dispatched": false,
+            "capability": { "name": "multi_touch", "status": "unsupported" },
+        })),
+    )
+}
+
+fn validate_multi_touch_request(
+    pointers: &[MultiTouchPointer],
+    duration_ms: u64,
+    display_size: (u32, u32),
+) -> Result<(), McpError> {
+    if !(MIN_MULTI_TOUCH_POINTERS..=MAX_MULTI_TOUCH_POINTERS).contains(&pointers.len()) {
+        return Err(McpError::invalid_params(
+            format!(
+                "pointers must contain {MIN_MULTI_TOUCH_POINTERS} to {MAX_MULTI_TOUCH_POINTERS} paths; got {}",
+                pointers.len()
+            ),
+            None,
+        ));
+    }
+    if !(MIN_MULTI_TOUCH_DURATION_MS..=MAX_MULTI_TOUCH_DURATION_MS).contains(&duration_ms) {
+        return Err(McpError::invalid_params(
+            format!(
+                "duration_ms must be between {MIN_MULTI_TOUCH_DURATION_MS} and {MAX_MULTI_TOUCH_DURATION_MS}; got {duration_ms}"
+            ),
+            None,
+        ));
+    }
+
+    let (width, height) = display_size;
+    for (index, pointer) in pointers.iter().enumerate() {
+        for (field, value, limit) in [
+            ("x1", pointer.x1, width),
+            ("x2", pointer.x2, width),
+            ("y1", pointer.y1, height),
+            ("y2", pointer.y2, height),
+        ] {
+            if value >= limit {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "pointers[{index}].{field}={value} is outside the {width}x{height} display"
+                    ),
+                    None,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn parse_display_dimensions(raw: &str) -> Option<(u32, u32)> {
     let (width, height) = raw.split_once('x')?;
     Some((width.trim().parse().ok()?, height.trim().parse().ok()?))
 }
 
 fn parse_android_window_state(window_output: &str, activity_output: &str) -> AndroidWindowState {
+    let input_method_target = find_dumpsys_component(window_output, &["mInputMethodTarget="]);
     AndroidWindowState {
         current_focus: find_dumpsys_component(window_output, &["mCurrentFocus="]),
         focused_app: find_dumpsys_component(window_output, &["mFocusedApp="]),
@@ -4958,7 +7494,19 @@ fn parse_android_window_state(window_output: &str, activity_output: &str) -> And
             activity_output,
             &["topResumedActivity=", "mResumedActivity:"],
         ),
+        input_method_visible: input_method_target.is_some()
+            && parse_input_method_visible(window_output),
+        input_method_target,
     }
+}
+
+fn parse_input_method_visible(window_output: &str) -> bool {
+    window_output.lines().map(str::trim).any(|line| {
+        line.contains("mInputShown=true")
+            || (line.contains("mInputMethodWindow=")
+                && !line.ends_with("null")
+                && !line.contains("mInputMethodWindow=null"))
+    })
 }
 
 fn find_dumpsys_component(output: &str, needles: &[&str]) -> Option<String> {
@@ -4979,27 +7527,6 @@ fn extract_component_token(line: &str) -> Option<String> {
         })
 }
 
-fn observation_result_with_optional_screenshot(
-    value: serde_json::Value,
-    screenshot_bytes: Option<Vec<u8>>,
-) -> Result<CallToolResult, McpError> {
-    let Some(bytes) = screenshot_bytes else {
-        return Ok(CallToolResult::structured(value));
-    };
-
-    let receipt = serde_json::to_string(&value).map_err(|err| {
-        McpError::internal_error(
-            format!("Failed to serialize Android observation receipt: {err}"),
-            None,
-        )
-    })?;
-    // Codex prefers structured_content and drops accompanying image content.
-    Ok(CallToolResult::success(vec![
-        Content::text(receipt),
-        Content::image(BASE64_STANDARD.encode(bytes), "image/png"),
-    ]))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5010,43 +7537,1214 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::process::ExitStatusExt;
 
+    #[cfg(unix)]
+    fn adb_fixture_server(root: &Path) -> AndroidEmulatorMcp {
+        AndroidEmulatorMcp::new(crate::config::Config {
+            sdk_root: root.to_path_buf(),
+            adb_path: root.join("adb"),
+            emulator_path: root.join("emulator"),
+            avdmanager_path: root.join("avdmanager"),
+            artifact_dir: root.join("artifacts"),
+            emulator_grpc_port: None,
+            use_sg_kvm: false,
+            streamable_http: crate::config::StreamableHttpConfig {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                allowed_hosts: vec!["localhost".into()],
+                max_sessions: 1,
+                channel_capacity: 1,
+                allow_resume: false,
+            },
+            interactive_session: None,
+            execution_identity: ProviderExecutionIdentity {
+                environment_id: "adb-test".into(),
+                provider_instance_id: "adb-test".into(),
+                provider_epoch: "adb-test".into(),
+                session_id: "adb-test".into(),
+            },
+        })
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn cancelled_requests_stop_new_adb_mutations_but_keep_observations_and_cleanup() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(timestamp_filename("cancelled-adb", None));
+        fs::create_dir_all(&root).await.unwrap();
+        let adb_path = root.join("adb");
+        let calls = root.join("calls");
+        fs::write(
+            &adb_path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\n",
+                shell_quote(&calls.display().to_string())
+            ),
+        )
+        .await
+        .unwrap();
+        fs::set_permissions(&adb_path, std::fs::Permissions::from_mode(0o700))
+            .await
+            .unwrap();
+        let mcp = adb_fixture_server(&root);
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+        crate::execution::with_cancellation(token, async {
+            for arguments in [
+                vec!["input", "tap", "10", "20"],
+                vec!["am", "force-stop", "com.example.app"],
+                vec!["monkey", "-p", "com.example.app", "1"],
+                vec!["settings", "put", "system", "user_rotation", "1"],
+                vec![
+                    "settings",
+                    "--user",
+                    "0",
+                    "delete",
+                    "system",
+                    "user_rotation",
+                ],
+            ] {
+                let error = mcp
+                    .run_adb_shell("cancel-fixture", arguments)
+                    .await
+                    .err()
+                    .expect("cancelled shell mutation must not dispatch");
+                assert_eq!(error.data.as_ref().unwrap()["outcome"], "cancelled");
+                assert_eq!(
+                    error.data.as_ref().unwrap()["next_mutation_dispatched"],
+                    false
+                );
+            }
+            for command in ["install", "uninstall"] {
+                let error = mcp
+                    .run_adb("cancel-fixture", [command, "fixture"])
+                    .await
+                    .err()
+                    .expect("cancelled ADB mutation must not dispatch");
+                assert_eq!(error.data.unwrap()["outcome"], "cancelled");
+            }
+            assert!(
+                mcp.run_adb_allow_failure("cancel-fixture", ["install", "fixture.apk"])
+                    .await
+                    .is_err()
+            );
+            assert!(
+                mcp.double_tap_point_internal("cancel-fixture", 10, 20, tool_deadline(None, 5))
+                    .await
+                    .is_err()
+            );
+            assert!(
+                !calls.exists(),
+                "no cancelled mutation may start an ADB process"
+            );
+
+            mcp.run_adb_shell(
+                "cancel-fixture",
+                ["settings", "--user", "0", "get", "system", "user_rotation"],
+            )
+            .await
+            .unwrap();
+            mcp.run_adb_shell("cancel-fixture", ["rm", "-f", "/sdcard/fixture.xml"])
+                .await
+                .unwrap();
+            assert_eq!(fs::read_to_string(&calls).await.unwrap().lines().count(), 2);
+        })
+        .await;
+        fs::remove_dir_all(root).await.unwrap();
+    }
+
     #[test]
-    fn mcp_observation_includes_typed_screenshot_and_json_text_receipt() {
-        let result = observation_result_with_optional_screenshot(
-            json!({"ok": true, "serial": "emulator-5554"}),
-            Some(b"png-bytes".to_vec()),
-        )
-        .expect("screenshot image content should be attached");
+    fn adb_text_refuses_input_it_cannot_preserve_exactly() {
+        assert!(validate_adb_text("hello world").is_ok());
+        assert!(validate_adb_text("literal %s").is_err());
+        assert!(validate_adb_text("Grüße").is_err());
+        assert!(validate_adb_text("line\nbreak").is_err());
+    }
 
-        assert!(result.structured_content.is_none());
-        assert_eq!(result.content.len(), 2);
-        let receipt = serde_json::to_value(&result.content[0])
-            .expect("JSON receipt should serialize for assertion");
-        assert_eq!(receipt["type"], "text");
-        let receipt: serde_json::Value = serde_json::from_str(
-            receipt["text"]
-                .as_str()
-                .expect("text receipt should contain JSON"),
-        )
-        .expect("JSON receipt should parse");
-        assert_eq!(receipt, json!({"ok": true, "serial": "emulator-5554"}));
-        let image = serde_json::to_value(&result.content[1])
-            .expect("image content should serialize for assertion");
-        assert_eq!(image["type"], "image");
-        assert_eq!(image["mimeType"], "image/png");
-        assert_eq!(image["data"], BASE64_STANDARD.encode(b"png-bytes"));
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn ascii_replacement_preselects_one_exact_serial_adb_text_without_clipboard() {
+        use std::os::unix::fs::PermissionsExt;
 
-        let without_screenshot = observation_result_with_optional_screenshot(
-            json!({"ok": true, "serial": "emulator-5554"}),
+        let root = std::env::temp_dir().join(timestamp_filename("ascii-text", None));
+        fs::create_dir_all(&root).await.unwrap();
+        let adb = root.join("adb");
+        fs::write(
+            &adb,
+            r#"#!/usr/bin/env python3
+import json, pathlib, shlex, sys
+root = pathlib.Path(__file__).resolve().parent
+if sys.argv[1:3] != ['-s', 'ascii-fixture']:
+    sys.exit('wrong serial')
+args = sys.argv[3:]
+if args[0] != 'shell':
+    sys.exit('unexpected transport')
+command = shlex.split(args[1])
+with (root / 'calls').open('a') as log:
+    log.write(json.dumps([sys.argv[1], sys.argv[2], command]) + '\n')
+if command[:2] == ['input', 'text'] and (root / 'fail-text').exists():
+    sys.exit('text acknowledgement lost')
+"#,
+        )
+        .await
+        .unwrap();
+        fs::set_permissions(&adb, std::fs::Permissions::from_mode(0o700))
+            .await
+            .unwrap();
+        let mcp = adb_fixture_server(&root);
+        let text = "  Sedna's ASCII & value  ";
+        let dispatch = mcp
+            .send_text_with_verification(VerifiedTextDispatchRequest {
+                serial: "ascii-fixture",
+                text,
+                pre_text_nodes: &[],
+                public_target_selector: None,
+                target_tracker: None,
+                target_selector: None,
+                wait_for_selector: None,
+                deadline: Instant::now() + Duration::from_secs(5),
+                hierarchy_filename: None,
+                replace_existing_text_on_adb: true,
+                existing_text_for_adb_replace: Some("old field text"),
+            })
+            .await
+            .unwrap();
+        assert_eq!(dispatch.dispatch.backend, "adb");
+        assert_eq!(dispatch.clipboard_restore, None);
+        assert!(!dispatch.verification.requested);
+        let read_calls = || async {
+            fs::read_to_string(root.join("calls"))
+                .await
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let expected = vec![
+            json!([
+                "-s",
+                "ascii-fixture",
+                ["input", "keycombination", "CTRL_LEFT", "A"]
+            ]),
+            json!([
+                "-s",
+                "ascii-fixture",
+                ["input", "text", "%s%sSedna's%sASCII%s&%svalue%s%s"]
+            ]),
+        ];
+        assert_eq!(read_calls().await, expected);
+
+        for unsupported in ["Grüße", "line\nbreak", "literal %s"] {
+            assert!(
+                mcp.send_text_replacing_via_adb_internal("ascii-fixture", unsupported, None)
+                    .await
+                    .is_err()
+            );
+        }
+        assert_eq!(read_calls().await, expected, "validate before select-all");
+
+        fs::write(root.join("fail-text"), "fail").await.unwrap();
+        assert!(
+            mcp.send_text_replacing_via_adb_internal("ascii-fixture", text, None)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            read_calls().await,
+            [expected.clone(), expected].concat(),
+            "An uncertain input command must not be retried"
+        );
+        fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn adb_logical_capture_validates_pixels_and_obeys_serial_and_deadline() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(timestamp_filename("logical-capture", None));
+        fs::create_dir_all(&root).await.unwrap();
+        let mut pixels = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut pixels, 7, 3);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().unwrap();
+            writer.write_image_data(&[0; 7 * 3 * 4]).unwrap();
+        }
+        fs::write(root.join("capture.png"), &pixels).await.unwrap();
+        let adb = root.join("adb");
+        fs::write(
+            &adb,
+            r#"#!/usr/bin/env python3
+import pathlib, shlex, sys, time
+root = pathlib.Path(__file__).resolve().parent
+args = sys.argv[1:]
+if args == ['devices', '-l']:
+    print('List of devices attached\ngeometry-fixture device model:fixture')
+    sys.exit(0)
+if args[:2] != ['-s', 'geometry-fixture']:
+    sys.exit('wrong serial')
+args = args[2:]
+if args == ['exec-out', 'screencap', '-p']:
+    if (root / 'stall').exists():
+        time.sleep(5)
+    sys.stdout.buffer.write((root / 'capture.png').read_bytes())
+elif len(args) == 2 and args[0] == 'shell':
+    command = shlex.split(args[1])
+    if command == ['dumpsys', 'input']:
+        print('Viewport INTERNAL: displayId=0, orientation=1, logicalFrame=[0,0,7,3]')
+    elif command == ['wm', 'size']:
+        print('Physical size: 3x7')
+    else:
+        sys.exit('unexpected shell command')
+else:
+    sys.exit('unexpected transport')
+"#,
+        )
+        .await
+        .unwrap();
+        fs::set_permissions(&adb, std::fs::Permissions::from_mode(0o700))
+            .await
+            .unwrap();
+        let mcp = adb_fixture_server(&root);
+        let orientation = mcp
+            .android_get_orientation(Parameters(SerialArgs {
+                serial: Some("geometry-fixture".into()),
+            }))
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap();
+        assert_eq!(orientation["raw_rotation"], 1);
+        assert_eq!(orientation["display_width"], 7);
+        assert_eq!(orientation["display_height"], 3);
+        let (path, backend) = mcp
+            .capture_screenshot_internal_with_timeout(
+                "geometry-fixture",
+                "logical.png".into(),
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        assert_eq!(backend, "adb");
+        assert_eq!(fs::read(&path).await.unwrap(), pixels);
+        assert_eq!(crate::workflow::png_dimensions(&pixels).unwrap(), (7, 3));
+        let capture_files = || {
+            std::fs::read_dir(root.join("artifacts/screenshots"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let valid_files = capture_files();
+        assert_eq!(valid_files.len(), 1);
+
+        fs::write(root.join("capture.png"), b"\x89PNG\r\n\x1a\ntruncated")
+            .await
+            .unwrap();
+        assert!(
+            mcp.capture_screenshot_internal_with_timeout(
+                "geometry-fixture",
+                "invalid.png".into(),
+                Duration::from_secs(2),
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            capture_files(),
+            valid_files,
+            "Invalid PNGs must not create artifacts"
+        );
+
+        fs::write(root.join("capture.png"), &pixels).await.unwrap();
+        fs::write(root.join("stall"), b"stall").await.unwrap();
+        let started = Instant::now();
+        assert!(
+            mcp.capture_screenshot_internal_with_timeout(
+                "geometry-fixture",
+                "expired.png".into(),
+                Duration::from_millis(50),
+            )
+            .await
+            .is_err()
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(
+            capture_files(),
+            valid_files,
+            "Timed-out captures must not create artifacts"
+        );
+        assert_eq!(fs::read(path).await.unwrap(), pixels);
+        fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn ordinary_pointer_input_preserves_logical_coordinates_deadlines_and_no_replay() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(timestamp_filename("logical-pointer", None));
+        fs::create_dir_all(&root).await.unwrap();
+        let adb = root.join("adb");
+        fs::write(
+            &adb,
+            r#"#!/usr/bin/env python3
+import json, pathlib, shlex, sys, time
+root = pathlib.Path(__file__).resolve().parent
+if sys.argv[1:3] != ['-s', 'geometry-fixture']:
+    sys.exit('wrong serial')
+args = sys.argv[3:]
+if len(args) != 2 or args[0] != 'shell':
+    sys.exit('unexpected transport')
+command = shlex.split(args[1])
+with (root / 'calls').open('a') as log:
+    log.write(json.dumps(command) + '\n')
+if (root / 'stall-input').exists():
+    time.sleep(5)
+if (root / 'fail-input').exists():
+    sys.exit('input acknowledgement lost')
+"#,
+        )
+        .await
+        .unwrap();
+        fs::set_permissions(&adb, std::fs::Permissions::from_mode(0o700))
+            .await
+            .unwrap();
+        let mcp = adb_fixture_server(&root);
+        assert_eq!(
+            mcp.tap_point_internal("geometry-fixture", 1200, 400, tool_deadline(None, 5))
+                .await
+                .unwrap()
+                .backend,
+            "adb"
+        );
+        assert_eq!(
+            mcp.swipe_points_internal(
+                "geometry-fixture",
+                (2200, 700),
+                (100, 200),
+                250,
+                tool_deadline(None, 5)
+            )
+            .await
+            .unwrap()
+            .backend,
+            "adb"
+        );
+        assert_eq!(
+            mcp.double_tap_point_internal("geometry-fixture", 1000, 200, tool_deadline(None, 5))
+                .await
+                .unwrap()
+                .backend,
+            "adb"
+        );
+        let read_calls = || async {
+            fs::read_to_string(root.join("calls"))
+                .await
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let mut expected = vec![
+            json!(["input", "tap", "1200", "400"]),
+            json!(["input", "swipe", "2200", "700", "100", "200", "250"]),
+            json!([
+                "sh",
+                "-c",
+                "input tap 1000 200 && sleep 0.08 && input tap 1000 200"
+            ]),
+        ];
+        assert_eq!(read_calls().await, expected);
+        fs::write(root.join("fail-input"), b"fail").await.unwrap();
+        assert!(
+            mcp.tap_point_internal("geometry-fixture", 1200, 400, tool_deadline(None, 5))
+                .await
+                .is_err()
+        );
+        expected.push(json!(["input", "tap", "1200", "400"]));
+        assert_eq!(
+            read_calls().await,
+            expected,
+            "An uncertain tap must not be replayed"
+        );
+        assert!(
+            mcp.tap_point_internal("geometry-fixture", 1200, 400, Instant::now())
+                .await
+                .is_err()
+        );
+        assert!(
+            mcp.swipe_points_internal(
+                "geometry-fixture",
+                (2200, 700),
+                (100, 200),
+                250,
+                Instant::now() + Duration::from_millis(100),
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            read_calls().await,
+            expected,
+            "Expired gestures must not dispatch"
+        );
+        fs::write(root.join("stall-input"), b"stall").await.unwrap();
+        let started = Instant::now();
+        let error = mcp
+            .tap_point_internal(
+                "geometry-fixture",
+                1200,
+                400,
+                Instant::now() + Duration::from_millis(500),
+            )
+            .await
+            .err()
+            .expect("A stalled ADB tap must obey the action deadline");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(error.data.as_ref().unwrap()["outcome"], "outcome_unknown");
+        assert_eq!(error.data.as_ref().unwrap()["do_not_replay"], true);
+        assert_eq!(error.data.as_ref().unwrap()["backend"], "adb");
+        expected.push(json!(["input", "tap", "1200", "400"]));
+        assert_eq!(read_calls().await, expected);
+        fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[test]
+    fn clipboard_raw_target_requires_one_matching_focused_editable_field() {
+        let nodes = clipboard_text_nodes_from_xml(
+            r#"<hierarchy><node class="android.widget.EditText" resource-id="fixture:id/input" text="" focused="true" focusable="true" enabled="true" /></hierarchy>"#,
+        )
+        .unwrap();
+        let selector = UiSelector {
+            resource_id: Some("fixture:id/input".into()),
+            ..UiSelector::default()
+        };
+        assert!(clipboard_text_target(&nodes, Some(&selector)).is_ok());
+        for (class, focused, focusable, enabled) in [
+            ("android.widget.TextView", true, true, true),
+            ("android.widget.EditText", false, true, true),
+            ("android.widget.EditText", true, false, true),
+            ("android.widget.EditText", true, true, false),
+        ] {
+            let mut invalid = nodes.clone();
+            invalid[0].class_name = Some(class.into());
+            invalid[0].focused = focused;
+            invalid[0].focusable = focusable;
+            invalid[0].enabled = enabled;
+            assert!(clipboard_text_target(&invalid, None).is_err());
+        }
+        assert!(clipboard_text_target(&[], None).is_err());
+        assert!(clipboard_text_target(&[nodes[0].clone(), nodes[0].clone()], None).is_err());
+        assert!(
+            clipboard_text_target(
+                &nodes,
+                Some(&UiSelector {
+                    resource_id: Some("fixture:id/other".into()),
+                    ..UiSelector::default()
+                })
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn clipboard_text_keeps_transfer_until_exact_verification_and_cleans_every_exit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct RecordingCleanup {
+            root: PathBuf,
+            result: Result<grpc_backend::ClipboardRestoreOutcome, grpc_backend::GrpcMutationError>,
+            calls: usize,
+            restored_at: Option<Instant>,
+        }
+        impl ClipboardTransferCleanup for RecordingCleanup {
+            async fn restore_if_owned(
+                &mut self,
+            ) -> Result<grpc_backend::ClipboardRestoreOutcome, grpc_backend::GrpcMutationError>
+            {
+                self.calls += 1;
+                self.restored_at = Some(Instant::now());
+                fs::write(self.root.join("restored"), "cleanup")
+                    .await
+                    .unwrap();
+                self.result.clone()
+            }
+        }
+
+        let parent = std::env::temp_dir().join(timestamp_filename("clipboard-lifecycle", None));
+        let text = " Sedna café Ω %s ";
+        let before_xml = r#"<hierarchy><node class="android.widget.EditText" package="fixture" resource-id="fixture:id/input" text="" content-desc=" Sedna café Ω %s " focused="true" focusable="true" enabled="true" bounds="[0,0][100,40]" /></hierarchy>"#;
+        let before = clipboard_text_nodes_from_xml(before_xml).unwrap();
+        let already_matching = clipboard_text_nodes_from_xml(
+            &before_xml.replace("text=\"\"", &format!("text=\"{text}\"")),
+        )
+        .unwrap();
+        let selector = text_verification_target_selector(&before[0]);
+        let tracker = InternalNodeTracker::from_target_node(&before[0]).unwrap();
+        for scenario in [
+            "success",
+            "raw_success",
+            "intervening_change",
+            "paste_error",
+            "verification_failure",
+            "cleanup_failure",
+            "cancelled",
+            "deadline",
+            "unavailable",
+            "raw_existing",
+            "anr_success",
+            "anr_wrong",
+            "anr_missing",
+            "anr_unsafe",
+        ] {
+            let root = parent.join(scenario);
+            fs::create_dir_all(&root).await.unwrap();
+            fs::write(root.join("before.xml"), before_xml)
+                .await
+                .unwrap();
+            fs::write(
+                root.join("after.xml"),
+                before_xml.replace("text=\"\"", &format!("text=\"{text}\"")),
+            )
+            .await
+            .unwrap();
+            let dialog = r#"<hierarchy>
+                <node package="android" text="Fixture isn't responding" />
+                <node package="android" resource-id="android:id/aerr_close" text="Close app" clickable="true" enabled="true" bounds="[0,0][40,20]" />
+                <node package="android" resource-id="android:id/aerr_wait" text="Wait" clickable="true" enabled="true" bounds="[60,0][100,20]" />
+                </hierarchy>"#;
+            fs::write(
+                root.join("dialog.xml"),
+                if scenario == "anr_unsafe" {
+                    dialog.replace("android:id/aerr_wait", "fixture:id/aerr_wait")
+                } else {
+                    dialog.to_owned()
+                },
+            )
+            .await
+            .unwrap();
+            if scenario == "anr_wrong" {
+                fs::write(
+                    root.join("after.xml"),
+                    before_xml.replace(
+                        "text=\"\"",
+                        &format!("text=\"{}\"", text.replace("Sedna", "sedna")),
+                    ),
+                )
+                .await
+                .unwrap();
+            }
+            let adb = root.join("adb");
+            fs::write(
+                &adb,
+                r#"#!/usr/bin/env python3
+import pathlib, shlex, sys
+root = pathlib.Path(__file__).resolve().parent
+if sys.argv[1:3] != ['-s', 'clipboard-fixture']:
+    sys.exit('wrong serial')
+args = sys.argv[3:]
+if args[0] == 'shell':
+    args = ['shell'] + shlex.split(args[1])
+command = ' '.join(args)
+with (root / 'calls').open('a') as log:
+    log.write(command + '\n')
+if command == 'shell input keycombination CTRL_LEFT A':
+    pass
+elif command == 'shell input keyevent KEYCODE_PASTE':
+    (root / 'pasted').touch()
+    if root.name == 'paste_error':
+        sys.exit('paste acknowledgement lost')
+elif command == 'shell input tap 80 10' and root.name.startswith('anr_'):
+    if (root / 'restored').exists():
+        sys.exit('clipboard restored before ANR recovery')
+    (root / 'waited').touch()
+elif command == 'exec-out uiautomator dump /dev/tty':
+    if (root / 'restored').exists():
+        sys.exit('clipboard restored before text verification')
+    count_file = root / 'captures'
+    count = int(count_file.read_text()) + 1 if count_file.exists() else 1
+    count_file.write_text(str(count))
+    ready = count > 1 and root.name not in ['verification_failure', 'anr_missing']
+    capture = 'after.xml' if ready else 'before.xml'
+    if root.name.startswith('anr_') and not (root / 'waited').exists():
+        capture = 'dialog.xml'
+    print((root / capture).read_text())
+elif command == 'shell dumpsys window windows':
+    print('mCurrentFocus=Window{a u0 fixture/.Main}')
+elif command == 'shell dumpsys activity activities':
+    print('mResumedActivity: ActivityRecord{a u0 fixture/.Main}')
+else:
+    sys.exit('Unexpected fixture command')
+"#,
+            )
+            .await
+            .unwrap();
+            fs::set_permissions(&adb, std::fs::Permissions::from_mode(0o700))
+                .await
+                .unwrap();
+            let mcp = adb_fixture_server(&root);
+            let deadline = match scenario {
+                "deadline" => Instant::now() - Duration::from_secs(1),
+                "verification_failure" => Instant::now() + Duration::from_secs(1),
+                "anr_success" => Instant::now() + Duration::from_secs(8),
+                "anr_wrong" | "anr_missing" => Instant::now() + Duration::from_secs(6),
+                "anr_unsafe" => Instant::now() + Duration::from_secs(2),
+                _ => Instant::now() + Duration::from_secs(5),
+            };
+            let request = VerifiedTextDispatchRequest {
+                serial: "clipboard-fixture",
+                text,
+                pre_text_nodes: if scenario == "raw_existing" {
+                    &already_matching
+                } else {
+                    &before
+                },
+                public_target_selector: Some(&selector),
+                target_tracker: Some(&tracker),
+                target_selector: Some(&selector),
+                wait_for_selector: None,
+                deadline,
+                hierarchy_filename: None,
+                replace_existing_text_on_adb: !matches!(scenario, "raw_success" | "raw_existing"),
+                existing_text_for_adb_replace: None,
+            };
+            if matches!(scenario, "unavailable" | "raw_existing") {
+                let error = mcp
+                    .send_text_with_verification(request)
+                    .await
+                    .err()
+                    .unwrap();
+                if scenario == "raw_existing" {
+                    assert!(error.message.contains("existing matching text"));
+                }
+                assert_eq!(error.data.unwrap()["outcome"], "unsupported_capability");
+                assert!(!root.join("calls").exists());
+                continue;
+            }
+            let mut cleanup = RecordingCleanup {
+                root: root.clone(),
+                result: match scenario {
+                    "cleanup_failure" => Err(grpc_backend::GrpcMutationError::OutcomeUnknown(
+                        "private cleanup failure".into(),
+                    )),
+                    "intervening_change" => {
+                        Ok(grpc_backend::ClipboardRestoreOutcome::PreservedInterveningChange)
+                    }
+                    _ => Ok(grpc_backend::ClipboardRestoreOutcome::Restored),
+                },
+                calls: 0,
+                restored_at: None,
+            };
+            let token = tokio_util::sync::CancellationToken::new();
+            if scenario == "cancelled" {
+                token.cancel();
+            }
+            let result = crate::execution::with_cancellation(
+                token,
+                mcp.dispatch_staged_clipboard_text(&mut cleanup, request),
+            )
+            .await;
+            assert_eq!(cleanup.calls, 1, "cleanup must execute exactly once");
+            if matches!(
+                scenario,
+                "success" | "raw_success" | "intervening_change" | "anr_success"
+            ) {
+                let result = result.unwrap();
+                assert!(result.verification.satisfied);
+                if scenario == "anr_success" {
+                    assert_eq!(
+                        result.verification.stable_polls_observed, 1,
+                        "One fresh exact editable-text proof retains the existing confirmation rule"
+                    );
+                    assert_eq!(
+                        text_verification_json(&result.verification)["handled_system_dialogs"],
+                        json!([{ "kind": "anr", "action": "wait" }])
+                    );
+                }
+                assert_eq!(result.dispatch.backend, "emulator_clipboard_adb");
+                assert_eq!(
+                    result.clipboard_restore,
+                    Some(if scenario == "intervening_change" {
+                        "preserved_intervening_change"
+                    } else {
+                        "restored"
+                    })
+                );
+                assert!(
+                    fs::read_to_string(root.join("captures"))
+                        .await
+                        .unwrap()
+                        .parse::<usize>()
+                        .unwrap()
+                        >= 2
+                );
+            } else {
+                let error = result.err().unwrap();
+                let data = error.data.as_ref().unwrap();
+                assert_eq!(data["outcome"], "outcome_unknown");
+                assert_eq!(data["retry_safe"], false);
+                assert_eq!(data["do_not_replay"], true);
+                assert_eq!(
+                    data["phase"],
+                    match scenario {
+                        "paste_error" => "paste_dispatch",
+                        "verification_failure" | "anr_wrong" | "anr_missing" | "anr_unsafe" =>
+                            "text_verification",
+                        "cleanup_failure" => "clipboard_restore",
+                        "cancelled" => "cancelled_before_next_input",
+                        "deadline" => "deadline_before_next_input",
+                        _ => unreachable!(),
+                    }
+                );
+                assert!(!error.to_string().contains(text));
+                assert!(!error.to_string().contains("private cleanup failure"));
+                assert_eq!(
+                    data["clipboard_restore"],
+                    if scenario == "cleanup_failure" {
+                        "unknown"
+                    } else {
+                        "restored"
+                    }
+                );
+                if matches!(
+                    scenario,
+                    "verification_failure" | "anr_wrong" | "anr_missing" | "anr_unsafe"
+                ) {
+                    assert!(cleanup.restored_at.unwrap() >= deadline);
+                    assert_eq!(data["text_verified"], false);
+                    assert_eq!(data["text_verification"]["satisfied"], false);
+                    assert!(data["text_verification"].get("target_selector").is_none());
+                    assert!(data["text_verification"].get("wait_for_selector").is_none());
+                    assert_eq!(
+                        data["text_verification"]["handled_system_dialogs"],
+                        if matches!(scenario, "anr_wrong" | "anr_missing") {
+                            json!([{ "kind": "anr", "action": "wait" }])
+                        } else {
+                            json!([])
+                        }
+                    );
+                    assert!(
+                        Path::new(
+                            data["artifacts"]["post_text_hierarchy_path"]
+                                .as_str()
+                                .unwrap()
+                        )
+                        .is_file()
+                    );
+                    if matches!(scenario, "anr_wrong" | "anr_missing") {
+                        assert!(
+                            fs::read_to_string(root.join("captures"))
+                                .await
+                                .unwrap()
+                                .parse::<usize>()
+                                .unwrap()
+                                >= 2,
+                            "Failure must include a fresh observation after Wait"
+                        );
+                    }
+                } else if matches!(scenario, "paste_error" | "cleanup_failure") {
+                    assert_eq!(data["text_verified"], true);
+                }
+            }
+            let calls = fs::read_to_string(root.join("calls"))
+                .await
+                .unwrap_or_default();
+            assert!(
+                !calls
+                    .lines()
+                    .any(|line| line == "exec-out cmd window dump-visible-window-views"),
+                "Text verification must use semantic observations: {scenario}"
+            );
+            let mutations = calls
+                .lines()
+                .filter(|line| line.starts_with("shell input"))
+                .collect::<Vec<_>>();
+            if matches!(scenario, "cancelled" | "deadline") {
+                assert!(mutations.is_empty());
+            } else if scenario == "raw_success" {
+                assert_eq!(mutations, ["shell input keyevent KEYCODE_PASTE"]);
+            } else if matches!(scenario, "anr_success" | "anr_wrong" | "anr_missing") {
+                assert_eq!(
+                    mutations,
+                    [
+                        "shell input keycombination CTRL_LEFT A",
+                        "shell input keyevent KEYCODE_PASTE",
+                        "shell input tap 80 10",
+                    ],
+                    "Original paste must run once and clipboard recovery must only choose Wait"
+                );
+            } else {
+                assert_eq!(
+                    mutations,
+                    [
+                        "shell input keycombination CTRL_LEFT A",
+                        "shell input keyevent KEYCODE_PASTE"
+                    ]
+                );
+            }
+        }
+        fs::remove_dir_all(parent).await.unwrap();
+    }
+
+    #[test]
+    fn overlapping_distinct_controls_remain_ambiguous() {
+        let xml = r#"<hierarchy>
+          <node text="Search" clickable="true" enabled="true" resource-id="first" bounds="[0,0][100,100]"/>
+          <node text="Search" clickable="true" enabled="true" resource-id="second" bounds="[0,0][100,100]"/>
+        </hierarchy>"#;
+        let path =
+            std::env::temp_dir().join(timestamp_filename("overlapping-controls", Some("xml")));
+        std::fs::write(&path, xml).unwrap();
+        let found = find_interactive_ui_node(
+            &path,
+            &UiSelector {
+                text: Some("Search".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(found.matches.len(), 2);
+        assert!(matches!(
+            resolve_node_selection(found.matches, None),
+            Err(SelectionFailure::Ambiguous { match_count: 2, .. })
+        ));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn observed_rotation_uses_the_default_display_and_never_the_setting() {
+        let output = "Viewport EXTERNAL: displayId=7, orientation=3, logicalFrame=[0,0,2000,1000]\nViewport INTERNAL: displayId=0, uniqueId=local:1, orientation=1, logicalFrame=[0,0,2400,1080]";
+        assert_eq!(parse_default_display_rotation(output), Some(1));
+        assert_eq!(
+            parse_default_display_rotation("SurfaceOrientation: 2"),
+            Some(2)
+        );
+        assert_eq!(
+            parse_default_display_rotation("SurfaceOrientation: 0\nSurfaceOrientation: 1"),
+            None
+        );
+        assert_eq!(parse_default_display_rotation("user_rotation=0"), None);
+        assert_eq!(
+            parse_default_display_rotation("Viewport INTERNAL: displayId=10, orientation=2"),
+            None
+        );
+        assert_eq!(rotated_display_size((1080, 2400), 1), (2400, 1080));
+        assert_eq!(
+            rotation_for_display_orientation("portrait", (2400, 1600)).unwrap(),
+            1
+        );
+        assert_eq!(
+            orientation_for_display_rotation(0, (2400, 1600)),
+            "landscape"
+        );
+    }
+
+    #[test]
+    fn swipe_requires_every_requested_postcondition() {
+        assert!(
+            !swipe_outcome_satisfied(true, true, false),
+            "an unchanged scroll cannot be called successful"
+        );
+        assert!(
+            !swipe_outcome_satisfied(false, true, true),
+            "a scroll does not satisfy an unmet selector"
+        );
+        assert!(swipe_outcome_satisfied(true, true, true));
+        assert!(swipe_outcome_satisfied(true, false, false));
+    }
+
+    #[test]
+    fn full_ui_output_is_bounded_and_reports_total_nodes() {
+        let node = parse_ui_nodes_from_xml(
+            r#"<hierarchy><node text="Example" bounds="[0,0][100,100]"/></hierarchy>"#,
+        )
+        .unwrap()
+        .remove(0);
+        let output = ui_nodes_for_tool_output(&vec![node; 500]);
+        assert_eq!(output.total_count, 500);
+        assert_eq!(output.returned_count, 400);
+        assert_eq!(output.nodes.len(), 400);
+    }
+
+    #[tokio::test]
+    async fn quoted_remote_shell_argument_preserves_literal_text() {
+        let value = "A name's details & spaces";
+        let command = format!("printf '%s' {}", shell_quote(value));
+        let output = Command::new("sh")
+            .args(["-c", &command])
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), value);
+    }
+
+    #[test]
+    fn dispatch_error_carries_non_replayable_unknown_outcome() {
+        let error = uncertain_mutation_error("tap", "grpc", "response lost");
+        let data = error.data.expect("structured recovery guidance");
+        assert_eq!(data["outcome"], "outcome_unknown");
+        assert_eq!(data["retry_safe"], false);
+        assert_eq!(data["do_not_replay"], true);
+    }
+
+    #[test]
+    fn grpc_endpoint_override_requires_the_discovered_serial_binding() {
+        let endpoint = discovery::GrpcEndpoint {
+            port: 8554,
+            auth_token: Some("test-token".to_string()),
+        };
+        assert!(select_serial_bound_grpc_endpoint(Some(8554), None).is_none());
+        assert!(select_serial_bound_grpc_endpoint(Some(8556), Some(endpoint.clone())).is_none());
+        assert_eq!(
+            select_serial_bound_grpc_endpoint(Some(8554), Some(endpoint.clone())),
+            Some(endpoint.clone())
+        );
+        assert_eq!(
+            select_serial_bound_grpc_endpoint(None, Some(endpoint.clone())),
+            Some(endpoint)
+        );
+    }
+
+    #[test]
+    fn gesture_and_deadline_budgets_are_bounded() {
+        assert!(validate_gesture_duration(0).is_err());
+        assert!(validate_gesture_duration(u64::MAX).is_err());
+        assert!(validate_gesture_duration(500).is_ok());
+        assert!(remaining_until(tool_deadline(Some(u64::MAX), 5)) <= Duration::from_secs(300));
+    }
+
+    #[test]
+    fn false_receipts_are_mcp_tool_errors_even_with_images() {
+        let receipt = structured_receipt(json!({"ok": false, "timed_out": true}));
+        assert_eq!(receipt.is_error, Some(true));
+        let image = observation_result_with_optional_screenshot(
+            json!({"ok": false, "outcome": "postcondition_failed"}),
+            Some(b"\x89PNG\r\n\x1a\nfixture".to_vec()),
+        )
+        .expect("failure may include a useful screenshot");
+        assert_eq!(image.is_error, Some(true));
+        assert!(image.structured_content.is_none());
+        assert_eq!(image.content.len(), 2);
+        assert!(
+            observation_result_with_optional_screenshot(
+                json!({"ok": true}),
+                Some(b"not an image".to_vec())
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn generated_artifacts_use_new_files_and_fail_closed_at_capacity() {
+        let root = std::env::temp_dir().join(timestamp_filename("artifact-write-budget", None));
+        let directory = ensure_artifact_directory(&root, "screenshots")
+            .await
+            .unwrap();
+        let path = directory.join("capture.png");
+        write_public_artifact(&root, &path, b"first").await.unwrap();
+        assert!(
+            write_public_artifact(&root, &path, b"replacement")
+                .await
+                .is_err()
+        );
+        assert_eq!(fs::read(&path).await.unwrap(), b"first");
+        assert!(
+            ensure_artifact_store_capacity(&root, 0, 4, 10)
+                .await
+                .is_err()
+        );
+        assert!(
+            ensure_artifact_store_capacity(&root, 0, 100, 1)
+                .await
+                .is_err()
+        );
+        assert!(
+            ensure_artifact_directory(&root, ".action-ledger")
+                .await
+                .is_err()
+        );
+        assert!(
+            ensure_artifact_directory(&root, "../outside")
+                .await
+                .is_err()
+        );
+        assert!(
+            write_public_artifact(&root, &root.join(".action-ledger"), b"private")
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            fs::read(&path).await.unwrap(),
+            b"first",
+            "capacity checks do not delete artifacts"
+        );
+        fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn generated_artifacts_reject_symlink_directories_and_existing_symlink_files() {
+        let sandbox =
+            std::env::temp_dir().join(timestamp_filename("artifact-write-symlinks", None));
+        let root = sandbox.join("artifacts");
+        let outside = sandbox.join("outside");
+        fs::create_dir_all(&root).await.unwrap();
+        fs::create_dir_all(&outside).await.unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("screenshots")).unwrap();
+        assert!(
+            ensure_artifact_directory(&root, "screenshots")
+                .await
+                .is_err()
+        );
+        let directory = ensure_artifact_directory(&root, "uiautomator")
+            .await
+            .unwrap();
+        let target = outside.join("target.xml");
+        fs::write(&target, b"original").await.unwrap();
+        let link = directory.join("hierarchy.xml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(write_public_artifact(&root, &link, b"new").await.is_err());
+        assert_eq!(fs::read(&target).await.unwrap(), b"original");
+        fs::remove_dir_all(sandbox).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn artifact_reads_reject_oversized_files_and_directories() {
+        let root = std::env::temp_dir().join(timestamp_filename("artifact-read-limits", None));
+        fs::create_dir_all(&root).await.unwrap();
+        let path = root.join("sample.txt");
+        fs::write(&path, b"123456789").await.unwrap();
+        assert!(read_limited_artifact_bytes(&path, 8).await.is_err());
+        assert_eq!(
+            read_limited_artifact_bytes(&path, 9).await.unwrap(),
+            b"123456789"
+        );
+        assert!(read_limited_artifact_bytes(&root, 9).await.is_err());
+        fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn artifact_paths_reject_outside_files_and_private_action_ledger() {
+        let sandbox = std::env::temp_dir().join(timestamp_filename("artifact-path-scope", None));
+        let root = sandbox.join("artifacts");
+        fs::create_dir_all(root.join(".action-ledger"))
+            .await
+            .unwrap();
+        let public = root.join("screen.txt");
+        let private = root.join(".action-ledger/action.json");
+        let outside = sandbox.join("outside.txt");
+        for path in [&public, &private, &outside] {
+            fs::write(path, b"fixture").await.unwrap();
+        }
+        assert!(resolve_public_artifact_path(&root, &public).await.is_ok());
+        assert!(resolve_public_artifact_path(&root, &outside).await.is_err());
+        assert!(resolve_public_artifact_path(&root, &private).await.is_err());
+        #[cfg(unix)]
+        {
+            let outside_link = root.join("outside-link");
+            let private_link = root.join("private-link");
+            std::os::unix::fs::symlink(&outside, &outside_link).unwrap();
+            std::os::unix::fs::symlink(&private, &private_link).unwrap();
+            assert!(
+                resolve_public_artifact_path(&root, &outside_link)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                resolve_public_artifact_path(&root, &private_link)
+                    .await
+                    .is_err()
+            );
+        }
+        fs::remove_dir_all(sandbox).await.unwrap();
+    }
+
+    #[test]
+    fn target_epoch_mismatch_is_rejected_before_device_action() {
+        let error = resolve_android_execution_target(
+            &provider_execution_identity(),
+            Some(&AndroidExecutionTarget {
+                provider_epoch: Some("stale-epoch".to_string()),
+                ..Default::default()
+            }),
+            "emulator-5554".to_string(),
             None,
         )
-        .expect("structured result should remain available without a screenshot");
+        .expect_err("restarted provider invalidates stale identity");
+        assert!(error.to_string().contains("provider_epoch"));
+    }
+
+    #[test]
+    fn legacy_retry_flags_default_to_disabled() {
+        let tap: TapElementArgs = serde_json::from_value(json!({"selector": "Search"})).unwrap();
+        assert!(!tap.retry_with_adb_on_no_change);
+    }
+
+    fn provider_execution_identity() -> ProviderExecutionIdentity {
+        ProviderExecutionIdentity {
+            environment_id: "environment-1".to_string(),
+            provider_instance_id: "provider-1".to_string(),
+            provider_epoch: "epoch-1".to_string(),
+            session_id: "session-1".to_string(),
+        }
+    }
+
+    #[test]
+    fn resolves_an_exact_target_against_the_configured_provider_tuple() {
+        let resolved = resolve_android_execution_target(
+            &provider_execution_identity(),
+            Some(&AndroidExecutionTarget {
+                environment_id: Some("environment-1".to_string()),
+                provider_instance_id: Some("provider-1".to_string()),
+                provider_epoch: Some("epoch-1".to_string()),
+                session_id: Some("session-1".to_string()),
+                device_serial: Some("emulator-5554".to_string()),
+                app: Some(AndroidAppTarget {
+                    package_name: "com.example.app".to_string(),
+                    activity: Some(".MainActivity".to_string()),
+                }),
+                expected_build: None,
+            }),
+            "emulator-5554".to_string(),
+            None,
+        )
+        .expect("exact target should resolve");
+
         assert_eq!(
-            without_screenshot
-                .structured_content
-                .as_ref()
-                .expect("no-image response should retain structured receipt"),
-            &json!({"ok": true, "serial": "emulator-5554"})
+            resolved,
+            ResolvedAndroidExecutionTarget {
+                environment_id: "environment-1".to_string(),
+                provider_instance_id: "provider-1".to_string(),
+                provider_epoch: "epoch-1".to_string(),
+                session_id: "session-1".to_string(),
+                device_serial: "emulator-5554".to_string(),
+                app: Some(AndroidAppTarget {
+                    package_name: "com.example.app".to_string(),
+                    activity: Some(".MainActivity".to_string()),
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_a_target_for_another_live_provider_session() {
+        let err = resolve_android_execution_target(
+            &provider_execution_identity(),
+            Some(&AndroidExecutionTarget {
+                session_id: Some("session-old-candidate".to_string()),
+                ..Default::default()
+            }),
+            "emulator-5554".to_string(),
+            None,
+        )
+        .expect_err("stale session target must fail closed");
+
+        assert!(
+            err.to_string()
+                .contains("target.session_id does not match the resolved provider target")
         );
     }
 
@@ -5066,6 +8764,26 @@ mod tests {
         let resolved = resolve_serial_from_devices(Some(" emulator-5554 "), &[])
             .expect("explicit serial should be accepted");
         assert_eq!(resolved, "emulator-5554");
+    }
+
+    #[test]
+    fn explicit_serial_requires_a_ready_connected_device() {
+        let resolved = resolve_explicit_ready_serial(
+            "emulator-5554",
+            &[json!({ "serial": "emulator-5554", "state": "device" })],
+        )
+        .expect("ready explicit serial should resolve");
+        assert_eq!(resolved, "emulator-5554");
+
+        let err = resolve_explicit_ready_serial(
+            "emulator-5554",
+            &[json!({ "serial": "emulator-5554", "state": "offline" })],
+        )
+        .expect_err("offline explicit serial must not become a resolved target");
+        assert!(
+            err.to_string()
+                .contains("requested Android serial emulator-5554 is not a ready connected device")
+        );
     }
 
     #[test]
@@ -5277,6 +8995,206 @@ mod tests {
         assert!(button.focused);
         assert!(button.long_clickable);
         assert_eq!(button.center, Some((144, 138)));
+    }
+
+    #[test]
+    fn compact_ui_nodes_for_output_truncates_large_text_fields_only_in_tool_output() {
+        let long_text = "runtime-packet|".repeat(40);
+        let xml = format!(
+            r#"
+            <hierarchy>
+              <node text="{long_text}" content-desc="{long_text}" resource-id="com.example:id/status" class="android.widget.TextView" package="com.example" clickable="false" focusable="false" focused="false" scrollable="false" long-clickable="false" enabled="true" selected="false" checked="false" bounds="[0,0][1080,120]" />
+            </hierarchy>
+        "#
+        );
+        let nodes = parse_ui_nodes_from_xml(&xml).expect("ui nodes should parse");
+        assert_eq!(nodes[0].text.as_deref(), Some(long_text.as_str()));
+
+        let output = ui_nodes_for_tool_output(&nodes);
+        let compact_text = output.nodes[0]
+            .text
+            .as_deref()
+            .expect("compact text should remain present");
+        assert!(compact_text.starts_with("runtime-packet|runtime-packet|"));
+        assert!(compact_text.contains("[truncated; original_chars="));
+        assert!(compact_text.len() < long_text.len());
+        assert_eq!(nodes[0].text.as_deref(), Some(long_text.as_str()));
+        assert_eq!(output.total_count, 1);
+        assert_eq!(output.returned_count, 1);
+        assert_eq!(output.compacted_text_fields, 3);
+        assert_eq!(output.text_char_limit, 240);
+    }
+
+    #[test]
+    fn visible_ui_output_returns_compact_labels_with_bounds_without_mutating_nodes() {
+        let long_text = "runtime packet ".repeat(20);
+        let xml = format!(
+            r#"
+            <hierarchy>
+              <node text="" content-desc="" resource-id="" class="android.widget.FrameLayout" package="com.example" clickable="false" focusable="false" focused="false" scrollable="true" long-clickable="false" enabled="true" selected="false" checked="false" bounds="[0,0][1080,2400]">
+                <node text="Search" content-desc="Search action" resource-id="com.example:id/search" class="android.widget.Button" package="com.example" clickable="true" focusable="true" focused="false" scrollable="false" long-clickable="false" enabled="true" selected="false" checked="false" bounds="[48,96][240,180]" />
+                <node text="{long_text}" content-desc="" resource-id="com.example:id/status" class="android.widget.TextView" package="com.example" clickable="false" focusable="false" focused="false" scrollable="false" long-clickable="false" enabled="true" selected="false" checked="false" bounds="[0,200][1080,260]" />
+                <node text="Advance" content-desc="" resource-id="com.example:id/advance" class="android.widget.Button" package="com.example" clickable="true" focusable="true" focused="false" scrollable="false" long-clickable="false" enabled="true" selected="false" checked="false" bounds="[1040,300][1120,360]" />
+              </node>
+            </hierarchy>
+        "#
+        );
+        let nodes = parse_ui_nodes_from_xml(&xml).expect("ui nodes should parse");
+
+        let visible_ui = visible_ui_for_tool_output(&nodes);
+
+        assert_eq!(visible_ui.total_labeled_count, 3);
+        assert_eq!(visible_ui.returned_count, 3);
+        assert_eq!(visible_ui.label_char_limit, 96);
+        assert_eq!(
+            visible_ui.viewport,
+            Some(UiBounds {
+                left: 0,
+                top: 0,
+                right: 1080,
+                bottom: 2400,
+            })
+        );
+        assert_eq!(visible_ui.clipped_node_count, 1);
+        assert_eq!(visible_ui.scrollable_node_count, 1);
+        assert_eq!(visible_ui.nodes[0].label, "Search");
+        assert_eq!(
+            visible_ui.nodes[0].bounds,
+            UiBounds {
+                left: 48,
+                top: 96,
+                right: 240,
+                bottom: 180,
+            }
+        );
+        assert!(visible_ui.nodes[0].interactive);
+        assert!(!visible_ui.nodes[0].scrollable);
+        assert!(
+            visible_ui.nodes[1]
+                .label
+                .contains("[truncated; original_chars=")
+        );
+        assert!(!visible_ui.nodes[1].clipped);
+        assert_eq!(visible_ui.nodes[1].visible_fraction_percent, 100);
+        assert_eq!(visible_ui.nodes[2].label, "Advance [clipped right 50%]");
+        assert!(visible_ui.nodes[2].clipped);
+        assert_eq!(visible_ui.nodes[2].clip_edges, vec!["right"]);
+        assert_eq!(visible_ui.nodes[2].visible_fraction_percent, 50);
+        assert_eq!(nodes[2].text.as_deref(), Some(long_text.trim()));
+    }
+
+    #[test]
+    fn visible_ui_output_annotates_state_in_digest_labels_without_mutating_nodes() {
+        let xml = r#"
+            <hierarchy>
+              <node text="" content-desc="" resource-id="" class="android.widget.FrameLayout" package="com.example" clickable="false" focusable="false" focused="false" scrollable="false" long-clickable="false" enabled="true" selected="false" checked="false" bounds="[0,0][1080,2400]">
+                <node text="Frame" content-desc="" resource-id="com.example:id/frame" class="android.widget.Button" package="com.example" clickable="true" focusable="true" focused="false" scrollable="false" long-clickable="false" enabled="false" selected="false" checked="false" bounds="[48,96][240,180]" />
+                <node text="Mission feed" content-desc="" resource-id="com.example:id/feed" class="android.widget.ScrollView" package="com.example" clickable="false" focusable="true" focused="false" scrollable="true" long-clickable="false" enabled="true" selected="false" checked="false" bounds="[48,220][720,900]" />
+                <node text="Advance" content-desc="" resource-id="com.example:id/advance" class="android.widget.Button" package="com.example" clickable="true" focusable="true" focused="false" scrollable="false" long-clickable="false" enabled="true" selected="false" checked="false" bounds="[1040,940][1120,1000]" />
+              </node>
+            </hierarchy>
+        "#;
+        let nodes = parse_ui_nodes_from_xml(xml).expect("ui nodes should parse");
+
+        let visible_ui = visible_ui_for_tool_output(&nodes);
+
+        assert_eq!(visible_ui.returned_count, 3);
+        assert_eq!(visible_ui.nodes[0].label, "Frame [disabled]");
+        assert!(!visible_ui.nodes[0].enabled);
+        assert_eq!(visible_ui.nodes[1].label, "Mission feed [scrollable]");
+        assert!(visible_ui.nodes[1].scrollable);
+        assert_eq!(visible_ui.nodes[2].label, "Advance [clipped right 50%]");
+        assert!(visible_ui.nodes[2].clipped);
+        assert_eq!(
+            nodes
+                .iter()
+                .find(|node| node.resource_id.as_deref() == Some("com.example:id/frame"))
+                .and_then(|node| node.text.as_deref()),
+            Some("Frame")
+        );
+        assert_eq!(
+            nodes
+                .iter()
+                .find(|node| node.resource_id.as_deref() == Some("com.example:id/feed"))
+                .and_then(|node| node.text.as_deref()),
+            Some("Mission feed")
+        );
+    }
+
+    #[test]
+    fn visible_ui_output_suppresses_nested_duplicate_button_text() {
+        let xml = r#"
+            <hierarchy>
+              <node text="" content-desc="" resource-id="" class="android.widget.FrameLayout" package="com.example" clickable="false" focusable="false" focused="false" scrollable="false" long-clickable="false" enabled="true" selected="false" checked="false" bounds="[0,0][1080,2400]">
+                <node text="" content-desc="" resource-id="" class="android.widget.Button" package="com.example" clickable="true" focusable="true" focused="false" scrollable="false" long-clickable="false" enabled="true" selected="false" checked="false" bounds="[40,100][220,220]">
+                  <node text="Pause" content-desc="" resource-id="" class="android.widget.TextView" package="com.example" clickable="false" focusable="false" focused="false" scrollable="false" long-clickable="false" enabled="true" selected="false" checked="false" bounds="[72,136][188,184]" />
+                </node>
+              </node>
+            </hierarchy>
+        "#;
+        let nodes = parse_ui_nodes_from_xml(xml).expect("ui nodes should parse");
+
+        let visible_ui = visible_ui_for_tool_output(&nodes);
+
+        assert_eq!(visible_ui.total_labeled_count, 1);
+        assert_eq!(visible_ui.returned_count, 1);
+        assert_eq!(visible_ui.nodes[0].label, "Pause");
+        assert!(visible_ui.nodes[0].interactive);
+        assert_eq!(
+            visible_ui.nodes[0].bounds,
+            UiBounds {
+                left: 40,
+                top: 100,
+                right: 220,
+                bottom: 220,
+            }
+        );
+    }
+
+    #[test]
+    fn visible_ui_output_surfaces_unlabeled_scrollable_regions() {
+        let xml = r#"
+            <hierarchy>
+              <node text="" content-desc="" resource-id="" class="android.widget.FrameLayout" package="com.example" clickable="false" focusable="false" focused="false" scrollable="true" long-clickable="false" enabled="true" selected="false" checked="false" bounds="[0,0][1080,2400]">
+                <node text="" content-desc="" resource-id="" class="androidx.recyclerview.widget.RecyclerView" package="com.example" clickable="false" focusable="true" focused="false" scrollable="true" long-clickable="false" enabled="true" selected="false" checked="false" bounds="[60,360][1020,1440]">
+                  <node text="Earth" content-desc="" resource-id="com.example:id/earth" class="android.widget.TextView" package="com.example" clickable="false" focusable="false" focused="false" scrollable="false" long-clickable="false" enabled="true" selected="false" checked="false" bounds="[96,420][260,480]" />
+                </node>
+              </node>
+            </hierarchy>
+        "#;
+        let nodes = parse_ui_nodes_from_xml(xml).expect("ui nodes should parse");
+
+        let visible_ui = visible_ui_for_tool_output(&nodes);
+
+        assert_eq!(visible_ui.scrollable_node_count, 2);
+        assert_eq!(visible_ui.total_labeled_count, 2);
+        assert_eq!(visible_ui.returned_count, 2);
+        assert_eq!(visible_ui.nodes[0].label, "Scrollable list");
+        assert_eq!(
+            visible_ui.nodes[0].bounds,
+            UiBounds {
+                left: 60,
+                top: 360,
+                right: 1020,
+                bottom: 1440,
+            }
+        );
+        assert!(visible_ui.nodes[0].interactive);
+        assert!(visible_ui.nodes[0].scrollable);
+        assert_eq!(visible_ui.nodes[1].label, "Earth");
+        let root_bounds = UiBounds {
+            left: 0,
+            top: 0,
+            right: 1080,
+            bottom: 2400,
+        };
+        assert!(
+            !visible_ui
+                .nodes
+                .iter()
+                .any(|node| node.bounds == root_bounds),
+            "root viewport scroll containers should stay hidden"
+        );
     }
 
     #[test]
@@ -6252,6 +10170,42 @@ mod tests {
     }
 
     #[test]
+    fn focus_verification_target_selector_drops_volatile_interaction_flags() {
+        let focused_field = NormalizedUiNode {
+            class_name: Some("android.widget.EditText".to_string()),
+            package_name: Some("com.example".to_string()),
+            text: Some("Search by name or id".to_string()),
+            semantic_label: Some("Search by name or id".to_string()),
+            content_desc: None,
+            resource_id: None,
+            clickable: true,
+            focusable: true,
+            enabled: true,
+            selected: false,
+            checked: false,
+            focused: false,
+            scrollable: false,
+            long_clickable: true,
+            bounds: None,
+            center: None,
+        };
+
+        let derived_selector = focus_verification_target_selector(&focused_field);
+
+        assert_eq!(derived_selector.resource_id, None);
+        assert_eq!(derived_selector.focusable, Some(true));
+        assert_eq!(derived_selector.focused, Some(true));
+        assert_eq!(derived_selector.clickable, None);
+        assert_eq!(derived_selector.long_clickable, None);
+        assert_eq!(
+            derived_selector.text,
+            Some("Search by name or id".to_string())
+        );
+        assert_eq!(derived_selector.content_desc, None);
+        assert_eq!(derived_selector.label, None);
+    }
+
+    #[test]
     fn text_verification_allows_noop_when_target_already_matches_requested_text() {
         let field = NormalizedUiNode {
             class_name: Some("android.widget.EditText".to_string()),
@@ -6460,90 +10414,12 @@ mod tests {
     }
 
     #[test]
-    fn bounded_deadline_prefers_shorter_soft_budget() {
-        let hard_deadline = Instant::now() + Duration::from_secs(5);
-        let bounded = bounded_deadline(hard_deadline, Duration::from_millis(250));
-
-        assert!(bounded <= hard_deadline);
-        assert!(remaining_until(bounded) <= Duration::from_millis(300));
-    }
-
-    #[test]
-    fn reserved_fallback_deadline_keeps_time_in_hand_for_retry_budget() {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let reserved = reserved_fallback_deadline(deadline, Duration::from_secs(2));
-
-        assert!(reserved <= deadline);
-        assert!(remaining_until(reserved) >= Duration::from_secs(2));
-    }
-
-    #[test]
-    fn initial_text_verification_deadline_uses_full_budget_for_adb_dispatch() {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let initial = initial_text_verification_deadline("adb", deadline, true);
-
-        assert_eq!(initial, deadline);
-    }
-
-    #[test]
-    fn initial_text_verification_deadline_uses_full_budget_when_retry_disabled() {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let initial = initial_text_verification_deadline("grpc", deadline, false);
-
-        assert_eq!(initial, deadline);
-    }
-
-    #[test]
-    fn initial_text_verification_deadline_uses_full_budget_when_not_enough_time_for_split() {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let initial = initial_text_verification_deadline("grpc", deadline, true);
-
-        assert_eq!(initial, deadline);
-    }
-
-    #[test]
-    fn initial_text_verification_deadline_reserves_budget_only_when_split_is_meaningful() {
-        let deadline = Instant::now() + Duration::from_secs(12);
-        let initial = initial_text_verification_deadline("grpc", deadline, true);
-
-        assert!(initial < deadline);
-        assert!(remaining_until(initial) >= Duration::from_millis(6800));
-        assert!(remaining_until(initial) <= Duration::from_millis(7100));
-        assert!(has_meaningful_text_fallback_budget(deadline));
-    }
-
-    #[test]
-    fn meaningful_text_fallback_budget_rejects_near_expiry_deadlines() {
-        let almost_expired = Instant::now() + Duration::from_millis(1500);
-        let healthy = Instant::now() + Duration::from_millis(5200);
-
-        assert!(!has_meaningful_text_fallback_budget(almost_expired));
-        assert!(has_meaningful_text_fallback_budget(healthy));
-    }
-
-    #[test]
     fn has_meaningful_observation_budget_rejects_near_expiry_deadlines() {
         let almost_expired = Instant::now() + Duration::from_millis(100);
         let healthy = Instant::now() + Duration::from_millis(1000);
 
         assert!(!has_meaningful_observation_budget(almost_expired));
         assert!(has_meaningful_observation_budget(healthy));
-    }
-
-    #[test]
-    fn has_meaningful_fast_ui_fingerprint_budget_requires_full_capture_reserve() {
-        let tight = Instant::now() + Duration::from_millis(5400);
-        let healthy = Instant::now() + Duration::from_millis(6500);
-
-        assert!(!has_meaningful_fast_ui_fingerprint_budget(tight));
-        assert!(has_meaningful_fast_ui_fingerprint_budget(healthy));
-    }
-
-    #[test]
-    fn fallback_clear_delete_count_tracks_existing_text_length() {
-        assert_eq!(fallback_clear_delete_count(None), 0);
-        assert_eq!(fallback_clear_delete_count(Some("")), 0);
-        assert_eq!(fallback_clear_delete_count(Some("earth")), 5);
     }
 
     #[test]
@@ -6571,9 +10447,9 @@ mod tests {
         assert_eq!(
             merge_dispatch_detail(
                 "replaced focused field contents via adb select-all".to_string(),
-                Some("gRPC text transport failed, fell back to adb: unavailable")
+                Some("replacement text dispatched through adb")
             ),
-            "replaced focused field contents via adb select-all; gRPC text transport failed, fell back to adb: unavailable"
+            "replaced focused field contents via adb select-all; replacement text dispatched through adb"
         );
     }
 
@@ -6627,77 +10503,128 @@ mod tests {
         assert!(!node_matches_requested_text(&node, "mars"));
     }
 
-    #[test]
-    fn retry_with_adb_is_only_used_for_failed_verified_grpc_taps() {
-        let verification = TapVerification {
-            requested: true,
-            wait_until_absent: false,
-            wait_for_selector: None,
-            satisfied: false,
-            stabilized: true,
-            stable_polls_observed: 2,
-            stable_polls_required: 2,
-            timed_out: false,
-            elapsed_ms: 250,
-            hierarchy_path: None,
-            tapped_selector_present_pre_tap: Some(true),
-            post_selector_matched_pre_tap: Some(false),
-            tapped_selector_still_present: Some(true),
-            post_selector_matched: Some(false),
-            ui_changed_from_pre_tap: Some(false),
-        };
-        assert!(should_retry_tap_with_adb("grpc", true, &verification));
-        assert!(!should_retry_tap_with_adb("adb", true, &verification));
-        assert!(!should_retry_tap_with_adb("grpc", false, &verification));
-        assert!(!should_retry_tap_with_adb(
-            "grpc",
-            true,
-            &TapVerification {
-                satisfied: true,
-                ..verification
-            }
-        ));
-    }
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stable_ui_requires_matching_hierarchy_and_window_observations_without_debug_dumps() {
+        use std::os::unix::fs::PermissionsExt;
 
-    #[test]
-    fn retry_with_adb_is_only_used_for_failed_verified_grpc_text_dispatch() {
-        let verification = TextVerification {
-            requested: true,
-            target_selector: None,
-            wait_for_selector: None,
-            satisfied: false,
-            stabilized: true,
-            stable_polls_observed: 2,
-            stable_polls_required: 2,
-            timed_out: false,
-            elapsed_ms: 250,
-            hierarchy_path: None,
-            target_selector_present_pre_text: Some(true),
-            post_selector_matched_pre_text: Some(false),
-            target_selector_still_present: Some(true),
-            target_text_matches_requested: Some(false),
-            post_selector_matched: Some(false),
-            ui_changed_from_pre_text: Some(false),
-        };
-        assert!(should_retry_text_with_adb("grpc", true, &verification));
-        assert!(!should_retry_text_with_adb("adb", true, &verification));
-        assert!(!should_retry_text_with_adb("grpc", false, &verification));
-        assert!(!should_retry_text_with_adb(
-            "grpc",
-            true,
-            &TextVerification {
-                satisfied: true,
-                ..verification.clone()
+        let parent = std::env::temp_dir().join(timestamp_filename("semantic-stability", None));
+        for scenario in ["hierarchy_changes", "window_changes", "changing", "expired"] {
+            let root = parent.join(scenario);
+            fs::create_dir_all(&root).await.unwrap();
+            let adb = root.join("adb");
+            fs::write(
+                &adb,
+                r#"#!/usr/bin/env python3
+import pathlib, shlex, sys
+root = pathlib.Path(__file__).resolve().parent
+if sys.argv[1:] == ['devices', '-l']:
+    print('List of devices attached\nstability-fixture device model:fixture')
+    sys.exit(0)
+if sys.argv[1:3] != ['-s', 'stability-fixture']:
+    sys.exit('wrong serial')
+args = sys.argv[3:]
+if args[0] == 'shell':
+    args = ['shell'] + shlex.split(args[1])
+command = ' '.join(args)
+with (root / 'calls').open('a') as log:
+    log.write(command + '\n')
+counter = root / 'captures'
+if command == 'exec-out uiautomator dump /dev/tty':
+    count = int(counter.read_text()) + 1 if counter.exists() else 1
+    counter.write_text(str(count))
+    text = str(count) if root.name == 'changing' else 'Ready'
+    if root.name == 'hierarchy_changes' and count == 1:
+        text = 'Loading'
+    print(f'<hierarchy><node package="fixture" text="{text}" bounds="[0,0][100,40]" /></hierarchy>')
+elif command in ['shell dumpsys window windows', 'shell dumpsys activity activities']:
+    count = int(counter.read_text())
+    activity = 'Before' if root.name == 'window_changes' and count == 1 else 'Main'
+    if command == 'shell dumpsys window windows':
+        print(f'mCurrentFocus=Window{{a u0 fixture/.{activity}}}')
+    else:
+        print(f'mResumedActivity: ActivityRecord{{a u0 fixture/.{activity}}}')
+else:
+    sys.exit('Unexpected fixture command: ' + command)
+"#,
+            )
+            .await
+            .unwrap();
+            fs::set_permissions(&adb, std::fs::Permissions::from_mode(0o700))
+                .await
+                .unwrap();
+            let mcp = adb_fixture_server(&root);
+            if scenario == "expired" {
+                let result = mcp
+                    .wait_for_stable_ui_internal(StableUiWaitRequest {
+                        serial: "stability-fixture",
+                        deadline: Instant::now() - Duration::from_secs(1),
+                        poll_interval: Duration::from_millis(25),
+                        required_stable_polls: 2,
+                        hierarchy_filename: "expired.xml".into(),
+                        include_screenshot: false,
+                        screenshot_filename: "expired.png".into(),
+                    })
+                    .await;
+                assert!(result.is_err());
+                assert!(!root.join("calls").exists());
+                continue;
             }
-        ));
-        assert!(!should_retry_text_with_adb(
-            "grpc",
-            true,
-            &TextVerification {
-                ui_changed_from_pre_text: Some(true),
-                ..verification
+            let started = Instant::now();
+            let receipt = mcp
+                .android_wait_for_stable_ui(Parameters(
+                    serde_json::from_value(json!({
+                        "serial": "stability-fixture",
+                        "timeout_secs": if scenario == "changing" { 3 } else { 10 },
+                        "poll_interval_ms": 25,
+                        "stable_polls": 2,
+                        "include_screenshot": false,
+                    }))
+                    .unwrap(),
+                ))
+                .await
+                .unwrap()
+                .structured_content
+                .unwrap();
+            let captures = fs::read_to_string(root.join("captures"))
+                .await
+                .unwrap()
+                .parse::<usize>()
+                .unwrap();
+            assert_eq!(receipt["stable_polls_required"], 2);
+            assert_eq!(receipt["current_focus"], "fixture/.Main");
+            assert!(Path::new(receipt["artifacts"]["hierarchy_path"].as_str().unwrap()).is_file());
+            if scenario == "changing" {
+                assert_eq!(receipt["ok"], false);
+                assert_eq!(receipt["stabilized"], false);
+                assert_eq!(receipt["timed_out"], true);
+                assert_eq!(receipt["stable_polls_observed"], 1);
+                assert!(captures >= 2);
+                assert!(started.elapsed() < Duration::from_secs(4));
+            } else {
+                assert_eq!(receipt["ok"], true);
+                assert_eq!(receipt["stabilized"], true);
+                assert_eq!(receipt["timed_out"], false);
+                assert_eq!(receipt["stable_polls_observed"], 2);
+                assert_eq!(captures, 3, "{scenario}");
             }
-        ));
+            let calls = fs::read_to_string(root.join("calls")).await.unwrap();
+            assert_eq!(
+                calls
+                    .lines()
+                    .filter(|line| *line == "exec-out uiautomator dump /dev/tty")
+                    .count(),
+                captures
+            );
+            assert!(
+                !calls
+                    .lines()
+                    .any(|line| line == "exec-out cmd window dump-visible-window-views"),
+                "Stability must use semantic observations: {scenario}"
+            );
+            assert!(!calls.lines().any(|line| line.starts_with("shell input")));
+        }
+        fs::remove_dir_all(parent).await.unwrap();
     }
 
     #[test]
@@ -6707,11 +10634,15 @@ mod tests {
             current_focus: Some("WindowA".to_string()),
             focused_app: Some("com.sednalabs.solarlab".to_string()),
             resumed_activity: Some("MainActivity".to_string()),
+            input_method_visible: false,
+            input_method_target: None,
         };
         let second = AndroidWindowState {
             current_focus: Some("WindowB".to_string()),
             focused_app: Some("com.sednalabs.solarlab".to_string()),
             resumed_activity: Some("MainActivity".to_string()),
+            input_method_visible: false,
+            input_method_target: None,
         };
 
         assert_ne!(
@@ -6735,11 +10666,88 @@ mod tests {
     }
 
     #[test]
+    fn multi_touch_validation_accepts_two_bounded_paths() {
+        let pointers = vec![
+            MultiTouchPointer {
+                x1: 100,
+                y1: 200,
+                x2: 80,
+                y2: 180,
+            },
+            MultiTouchPointer {
+                x1: 300,
+                y1: 400,
+                x2: 340,
+                y2: 440,
+            },
+        ];
+
+        validate_multi_touch_request(&pointers, 300, (1_080, 2_400))
+            .expect("valid multi-touch paths should be accepted");
+    }
+
+    #[test]
+    fn multi_touch_validation_rejects_bad_count_duration_and_coordinates() {
+        let one_pointer = vec![MultiTouchPointer {
+            x1: 100,
+            y1: 200,
+            x2: 80,
+            y2: 180,
+        }];
+        let count_error = validate_multi_touch_request(&one_pointer, 300, (1_080, 2_400))
+            .expect_err("one pointer should be rejected");
+        assert!(count_error.to_string().contains("2 to 5 paths"));
+
+        let valid_count = vec![
+            MultiTouchPointer {
+                x1: 100,
+                y1: 200,
+                x2: 80,
+                y2: 180,
+            },
+            MultiTouchPointer {
+                x1: 300,
+                y1: 400,
+                x2: 340,
+                y2: 440,
+            },
+        ];
+        let duration_error = validate_multi_touch_request(&valid_count, 49, (1_080, 2_400))
+            .expect_err("short duration should be rejected");
+        assert!(duration_error.to_string().contains("between 50 and 2000"));
+
+        let out_of_bounds = vec![
+            MultiTouchPointer {
+                x1: 1_080,
+                y1: 200,
+                x2: 80,
+                y2: 180,
+            },
+            MultiTouchPointer {
+                x1: 300,
+                y1: 400,
+                x2: 340,
+                y2: 440,
+            },
+        ];
+        let bounds_error = validate_multi_touch_request(&out_of_bounds, 300, (1_080, 2_400))
+            .expect_err("display-edge coordinate should be rejected");
+        assert!(
+            bounds_error
+                .to_string()
+                .contains("pointers[0].x1=1080 is outside the 1080x2400 display")
+        );
+    }
+
+    #[test]
     fn parses_android_window_state_from_dumpsys_output() {
         let window_output = r#"
             WINDOW MANAGER WINDOWS (dumpsys window windows)
               mCurrentFocus=Window{123 u0 com.sednalabs.solarlab/com.sednalabs.solarlab.MainActivity}
               mFocusedApp=AppWindowToken{456 token=Token{789 ActivityRecord{abc com.sednalabs.solarlab/.MainActivity}}}
+              mInputMethodTarget=Window{def u0 com.sednalabs.solarlab/com.sednalabs.solarlab.MainActivity}
+              mInputShown=true
+              mInputMethodWindow=Window{999 u0 InputMethod}
         "#;
         let activity_output = r#"
             topResumedActivity=ActivityRecord{abc u0 com.sednalabs.solarlab/.MainActivity t12}
@@ -6757,6 +10765,63 @@ mod tests {
             state.resumed_activity.as_deref(),
             Some("com.sednalabs.solarlab/.MainActivity")
         );
+        assert!(state.input_method_visible);
+        assert_eq!(
+            state.input_method_target.as_deref(),
+            Some("com.sednalabs.solarlab/com.sednalabs.solarlab.MainActivity")
+        );
+    }
+
+    #[test]
+    fn input_method_window_record_alone_is_not_visible() {
+        let state = parse_android_window_state(
+            r#"
+            WINDOW MANAGER WINDOWS (dumpsys window windows)
+              mInputMethodTarget=Window{def u0 com.sednalabs.solarlab/com.sednalabs.solarlab.MainActivity}
+              Window #7 Window{999 u0 InputMethod}:
+            "#,
+            "",
+        );
+
+        assert!(!state.input_method_visible);
+        assert_eq!(
+            state.input_method_target.as_deref(),
+            Some("com.sednalabs.solarlab/com.sednalabs.solarlab.MainActivity")
+        );
+    }
+
+    #[test]
+    fn input_method_shown_without_target_is_not_visible() {
+        let state = parse_android_window_state(
+            r#"
+            WINDOW MANAGER WINDOWS (dumpsys window windows)
+              mInputShown=true
+              mInputMethodWindow=Window{999 u0 InputMethod}
+            "#,
+            "",
+        );
+
+        assert!(!state.input_method_visible);
+        assert_eq!(state.input_method_target, None);
+    }
+
+    #[test]
+    fn key_args_accept_codex_action_aliases() {
+        let single: KeyeventArgs =
+            serde_json::from_value(json!({"key": "KEYCODE_BACK"})).expect("key alias parses");
+        assert_eq!(single.keycode, "KEYCODE_BACK");
+
+        let combination: KeycombinationArgs =
+            serde_json::from_value(json!({"keys": ["CTRL_LEFT", "A"]})).expect("keys alias parses");
+        assert_eq!(combination.keycodes, vec!["CTRL_LEFT", "A"]);
+
+        let singleton_combination: KeycombinationArgs =
+            serde_json::from_value(json!({"keycode": "KEYCODE_BACK"}))
+                .expect("single keycode alias parses");
+        assert_eq!(
+            singleton_combination.keycode.as_deref(),
+            Some("KEYCODE_BACK")
+        );
     }
 
     #[test]
@@ -6765,6 +10830,8 @@ mod tests {
             current_focus: None,
             focused_app: None,
             resumed_activity: Some("com.sednalabs.solarlab/.MainActivity".to_string()),
+            input_method_visible: false,
+            input_method_target: None,
         });
         assert_eq!(package.as_deref(), Some("com.sednalabs.solarlab"));
     }
@@ -6777,6 +10844,8 @@ mod tests {
             ),
             focused_app: None,
             resumed_activity: None,
+            input_method_visible: false,
+            input_method_target: None,
         });
         assert_eq!(package.as_deref(), Some("com.sednalabs.solarlab"));
     }
@@ -6831,6 +10900,13 @@ mod tests {
             })
         );
         assert_eq!(node.center, Some((144, 138)));
+        assert_eq!(node.class_name.as_deref(), Some("android.widget.Button"));
+        assert_eq!(
+            node.resource_id.as_deref(),
+            Some("com.example:id/search_button")
+        );
+        assert!(node.clickable);
+        assert_eq!(node.semantic_label.as_deref(), Some("Search action"));
         std::fs::remove_file(path).ok();
     }
 
@@ -6928,6 +11004,31 @@ mod tests {
                 right: 960,
                 bottom: 360,
             })
+        );
+        let text_selection = find_interactive_ui_node(
+            &path,
+            &UiSelector {
+                text: Some("Search by name or id".to_string()),
+                ..UiSelector::default()
+            },
+        )
+        .expect("placeholder text lookup should resolve its interactive ancestor");
+        let text_node = text_selection
+            .matches
+            .first()
+            .expect("interactive text field should be found");
+        assert_eq!(
+            text_node.class_name.as_deref(),
+            Some("android.widget.EditText")
+        );
+        assert_eq!(
+            text_node.resource_id.as_deref(),
+            Some("com.example:id/search_field")
+        );
+        assert!(text_node.focusable);
+        assert_eq!(
+            text_node.semantic_label.as_deref(),
+            Some("Search by name or id")
         );
         std::fs::remove_file(path).ok();
     }
@@ -7140,6 +11241,96 @@ mod tests {
     }
 
     #[test]
+    fn resolve_node_selection_keeps_differently_actionable_matches_ambiguous() {
+        let container = NormalizedUiNode {
+            class_name: Some("android.view.View".to_string()),
+            package_name: Some("com.example".to_string()),
+            text: Some("Search".to_string()),
+            semantic_label: Some("Search".to_string()),
+            content_desc: None,
+            resource_id: None,
+            clickable: false,
+            focusable: false,
+            enabled: true,
+            selected: false,
+            checked: false,
+            focused: false,
+            scrollable: false,
+            long_clickable: false,
+            bounds: Some(UiBounds {
+                left: 0,
+                top: 0,
+                right: 220,
+                bottom: 80,
+            }),
+            center: Some((110, 40)),
+        };
+        let button = NormalizedUiNode {
+            class_name: Some("android.widget.Button".to_string()),
+            resource_id: Some("com.example:id/search".to_string()),
+            clickable: true,
+            focusable: true,
+            bounds: Some(UiBounds {
+                left: 40,
+                top: 16,
+                right: 180,
+                bottom: 64,
+            }),
+            center: Some((110, 40)),
+            ..container.clone()
+        };
+
+        let error = resolve_node_selection(vec![container, button], None)
+            .expect_err("actionability does not authorise silently choosing among matches");
+        assert!(matches!(
+            error,
+            SelectionFailure::Ambiguous { match_count: 2, .. }
+        ));
+    }
+
+    #[test]
+    fn resolve_node_selection_keeps_ambiguous_ties_ambiguous() {
+        let first = NormalizedUiNode {
+            class_name: Some("android.widget.Button".to_string()),
+            package_name: Some("com.example".to_string()),
+            text: Some("Search".to_string()),
+            semantic_label: Some("Search".to_string()),
+            content_desc: None,
+            resource_id: Some("com.example:id/search_one".to_string()),
+            clickable: true,
+            focusable: true,
+            enabled: true,
+            selected: false,
+            checked: false,
+            focused: false,
+            scrollable: false,
+            long_clickable: false,
+            bounds: Some(UiBounds {
+                left: 0,
+                top: 0,
+                right: 100,
+                bottom: 40,
+            }),
+            center: Some((50, 20)),
+        };
+        let second = NormalizedUiNode {
+            resource_id: Some("com.example:id/search_two".to_string()),
+            bounds: Some(UiBounds {
+                left: 120,
+                top: 0,
+                right: 220,
+                bottom: 40,
+            }),
+            center: Some((170, 20)),
+            ..first.clone()
+        };
+
+        let error = resolve_node_selection(vec![first, second], None)
+            .expect_err("equally actionable candidates should still require disambiguation");
+        assert!(matches!(error, SelectionFailure::Ambiguous { .. }));
+    }
+
+    #[test]
     fn tool_postcondition_helper_rejects_unsatisfied_requested_postcondition() {
         let error = ensure_tool_postcondition_satisfied(
             "android.input.tap",
@@ -7149,6 +11340,7 @@ mod tests {
                 satisfied: false,
                 timed_out: true,
                 elapsed_ms: 500,
+                evidence_source: Some(ToolPostconditionEvidenceSource::UiHierarchy),
                 hierarchy_path: Some("/tmp/raw-tap.xml".to_string()),
                 screenshot_path: None,
                 observed_activity: None,
@@ -7157,6 +11349,7 @@ mod tests {
                 match_count: 0,
                 selected_match_index: None,
                 candidate_summary: Vec::new(),
+                handled_system_dialogs: Vec::new(),
             },
         )
         .expect_err("unsatisfied requested postconditions should hard-fail");
@@ -7176,6 +11369,7 @@ mod tests {
                 satisfied: true,
                 timed_out: false,
                 elapsed_ms: 0,
+                evidence_source: None,
                 hierarchy_path: None,
                 screenshot_path: None,
                 observed_activity: None,
@@ -7184,6 +11378,7 @@ mod tests {
                 match_count: 0,
                 selected_match_index: None,
                 candidate_summary: Vec::new(),
+                handled_system_dialogs: Vec::new(),
             },
         )
         .expect("unrequested postconditions should not error");
@@ -7237,6 +11432,446 @@ mod tests {
         .expect("crash dialog should be detected");
         assert_eq!(crash.kind, "crash");
         assert_eq!(crash.action_label, None);
+    }
+
+    #[test]
+    fn postcondition_recovery_only_selects_a_unique_system_anr_wait_button() {
+        let nodes = parse_ui_nodes_from_xml(
+            r#"<hierarchy><node package="android" resource-id="android:id/aerr_wait" text="Wait" clickable="true" enabled="true" bounds="[60,0][100,20]" /></hierarchy>"#,
+        )
+        .unwrap();
+        let plan = SystemDialogPlan {
+            kind: "anr",
+            action_label: Some("Wait"),
+        };
+        assert!(postcondition_anr_wait_button(&plan, &nodes).is_some());
+        for (package, resource, bounds) in [
+            ("fixture", "android:id/aerr_wait", "[60,0][100,20]"),
+            ("android", "android:id/aerr_close", "[0,0][40,20]"),
+            ("android", "android:id/aerr_wait", "[60,0][60,20]"),
+            ("android", "android:id/aerr_wait", "[60,0][100,0]"),
+        ] {
+            let nodes = parse_ui_nodes_from_xml(&format!(
+                r#"<hierarchy><node package="{package}" resource-id="{resource}" text="Wait" clickable="true" enabled="true" bounds="{bounds}" /></hierarchy>"#,
+            ))
+            .unwrap();
+            assert!(postcondition_anr_wait_button(&plan, &nodes).is_none());
+        }
+        let duplicate = vec![nodes[0].clone(), nodes[0].clone()];
+        assert!(postcondition_anr_wait_button(&plan, &duplicate).is_none());
+        for plan in [
+            SystemDialogPlan {
+                kind: "permission",
+                action_label: Some("Allow"),
+            },
+            SystemDialogPlan {
+                kind: "crash",
+                action_label: None,
+            },
+        ] {
+            assert!(postcondition_anr_wait_button(&plan, &nodes).is_none());
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn selector_postcondition_recovers_anr_then_requires_fresh_target_evidence() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(timestamp_filename("postcondition-anr", None));
+        fs::create_dir_all(&root).await.unwrap();
+        let dialog = root.join("dialog.xml");
+        fs::write(&dialog, r#"<hierarchy>
+            <node package="android" text="Fixture isn't responding" />
+            <node package="android" resource-id="android:id/aerr_close" text="Close app" clickable="true" enabled="true" bounds="[0,0][40,20]" />
+            <node package="android" resource-id="android:id/aerr_wait" text="Wait" clickable="true" enabled="true" bounds="[60,0][100,20]" />
+            </hierarchy>"#).await.unwrap();
+        fs::write(root.join("ready.xml"), r#"<hierarchy>
+            <node package="fixture" resource-id="fixture:id/increment" text="Increment" clickable="true" enabled="true" bounds="[0,0][100,40]" />
+            </hierarchy>"#).await.unwrap();
+        fs::copy(root.join("ready.xml"), root.join("before.xml"))
+            .await
+            .unwrap();
+        let adb = root.join("adb");
+        fs::write(
+            &adb,
+            r#"#!/usr/bin/env python3
+import pathlib, shlex, sys
+root = pathlib.Path(__file__).resolve().parent
+if sys.argv[1:] == ['devices', '-l']:
+    print('List of devices attached\nanr-fixture device model:fixture')
+    sys.exit(0)
+if sys.argv[1:3] != ['-s', 'anr-fixture']:
+    sys.exit('wrong serial')
+args = sys.argv[3:]
+if args[0] == 'shell':
+    args = ['shell'] + shlex.split(args[1])
+command = ' '.join(args)
+with (root / 'calls').open('a') as log:
+    log.write(command + '\n')
+if command == 'exec-out uiautomator dump /dev/tty':
+    scenario = (root / 'tap-scenario').read_text() if (root / 'tap-scenario').exists() else None
+    capture = 'ready.xml' if (root / 'waited').exists() else 'dialog.xml'
+    if scenario:
+        if not (root / 'tapped').exists():
+            capture = 'before.xml'
+        elif not (root / 'waited').exists():
+            counter = root / 'post-captures'
+            count = int(counter.read_text()) + 1 if counter.exists() else 1
+            counter.write_text(str(count))
+            capture = 'before.xml' if scenario == 'success' and count == 1 else 'dialog.xml'
+        else:
+            counter = root / 'after-wait-captures'
+            count = int(counter.read_text()) + 1 if counter.exists() else 1
+            counter.write_text(str(count))
+            if scenario == 'cap':
+                capture = 'dialog.xml'
+            elif scenario == 'wrong':
+                capture = 'wrong.xml'
+            elif scenario == 'missing' or (scenario == 'transient' and count > 1):
+                capture = 'before.xml'
+    print((root / capture).read_text())
+elif command == 'exec-out cmd window dump-visible-window-views':
+    sys.exit('Debug window dumps must not be dispatched')
+elif command == 'shell dumpsys window windows':
+    print('mCurrentFocus=Window{a u0 fixture/.Main}')
+elif command == 'shell dumpsys activity activities':
+    print('mResumedActivity: ActivityRecord{a u0 fixture/.Main}')
+elif command == 'shell input tap 80 10':
+    (root / 'waited').touch()
+elif command == 'shell input tap 50 20' and (root / 'tap-scenario').exists():
+    if (root / 'tapped').exists():
+        sys.exit('original input was replayed')
+    (root / 'tapped').touch()
+else:
+    sys.exit('Unexpected fixture command: ' + command)
+"#,
+        )
+        .await
+        .unwrap();
+        fs::set_permissions(&adb, std::fs::Permissions::from_mode(0o700))
+            .await
+            .unwrap();
+        let mcp = adb_fixture_server(&root);
+        let nodes = parse_ui_nodes_from_path(&dialog).unwrap();
+        let permission = parse_ui_nodes_from_xml(
+            r#"<hierarchy><node text="Allow location permission" /><node text="While using the app" /><node text="Don't allow" /></hierarchy>"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            mcp.check_postcondition_system_dialog(
+                "anr-fixture",
+                &dialog,
+                &permission,
+                Instant::now() + Duration::from_secs(10),
+                true,
+            )
+            .await
+            .unwrap(),
+            SystemDialogCheck::None
+        ));
+        for (deadline, allow_wait) in [
+            (Instant::now() - Duration::from_secs(1), true),
+            (Instant::now() + Duration::from_secs(10), false),
+        ] {
+            assert!(matches!(
+                mcp.check_postcondition_system_dialog(
+                    "anr-fixture",
+                    &dialog,
+                    &nodes,
+                    deadline,
+                    allow_wait
+                )
+                .await
+                .unwrap(),
+                SystemDialogCheck::Blocked(_)
+            ));
+        }
+        assert!(
+            !root.join("calls").exists(),
+            "Expired or exhausted recovery must not dispatch"
+        );
+        let dialog_selector = UiSelector {
+            resource_id: Some("android:id/aerr_wait".into()),
+            ..UiSelector::default()
+        };
+        let intentional_dialog = mcp
+            .wait_for_tool_postcondition(ToolPostconditionRequest {
+                serial: "anr-fixture",
+                selector: Some(&dialog_selector),
+                match_index: None,
+                wait_for_activity: Some("fixture.Main"),
+                wait_for_package: Some("fixture"),
+                deadline: Instant::now() + Duration::from_secs(10),
+                include_screenshot: false,
+                artifact_prefix: "intentional-anr-postcondition",
+            })
+            .await
+            .unwrap();
+        assert!(intentional_dialog.satisfied);
+        assert!(intentional_dialog.handled_system_dialogs.is_empty());
+        assert!(!root.join("waited").exists());
+        assert!(
+            !fs::read_to_string(root.join("calls"))
+                .await
+                .unwrap()
+                .lines()
+                .any(|line| line.starts_with("shell input")),
+            "A satisfied postcondition must not trigger dialog recovery"
+        );
+        let selector = UiSelector {
+            resource_id: Some("fixture:id/increment".into()),
+            ..UiSelector::default()
+        };
+        let result = mcp
+            .wait_for_tool_postcondition(ToolPostconditionRequest {
+                serial: "anr-fixture",
+                selector: Some(&selector),
+                match_index: None,
+                wait_for_activity: None,
+                wait_for_package: None,
+                deadline: Instant::now() + Duration::from_secs(10),
+                include_screenshot: false,
+                artifact_prefix: "anr-postcondition",
+            })
+            .await
+            .unwrap();
+        assert!(result.satisfied);
+        assert!(!result.timed_out);
+        assert_eq!(
+            result.node.as_ref().unwrap().resource_id.as_deref(),
+            Some("fixture:id/increment")
+        );
+        assert_eq!(
+            tool_postcondition_json(&result)["handled_system_dialogs"],
+            json!([{ "kind": "anr", "action": "wait" }])
+        );
+        let calls = fs::read_to_string(root.join("calls")).await.unwrap();
+        assert!(
+            !calls
+                .lines()
+                .any(|line| line == "exec-out cmd window dump-visible-window-views"),
+            "Selector-only postconditions must use fresh semantic observations"
+        );
+        assert_eq!(
+            calls
+                .lines()
+                .filter(|line| line.starts_with("shell input"))
+                .collect::<Vec<_>>(),
+            ["shell input tap 80 10"]
+        );
+        assert_eq!(
+            calls
+                .lines()
+                .filter(|line| *line == "exec-out uiautomator dump /dev/tty")
+                .count(),
+            3
+        );
+
+        let safe_dialog = fs::read_to_string(&dialog).await.unwrap();
+        let ready = r#"<hierarchy>
+            <node package="fixture" resource-id="fixture:id/increment" text="Increment" clickable="true" enabled="true" bounds="[0,0][100,40]" />
+            <node package="fixture" resource-id="fixture:id/counter" text="Count: 1" bounds="[0,40][100,80]" />
+            </hierarchy>"#;
+        fs::write(root.join("ready.xml"), ready).await.unwrap();
+        fs::write(
+            root.join("wrong.xml"),
+            ready.replace("Count: 1", "Count: 0"),
+        )
+        .await
+        .unwrap();
+        for scenario in [
+            "success",
+            "wrong",
+            "missing",
+            "transient",
+            "unsafe",
+            "intentional",
+            "cap",
+        ] {
+            for name in [
+                "calls",
+                "waited",
+                "tapped",
+                "post-captures",
+                "after-wait-captures",
+            ] {
+                if root.join(name).exists() {
+                    fs::remove_file(root.join(name)).await.unwrap();
+                }
+            }
+            fs::write(root.join("tap-scenario"), scenario)
+                .await
+                .unwrap();
+            fs::write(
+                &dialog,
+                if scenario == "unsafe" {
+                    safe_dialog.replace("android:id/aerr_wait", "fixture:id/aerr_wait")
+                } else {
+                    safe_dialog.clone()
+                },
+            )
+            .await
+            .unwrap();
+            let post_selector = if scenario == "intentional" {
+                json!({ "resource_id": "android:id/aerr_wait" })
+            } else {
+                json!({ "resource_id": "fixture:id/counter", "text": "Count: 1" })
+            };
+            let result = mcp
+                .android_tap_element(Parameters(serde_json::from_value(json!({
+                    "serial": "anr-fixture",
+                    "selector": { "resource_id": "fixture:id/increment" },
+                    "wait_for_selector": post_selector,
+                    "timeout_secs": if scenario == "cap" { 20 } else if scenario == "success" { 8 } else { 6 },
+                    "retry_with_adb_on_no_change": true,
+                })).unwrap()))
+                .await;
+            let expected_waits = match scenario {
+                "unsafe" | "intentional" => 0,
+                "cap" => 4,
+                _ => 1,
+            };
+            let evidence = if matches!(scenario, "success" | "intentional") {
+                let receipt = result.unwrap().structured_content.unwrap();
+                assert_eq!(receipt["verification"]["satisfied"], true, "{scenario}");
+                assert!(
+                    receipt["verification"]["stable_polls_observed"]
+                        .as_u64()
+                        .unwrap()
+                        >= 2
+                );
+                receipt
+            } else {
+                let error = result.expect_err("recovery alone must not satisfy the tap");
+                let data = error.data.unwrap();
+                assert_eq!(data["outcome"], "postcondition_failed", "{scenario}");
+                assert_eq!(data["retry_safe"], false);
+                assert_eq!(data["do_not_replay"], true);
+                assert_eq!(data["verification"]["satisfied"], false);
+                assert!(
+                    Path::new(
+                        data["artifacts"]["post_tap_hierarchy_path"]
+                            .as_str()
+                            .unwrap()
+                    )
+                    .is_file()
+                );
+                data
+            };
+            let handled = evidence["verification"]["handled_system_dialogs"]
+                .as_array()
+                .unwrap();
+            assert_eq!(handled.len(), expected_waits, "{scenario}");
+            assert!(
+                handled
+                    .iter()
+                    .all(|dialog| dialog == &json!({ "kind": "anr", "action": "wait" }))
+            );
+            let calls = fs::read_to_string(root.join("calls")).await.unwrap();
+            assert!(
+                !calls
+                    .lines()
+                    .any(|line| line == "exec-out cmd window dump-visible-window-views"),
+                "Tap verification must use semantic observations: {scenario}"
+            );
+            let mutations = calls
+                .lines()
+                .filter(|line| line.starts_with("shell input"))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                mutations
+                    .iter()
+                    .filter(|line| **line == "shell input tap 50 20")
+                    .count(),
+                1,
+                "{scenario}"
+            );
+            assert_eq!(
+                mutations
+                    .iter()
+                    .filter(|line| **line == "shell input tap 80 10")
+                    .count(),
+                expected_waits,
+                "{scenario}"
+            );
+            assert_eq!(mutations.len(), 1 + expected_waits, "{scenario}");
+            if scenario == "success" {
+                assert_eq!(
+                    fs::read_to_string(root.join("after-wait-captures"))
+                        .await
+                        .unwrap(),
+                    "2"
+                );
+                assert_eq!(
+                    fs::read_to_string(root.join("post-captures"))
+                        .await
+                        .unwrap(),
+                    "2",
+                    "Every unsatisfied poll must inspect a fresh hierarchy, including the later ANR"
+                );
+            } else if matches!(scenario, "wrong" | "missing" | "transient") {
+                let captures = fs::read_to_string(root.join("after-wait-captures"))
+                    .await
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap();
+                assert!(
+                    captures >= if scenario == "transient" { 2 } else { 1 },
+                    "Failure must include fresh original-postcondition evidence after Wait"
+                );
+            }
+        }
+        fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[test]
+    fn system_dialog_action_matches_selector_for_auto_handled_wait_button() {
+        let report = SystemDialogReport {
+            detected: true,
+            kind: "anr".to_string(),
+            labels: vec![
+                "Pixel Launcher isn't responding".to_string(),
+                "Close app".to_string(),
+                "Wait".to_string(),
+            ],
+            action_taken: Some("tap:Wait".to_string()),
+            action_label: Some("Wait".to_string()),
+            action_resource_id: Some("android:id/aerr_wait".to_string()),
+            artifact_path: "/tmp/anr.xml".to_string(),
+        };
+
+        assert!(system_dialog_action_matches_selector(
+            &UiSelector {
+                label: Some("Wait".to_string()),
+                label_exact: Some(true),
+                clickable: Some(true),
+                ..UiSelector::default()
+            },
+            &report,
+        ));
+        assert!(system_dialog_action_matches_selector(
+            &UiSelector {
+                text: Some("Wait".to_string()),
+                ..UiSelector::default()
+            },
+            &report,
+        ));
+        assert!(system_dialog_action_matches_selector(
+            &UiSelector {
+                resource_id: Some("android:id/aerr_wait".to_string()),
+                clickable: Some(true),
+                ..UiSelector::default()
+            },
+            &report,
+        ));
+        assert!(!system_dialog_action_matches_selector(
+            &UiSelector {
+                text: Some("Close app".to_string()),
+                ..UiSelector::default()
+            },
+            &report,
+        ));
     }
 
     #[test]
@@ -7299,6 +11934,141 @@ mod tests {
     }
 
     #[test]
+    fn artifact_read_encoding_defaults_to_base64() {
+        assert_eq!(
+            normalize_artifact_read_encoding(None).expect("default encoding should succeed"),
+            ArtifactReadEncoding::Base64
+        );
+        assert_eq!(
+            normalize_artifact_read_encoding(Some("utf8")).expect("utf8 should succeed"),
+            ArtifactReadEncoding::Utf8
+        );
+    }
+
+    #[test]
+    fn artifact_read_encoding_rejects_unknown_values() {
+        let err = normalize_artifact_read_encoding(Some("hex"))
+            .expect_err("unknown encoding should be rejected");
+        assert!(err.to_string().contains("encoding must be one of"));
+    }
+
+    #[test]
+    fn artifact_mime_type_prefers_known_extensions() {
+        assert_eq!(
+            guess_artifact_mime_type(Path::new("screen.png")),
+            "image/png"
+        );
+        assert_eq!(
+            guess_artifact_mime_type(Path::new("hierarchy.xml")),
+            "application/xml"
+        );
+        assert_eq!(
+            guess_artifact_mime_type(Path::new("unknown.bin")),
+            "application/octet-stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn structured_result_with_optional_screenshot_keeps_images_visible_to_codex() {
+        let path = std::env::temp_dir().join(format!(
+            "android-mcp-native-image-content-{}.png",
+            std::process::id()
+        ));
+        fs::write(&path, b"\x89PNG\r\n\x1a\nfixture")
+            .await
+            .expect("fixture image should be written");
+
+        let result = structured_result_with_optional_screenshot(
+            json!({
+                "ok": true,
+                "artifacts": {
+                    "screenshot_path": path.clone(),
+                },
+            }),
+            Some(&path),
+        )
+        .await
+        .expect("screenshot image content should be attached");
+
+        assert!(result.structured_content.is_none());
+        assert_eq!(result.is_error, Some(false));
+        assert_eq!(result.content.len(), 2);
+        let receipt = serde_json::to_value(&result.content[0]).expect("receipt content");
+        let receipt: serde_json::Value =
+            serde_json::from_str(receipt["text"].as_str().unwrap()).expect("JSON receipt");
+        assert_eq!(receipt["ok"], true);
+        let image = serde_json::to_value(&result.content[1])
+            .expect("image content should serialize for assertion");
+        assert_eq!(image["type"], "image");
+        assert_eq!(image["mimeType"], "image/png");
+        assert_eq!(
+            image["data"],
+            BASE64_STANDARD.encode(b"\x89PNG\r\n\x1a\nfixture")
+        );
+
+        let _ = fs::remove_file(&path).await;
+    }
+
+    #[test]
+    fn parses_launcher_and_pm_package_names() {
+        let launcher = "\
+            packageName=com.example.one\n\
+            ignored\n\
+            packageName=com.example.two\n\
+            packageName=com.example.one\n";
+        assert_eq!(
+            parse_launcher_package_names(launcher),
+            vec!["com.example.one", "com.example.two"]
+        );
+
+        let packages = "package:android\npackage:com.example.app\n";
+        assert_eq!(
+            parse_pm_package_names(packages),
+            vec!["android", "com.example.app"]
+        );
+    }
+
+    #[test]
+    fn validates_android_package_names() {
+        assert_eq!(
+            normalize_android_package_name(" com.example_app.test ")
+                .expect("package should be valid"),
+            "com.example_app.test"
+        );
+        assert!(normalize_android_package_name("").is_err());
+        assert!(normalize_android_package_name("com.example;rm").is_err());
+    }
+
+    #[test]
+    fn safe_android_url_defaults_to_http_and_https() {
+        assert_eq!(
+            normalize_safe_android_url(" https://example.test/path ")
+                .expect("https URL should be valid"),
+            "https://example.test/path"
+        );
+        assert!(normalize_safe_android_url("intent://example").is_err());
+    }
+
+    #[test]
+    fn shell_quotes_android_url_metacharacters() {
+        let url = "https://example.test/path?next=a&name=O'Brien;echo nope";
+        assert_eq!(
+            shell_quote(&normalize_safe_android_url(url).expect("https URL should be valid")),
+            "'https://example.test/path?next=a&name=O'\"'\"'Brien;echo nope'"
+        );
+    }
+
+    #[test]
+    fn orientation_names_round_trip_to_rotations() {
+        assert_eq!(rotation_for_orientation("portrait").unwrap(), 0);
+        assert_eq!(rotation_for_orientation("landscape").unwrap(), 1);
+        assert_eq!(rotation_for_orientation("reverse-portrait").unwrap(), 2);
+        assert_eq!(rotation_for_orientation("reverse_landscape").unwrap(), 3);
+        assert_eq!(orientation_name_from_rotation(5), "landscape");
+        assert!(rotation_for_orientation("diagonal").is_err());
+    }
+
+    #[test]
     fn timestamp_filename_is_unique_across_rapid_calls() {
         let generated = (0..64)
             .map(|_| timestamp_filename("window-dump", Some("xml")))
@@ -7312,6 +12082,15 @@ mod tests {
             .map(|_| remote_ui_dump_path())
             .collect::<std::collections::HashSet<_>>();
         assert_eq!(generated.len(), 64);
+    }
+
+    #[test]
+    fn ui_dump_shell_stream_script_captures_and_cleans_single_remote_file() {
+        let script = ui_dump_shell_stream_script("/sdcard/window-dump.xml");
+        assert!(script.contains("remote='/sdcard/window-dump.xml'"));
+        assert!(script.contains("trap 'rm -f \"$remote\"' EXIT"));
+        assert!(script.contains("uiautomator dump \"$remote\" >/dev/null && cat \"$remote\""));
+        assert!(!script.contains("adb pull"));
     }
 
     #[test]
@@ -7368,10 +12147,13 @@ mod tests {
             "adb -s emulator-5554 pull /sdcard/window-dump-1.xml local.xml timed out after 1800 ms",
             None,
         );
+        let bounded_adb_error =
+            McpError::internal_error("adb command timed out after 583 ms", None);
 
         assert!(is_deadline_limited_observation_timeout(&exec_out_error));
         assert!(is_deadline_limited_observation_timeout(&shell_error));
         assert!(is_deadline_limited_observation_timeout(&pull_error));
+        assert!(is_deadline_limited_observation_timeout(&bounded_adb_error));
     }
 
     #[test]
@@ -7381,6 +12163,14 @@ mod tests {
             None,
         );
         assert!(!is_deadline_limited_observation_timeout(&error));
+        for message in [
+            "adb command failed with exit status 1: device offline",
+            "adb command failed with exit status 1: permission denied",
+            "gRPC request timed out after 5000 ms",
+        ] {
+            let error = McpError::internal_error(message, None);
+            assert!(!is_deadline_limited_observation_timeout(&error));
+        }
     }
 
     #[test]
@@ -7390,6 +12180,28 @@ mod tests {
             None,
         );
         assert!(should_retry_ui_dump_pull(&error));
+    }
+
+    #[test]
+    fn transient_remote_ui_dump_pull_error_is_summarized_for_tool_output() {
+        let pull_error = McpError::internal_error(
+            "adb pull /sdcard/window-dump.xml local.xml failed with exit status 1: adb: error: failed to stat remote object '/sdcard/window-dump.xml': No such file or directory",
+            None,
+        );
+        let error = ui_hierarchy_capture_error(Some(pull_error), None).to_string();
+        assert!(error.contains("UI hierarchy capture was unavailable"));
+        assert!(!error.contains("failed to stat remote object"));
+    }
+
+    #[test]
+    fn transient_remote_ui_dump_stream_error_is_summarized_for_tool_output() {
+        let stream_error = McpError::internal_error(
+            "adb shell sh -c uiautomator dump failed with exit status 1: adb: error: failed to stat remote object '/sdcard/window-dump.xml': No such file or directory",
+            None,
+        );
+        let error = ui_hierarchy_capture_error(None, Some(stream_error)).to_string();
+        assert!(error.contains("UI hierarchy capture was unavailable"));
+        assert!(!error.contains("failed to stat remote object"));
     }
 
     #[test]
@@ -7425,6 +12237,56 @@ mod tests {
         assert!(
             err.to_string().contains("failed with exit status 7"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn command_output_is_bounded_before_artifact_materialisation() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf '123456789'"]);
+        let error =
+            run_command_with_output_limits(command, Duration::from_secs(5), "bounded test", 8, 8)
+                .await
+                .expect_err("oversized output must fail before buffering more bytes");
+        assert!(
+            error
+                .message
+                .contains("stdout exceeded the 8-byte capture limit")
+        );
+        assert_eq!(error.data.unwrap()["do_not_replay"], true);
+
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf '123456789' >&2"]);
+        let error =
+            run_command_with_output_limits(command, Duration::from_secs(5), "bounded test", 8, 8)
+                .await
+                .unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("stderr exceeded the 8-byte capture limit")
+        );
+    }
+
+    #[tokio::test]
+    async fn allow_failure_runner_preserves_expected_nonzero_output() {
+        let mut command = Command::new("bash");
+        command.args([
+            "-lc",
+            "echo 'Failure [INSTALL_FAILED_UPDATE_INCOMPATIBLE]' >&2; exit 1",
+        ]);
+        let output = run_command_with_timeout_allow_failure(
+            command,
+            Duration::from_secs(5),
+            "test recoverable command",
+        )
+        .await
+        .expect("expected process failures should remain inspectable");
+
+        assert!(!output.status.success());
+        assert_eq!(output.status.code(), Some(1));
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("INSTALL_FAILED_UPDATE_INCOMPATIBLE")
         );
     }
 
@@ -7587,6 +12449,157 @@ mod tests {
     }
 
     #[test]
+    fn semantic_action_args_normalize_canonical_and_native_envelopes() {
+        let canonical: SolarLabSemanticActionArgs = serde_json::from_value(json!({
+            "serial": "emulator-5554",
+            "action": "focus_body",
+            "body_query": "comet",
+            "capture_state": false,
+        }))
+        .expect("canonical semantic action should deserialize");
+        assert_eq!(
+            normalize_solarlab_semantic_action_args(canonical)
+                .expect("canonical semantic action should normalize"),
+            NormalizedSolarLabSemanticActionArgs {
+                serial: Some("emulator-5554".to_string()),
+                package_name: None,
+                activity: None,
+                action: "focus_body".to_string(),
+                body_query: Some("comet".to_string()),
+                target: None,
+                capture_state: false,
+            }
+        );
+
+        let top_level_native: SolarLabSemanticActionArgs = serde_json::from_value(json!({
+            "action": "semantic_action",
+            "action_name": "focus_body",
+            "body_query": "comet",
+            "timeout_secs": 30,
+            "post_observe_scope": "screen_and_ui",
+        }))
+        .expect("top-level native semantic envelope should deserialize");
+        assert_eq!(
+            normalize_solarlab_semantic_action_args(top_level_native)
+                .expect("top-level native semantic envelope should normalize"),
+            NormalizedSolarLabSemanticActionArgs {
+                serial: None,
+                package_name: None,
+                activity: None,
+                action: "focus_body".to_string(),
+                body_query: Some("comet".to_string()),
+                target: None,
+                capture_state: true,
+            }
+        );
+
+        let batched_native: SolarLabSemanticActionArgs = serde_json::from_value(json!({
+            "actions": [{
+                "type": "semantic_action",
+                "action_name": "focus_body",
+                "target": {"text": "comet"},
+                "timeout_secs": 30
+            }],
+            "post_observe_scope": "screen_and_ui",
+        }))
+        .expect("batched native semantic envelope should deserialize");
+        assert_eq!(
+            normalize_solarlab_semantic_action_args(batched_native)
+                .expect("batched native semantic envelope should normalize"),
+            NormalizedSolarLabSemanticActionArgs {
+                serial: None,
+                package_name: None,
+                activity: None,
+                action: "focus_body".to_string(),
+                body_query: None,
+                target: Some(json!({"text": "comet"})),
+                capture_state: true,
+            }
+        );
+    }
+
+    #[test]
+    fn semantic_action_args_reject_ambiguous_or_nonsemantic_batches() {
+        let conflicting: SolarLabSemanticActionArgs = serde_json::from_value(json!({
+            "action": "focus_body",
+            "action_name": "reset_camera",
+        }))
+        .expect("conflicting semantic action names should deserialize");
+        let err = normalize_solarlab_semantic_action_args(conflicting)
+            .expect_err("conflicting semantic action names should fail normalization");
+        assert!(
+            err.to_string()
+                .contains("conflicting semantic action names")
+        );
+
+        let multiple: SolarLabSemanticActionArgs = serde_json::from_value(json!({
+            "actions": [
+                {"type": "semantic_action", "action_name": "reset_camera"},
+                {"type": "semantic_action", "action_name": "open_immersive"}
+            ],
+        }))
+        .expect("multiple semantic actions should deserialize");
+        let err = normalize_solarlab_semantic_action_args(multiple)
+            .expect_err("multiple semantic actions should fail normalization");
+        assert!(
+            err.to_string()
+                .contains("exactly one batched semantic action")
+        );
+
+        let nonsemantic: SolarLabSemanticActionArgs = serde_json::from_value(json!({
+            "actions": [{"type": "click", "action_name": "focus_body"}],
+        }))
+        .expect("nonsemantic action envelope should deserialize");
+        let err = normalize_solarlab_semantic_action_args(nonsemantic)
+            .expect_err("nonsemantic action envelope should fail normalization");
+        assert!(err.to_string().contains("must be 'semantic_action'"));
+    }
+
+    #[test]
+    fn semantic_body_query_accepts_generic_adapter_targets() {
+        let cases = [
+            (json!(" comet "), "comet"),
+            (json!({"text": "comet"}), "comet"),
+            (json!({"text_exact": "comet"}), "comet"),
+            (json!({"label": "comet"}), "comet"),
+            (json!({"label_exact": "comet"}), "comet"),
+            (json!({"content_desc": "comet"}), "comet"),
+            (json!({"content_description": "comet"}), "comet"),
+            (json!({"contentDescription": "comet"}), "comet"),
+        ];
+
+        for (target, expected) in cases {
+            let args: SolarLabSemanticActionArgs = serde_json::from_value(json!({
+                "action": "focus_body",
+                "target": target,
+            }))
+            .expect("generic semantic target should deserialize");
+            assert_eq!(
+                resolve_solarlab_semantic_body_query(args.body_query, args.target),
+                Some(expected.to_string()),
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_body_query_prefers_the_canonical_field() {
+        assert_eq!(
+            resolve_solarlab_semantic_body_query(
+                Some("halley".to_string()),
+                Some(json!({"text": "comet"})),
+            ),
+            Some("halley".to_string()),
+        );
+        assert_eq!(
+            resolve_solarlab_semantic_body_query(
+                Some("  ".to_string()),
+                Some(json!({"text": "comet"})),
+            ),
+            Some("comet".to_string()),
+        );
+    }
+
+    #[test]
     fn return_to_sandbox_ack_uses_sandbox_specific_matcher() {
         assert_eq!(
             matcher_for_action(&SolarLabSemanticCommand::ReturnToSandbox).description,
@@ -7599,7 +12612,8 @@ mod tests {
         let hierarchy = r#"<hierarchy><node text="Search"/><node text="Immersive"/></hierarchy>"#;
         assert!(solarlab_semantic_ack_matches(
             &SolarLabSemanticCommand::ReturnToSandbox,
-            hierarchy
+            hierarchy,
+            None,
         ));
     }
 
@@ -7608,7 +12622,8 @@ mod tests {
         let hierarchy = r#"<hierarchy><node class="android.widget.FrameLayout"/></hierarchy>"#;
         assert!(solarlab_semantic_ack_matches(
             &SolarLabSemanticCommand::OpenImmersive,
-            hierarchy
+            hierarchy,
+            None,
         ));
     }
 
@@ -7617,15 +12632,70 @@ mod tests {
         let hierarchy = r#"<hierarchy><node text="Search"/><node text="Immersive"/><node text="No body selected"/></hierarchy>"#;
         assert!(!solarlab_semantic_ack_matches(
             &SolarLabSemanticCommand::OpenImmersive,
-            hierarchy
+            hierarchy,
+            None,
         ));
+    }
+
+    #[test]
+    fn focus_body_ack_correlates_request_and_reports_resolved_body() {
+        let hierarchy = r#"<hierarchy><node content-desc="Halley. SolarLab semantic focus acknowledged; request-id=semantic-request-42; query=comet; resolved-body=halley"/></hierarchy>"#;
+        let action = SolarLabSemanticCommand::FocusBody {
+            body_query: "comet".to_string(),
+        };
+
+        assert!(solarlab_semantic_ack_matches(
+            &action,
+            hierarchy,
+            Some("semantic-request-42"),
+        ));
+        assert_eq!(
+            solarlab_semantic_resolved_body_id(&action, hierarchy, "semantic-request-42"),
+            Some("halley".to_string())
+        );
+    }
+
+    #[test]
+    fn focus_body_ack_rejects_stale_request() {
+        let hierarchy = r#"<hierarchy><node content-desc="Halley. SolarLab semantic focus acknowledged; request-id=semantic-request-41; query=comet; resolved-body=halley"/></hierarchy>"#;
+        let action = SolarLabSemanticCommand::FocusBody {
+            body_query: "comet".to_string(),
+        };
+
+        assert!(!solarlab_semantic_ack_matches(
+            &action,
+            hierarchy,
+            Some("semantic-request-42"),
+        ));
+    }
+
+    #[test]
+    fn focus_body_ack_keeps_legacy_literal_match_compatibility() {
+        let hierarchy = r#"<hierarchy><node text="Halley"/></hierarchy>"#;
+        let action = SolarLabSemanticCommand::FocusBody {
+            body_query: "halley".to_string(),
+        };
+
+        assert!(solarlab_semantic_ack_matches(
+            &action,
+            hierarchy,
+            Some("semantic-request-42"),
+        ));
+    }
+
+    #[test]
+    fn semantic_ack_tokens_are_stable_across_ui_safe_separators() {
+        assert_eq!(
+            normalize_solarlab_semantic_ack_token("  Comet / Halley  "),
+            "comet-halley"
+        );
     }
 
     #[test]
     fn tool_schema_snapshot_contract_is_stable() {
         let inventory = build_tool_inventory().expect("inventory should build");
         let tools = inventory.filter_tools(
-            AndroidEmulatorMcp::tool_router_android().list_all(),
+            AndroidEmulatorMcp::tool_router_all().list_all(),
             ToolOperation::List,
             &ToolInventoryPolicy::strict(),
             |tool| tool.name.as_ref(),

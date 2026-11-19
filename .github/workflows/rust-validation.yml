@@ -14,6 +14,11 @@ jobs:
     name: Test And Tool Contract
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
 
     steps:
       - name: Checkout
@@ -39,13 +44,44 @@ jobs:
           test -f "${sdk_root}/emulator/lib/emulator_controller.proto"
 
       - name: Format check
-        run: cargo fmt --check
+        run: cargo fmt --all -- --check
 
       - name: Unit and integration tests
-        run: cargo test
+        run: cargo test --locked
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
       - name: Print tool inventory
         run: |
           set -euo pipefail
-          cargo run --bin android-computer-use-mcp -- --print-tools > /tmp/tools.json
+          cargo run --locked --bin android-computer-use-mcp -- --print-tools > /tmp/tools.json
           test -s /tmp/tools.json
+
+      - name: Install Node.js for HTTP contracts
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24.22.3"
+
+      - name: Verify HTTP workflow recovery with a simulated device
+        run: python3 scripts/test_mcp_workflow_http.py
+
+  javascript-contracts:
+    name: Adapter And Consumer Contracts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24.22.3"
+      - name: Test adapters, examples and model-facing receipt assertions
+        run: node --test adapters/codex/*.test.mjs adapters/openai/*.test.mjs docs/examples/*.test.mjs scripts/*.test.mjs
+      - name: Validate consumer entrypoint syntax
+        run: |
+          node --check scripts/codex_android_mcp_journey.mjs
+          bash -n scripts/build_sedna_codex_consumer.sh
+          sh -n scripts/run_android_image_content_smoke.sh
+          sh -n scripts/run_sedna_codex_acceptance.sh

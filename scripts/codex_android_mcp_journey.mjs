@@ -1,16 +1,79 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { zstdDecompressSync } from "node:zlib";
+import {
+  assertAndroidToolCatalog, assertAndroidToolDiscovery, assertBootReadiness, assertInstallReceipt, assertObservationReceipt, assertScreenshotReceipt,
+  assertStepReceipt, assertTypedPng, callOutput, jsonReceipt,
+} from "./codex_journey_assertions.mjs";
 
-const codexVersion = "0.163.0";
+const codexBinary = process.env.CODEX_BINARY || "codex";
+const codexVersion = process.env.CODEX_EXPECTED_VERSION || (process.env.CODEX_BINARY ? null : "0.163.0");
+const scenario = process.env.ANDROID_MCP_JOURNEY || "upstream-image";
+assert.ok(["upstream-image", "production"].includes(scenario), "Unknown Android MCP journey.");
+const protocolMode = process.env.MCP_PROTOCOL_MODE;
+if (protocolMode) assert.ok(["legacy", "2026-07-28"].includes(protocolMode), "Unknown MCP protocol preference.");
+const serial = process.env.ANDROID_SERIAL || "emulator-5554";
+const startedAt = new Date().toISOString();
+const checks = [];
+let consumerProvenance;
+let resolvedInstallTarget;
+let expectedBuild;
+const fixturePackage = "com.sednalabs.mcp.acceptance";
+if (scenario === "production") {
+  const artifactDigest = (process.env.ANDROID_ACCEPTANCE_ARTIFACT_SHA256 || "").replace(/^sha256:/, "");
+  assert.match(artifactDigest, /^[a-f0-9]{64}$/, "Production acceptance requires the uploaded fixture archive digest.");
+  assert.match(process.env.ANDROID_ACCEPTANCE_SOURCE_SHA || "", /^[a-f0-9]{40}$/, "Production acceptance requires the exact fixture source revision.");
+  assert.match(process.env.GITHUB_REPOSITORY || "", /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/);
+  assert.match(process.env.GITHUB_RUN_ID || "", /^[1-9][0-9]*$/);
+  assert.ok(Number.isSafeInteger(Number(process.env.GITHUB_RUN_ID)));
+  assert.ok(process.env.ANDROID_ACCEPTANCE_ARTIFACT_NAME, "Production acceptance requires the uploaded fixture artifact name.");
+  expectedBuild = {
+    repository: process.env.GITHUB_REPOSITORY,
+    commit_sha: process.env.ANDROID_ACCEPTANCE_SOURCE_SHA,
+    workflow_run_id: Number(process.env.GITHUB_RUN_ID),
+    artifact_name: process.env.ANDROID_ACCEPTANCE_ARTIFACT_NAME,
+    artifact_sha256: `sha256:${artifactDigest}`,
+  };
+}
+
+async function verifyConsumer() {
+  const version = spawnSync(codexBinary, ["--version"], {
+    encoding: "utf8", timeout: 10000,
+    env: { PATH: process.env.PATH || "", HOME: process.env.HOME },
+  });
+  assert.equal(version.status, 0, "The selected Codex CLI did not start.");
+  if (codexVersion) {
+    assert.ok(version.stdout.trim().split(/\s+/).includes(codexVersion), "Codex CLI version did not match the pinned version.");
+  }
+  if (process.env.CODEX_BINARY) {
+    assert.ok(path.isAbsolute(codexBinary), "CODEX_BINARY must be an absolute executable path.");
+    assert.match(process.env.CODEX_SOURCE_SHA || "", /^[a-f0-9]{40}$/, "An exact Codex source SHA is required.");
+    assert.ok(process.env.CODEX_BUILD_PROVENANCE, "A source-build provenance receipt is required for a custom Codex binary.");
+    consumerProvenance = JSON.parse(await readFile(process.env.CODEX_BUILD_PROVENANCE, "utf8"));
+    assert.equal(consumerProvenance.repository, "sednalabs/codex");
+    assert.equal(consumerProvenance.source_sha, process.env.CODEX_SOURCE_SHA);
+    const binaryDigest = createHash("sha256").update(await readFile(codexBinary)).digest("hex");
+    assert.equal(consumerProvenance.binary_sha256, binaryDigest, "Codex binary does not match its build receipt.");
+  } else {
+    assert.equal(scenario, "upstream-image", "The production journey requires an exact Sedna Codex source build.");
+    consumerProvenance = { kind: "version-pinned-cli", version_pin: codexVersion, source_revision_verified: false };
+  }
+  consumerProvenance = { ...consumerProvenance, version_output: version.stdout.trim() };
+}
 const fakeKey = "android-mcp-disposable-ci-key";
 const mcpEndpoint = process.env.MCP_ENDPOINT ?? "http://127.0.0.1:9526/mcp";
-const tmpRoot = await mkdtemp(path.join(tmpdir(), "android-mcp-codex-consumer-"));
+const endpointUrl = new URL(mcpEndpoint);
+assert.ok(endpointUrl.protocol === "http:" && ["127.0.0.1", "localhost", "[::1]"].includes(endpointUrl.hostname), "The disposable journey must use a loopback MCP endpoint.");
+assert.ok(!endpointUrl.username && !endpointUrl.password, "MCP endpoint must not contain credentials.");
+// Codex helper aliases must live outside the global /tmp directory when the
+// host provides a private job directory. The consumer home remains isolated.
+const tmpRoot = await mkdtemp(path.join(process.env.RUNNER_TEMP || tmpdir(), "android-mcp-codex-consumer-"));
 const codexHome = path.join(tmpRoot, "codex-home");
 const codexCwd = path.join(tmpRoot, "workspace");
 await mkdir(codexHome);
@@ -58,88 +121,179 @@ const finalMessage = (responseId) => sse([
   },
   responseCompleted(responseId),
 ]);
+const toolDiscoveryCallId = "android-mcp-discovery";
+const discoverTools = (responseId, enabledTools) => sse([
+  responseCreated(responseId),
+  {
+    type: "response.output_item.done",
+    item: {
+      type: "tool_search_call", call_id: toolDiscoveryCallId, execution: "client",
+      arguments: {
+        query: enabledTools.map((name) => `mcp__android__${name.replaceAll(".", "_")}`).join(" "),
+        limit: enabledTools.length,
+      },
+    },
+  },
+  responseCompleted(responseId),
+]);
 
-function assertTypedPng(output) {
-  const images = output.filter((item) => item.type === "input_image");
-  const textPreview = (text) => {
-    const redact = (key, value) => {
-      if (typeof value !== "string") return value;
-      if (key === "path" || key.endsWith("_path")) return "[artifact path]";
-      if (["data", "image_url", "imageUrl", "audio_url", "audioUrl"].includes(key)) {
-        return `[binary content omitted length=${value.length}]`;
+const successActionId = `codex-consumer-${protocolMode || "default"}-success`;
+const failureActionId = `codex-consumer-${protocolMode || "default"}-partial-failure`;
+const installActionId = `codex-consumer-${protocolMode || "default"}-install`;
+const successArgs = {
+  serial, action_id: successActionId,
+  actions: [{ tool: "android.input.keyevent", arguments: { keycode: "KEYCODE_HOME" } }],
+};
+const steps = [{
+  name: "android_wait_for_boot", args: { serial, timeout_secs: 120 },
+  check(output) { assertBootReadiness(output, serial); return { gate: "boot_readiness" }; },
+}];
+if (scenario === "upstream-image") {
+  steps.push({
+    name: "android_capture_screenshot", args: { serial, filename: "codex-consumer-screenshot.png" },
+    check(output) { assertScreenshotReceipt(output, serial); return { gate: "typed_screenshot", image: assertTypedPng(output) }; },
+  });
+} else {
+  steps.push({
+    name: "android_resolve_target", args: { serial },
+    check(output) {
+      const receipt = jsonReceipt(output);
+      assert.equal(receipt.ok, true);
+      assert.equal(receipt.contract_version, "android-provider-execution/v1");
+      const target = receipt.resolved_target;
+      assert.equal(target?.device_serial, serial);
+      resolvedInstallTarget = {};
+      for (const key of ["environment_id", "provider_instance_id", "provider_epoch", "session_id", "device_serial"]) {
+        assert.ok(typeof target[key] === "string" && target[key].length > 0, `Missing exact target field ${key}.`);
+        resolvedInstallTarget[key] = target[key];
       }
-      return value
-        .replace(/data:[^\s,\"]+;base64,[A-Za-z0-9+/=]+/gi, "[binary content omitted]")
-        .replace(/\/[^\"\s]+/g, "[path]");
-    };
-    try {
-      const parsed = JSON.parse(text);
-      if (parsed && typeof parsed === "object") {
-        if (parsed.type === "image") {
-          return `image-content mime=${parsed.mimeType || parsed.mime_type || "unknown"} dataLength=${typeof parsed.data === "string" ? parsed.data.length : 0}`;
-        }
-        return JSON.stringify(parsed, redact).slice(0, 240);
-      }
-    } catch {}
-    return redact("", text).slice(0, 240);
-  };
-  const outputShape = JSON.stringify(output.map((item) => ({
-    type: item.type,
-    mimeType: item.mimeType,
-    detail: item.detail,
-    imageUrlLength: typeof item.image_url === "string" ? item.image_url.length : undefined,
-    textLength: typeof item.text === "string" ? item.text.length : undefined,
-    textPreview: typeof item.text === "string" ? textPreview(item.text) : undefined,
-  })));
-  assert.equal(images.length, 1, `Expected one typed screenshot in the model request; received ${outputShape}.`);
-  assert.equal(images[0].detail, "high");
-  assert.ok(/^data:image\/png;base64,/.test(images[0].image_url), "Screenshot was not forwarded as a PNG data URL.");
-  const png = Buffer.from(images[0].image_url.slice("data:image/png;base64,".length), "base64");
-  assert.equal(png.subarray(0, 8).toString("hex"), "89504e470d0a1a0a");
-  assert.ok(png.length > 100, "Screenshot did not contain real image bytes.");
-  return png.length;
+      return { gate: "exact_install_target", target: resolvedInstallTarget };
+    },
+  }, {
+    name: "android_install_build_from_run", args() {
+      assert.ok(resolvedInstallTarget, "Resolve the provider before constructing its install request.");
+      return {
+        action_id: installActionId,
+        build: {
+          contract_version: "android-provider-execution/v1",
+          workflow_run_id: expectedBuild.workflow_run_id,
+          artifact_name: expectedBuild.artifact_name,
+          repository: expectedBuild.repository,
+          install: { launch_after_install: true },
+          target: { ...resolvedInstallTarget, expected_build: expectedBuild },
+        },
+      };
+    },
+    check(output) {
+      const receipt = assertInstallReceipt(output, { serial, actionId: installActionId, expectedBuild, packageName: fixturePackage });
+      return {
+        gate: "hosted_install_receipt_and_image", image: assertTypedPng(output),
+        installed_build: receipt.install.install_receipt.installed_build,
+        apk_sha256: receipt.install.manifest.apk_sha256,
+      };
+    },
+  }, {
+    name: "android_observe", args: { serial },
+    check(output) {
+      const receipt = assertObservationReceipt(output, serial);
+      return { gate: "observation", observation_id: receipt.observation_id, image: assertTypedPng(output) };
+    },
+  }, {
+    name: "android_step", args: successArgs,
+    check(output) {
+      assertStepReceipt(output, { serial, actionId: successActionId, success: true, count: 1 });
+      return { gate: "successful_step", image: assertTypedPng(output) };
+    },
+  }, {
+    name: "android_step", args: successArgs,
+    check(output) {
+      assertStepReceipt(output, { serial, actionId: successActionId, success: true, count: 1, duplicate: true });
+      return { gate: "duplicate_action_id", image: assertTypedPng(output) };
+    },
+  }, {
+    name: "android_step", args: {
+      serial, action_id: failureActionId,
+      actions: [
+        { tool: "android.input.keyevent", arguments: { keycode: "KEYCODE_BACK" } },
+        { tool: "android.tap_element", arguments: {
+          selector: { resource_id: "android.mcp.fixture:id/nonexistent_control" }, timeout_secs: 1,
+        } },
+        { tool: "android.input.keyevent", arguments: { keycode: "KEYCODE_HOME" } },
+      ],
+    },
+    check(output) {
+      assertStepReceipt(output, {
+        serial, actionId: failureActionId, success: false, count: 1, attempted: 2, failedIndex: 1,
+      });
+      return { gate: "partial_failure_receipt_and_image", image: assertTypedPng(output) };
+    },
+  });
 }
-
-function callOutput(body, callId) {
-  const call = body.input?.find((item) => item.type === "function_call_output" && item.call_id === callId);
-  assert.ok(call, `Missing model-facing output for ${callId}.`);
-  if (Array.isArray(call.output)) return call.output;
-  assert.equal(typeof call.output, "string", `Unexpected model-facing output shape for ${callId}.`);
-  return [{ type: "input_text", text: call.output }];
-}
-
-function assertBootReadiness(output) {
-  const text = output.filter((item) => item.type === "input_text").map((item) => item.text).join("\n");
-  assert.match(text, /"ok"\s*:\s*true/, "Android boot tool did not report readiness.");
-  assert.match(text, /"serial"\s*:\s*"emulator-5554"/, "Android boot result did not identify the target emulator.");
-}
-
-function assertScreenshotReceipt(output) {
-  const receipts = output
-    .filter((item) => item.type === "input_text")
-    .map((item) => item.text)
-    .filter((text) => text.trimStart().startsWith("{"));
-  assert.equal(receipts.length, 1, "Android screenshot receipt was not preserved as one text item.");
-  const receipt = JSON.parse(receipts[0]);
-  assert.equal(receipt.ok, true, "Android screenshot receipt did not report success.");
-  assert.equal(receipt.serial, "emulator-5554", "Android screenshot receipt did not identify the target emulator.");
-  assert.equal(typeof receipt.path, "string", "Android screenshot receipt did not preserve its artifact path.");
-  assert.equal(typeof receipt.backend_used, "string", "Android screenshot receipt did not preserve its capture backend.");
-}
+const enabledTools = scenario === "upstream-image"
+  ? ["android.wait_for_boot", "android.capture_screenshot"]
+  : ["android.wait_for_boot", "android.resolve_target", "android.install_build_from_run", "android.observe", "android.step"];
 
 let api;
 let codex;
 let apiFailure;
 let requestCount = 0;
+let deferredDiscovery = false;
 let stderr = "";
+let currentGate = "consumer_startup";
+let lastOutputSummary;
+
+function redactMessage(message) {
+  let text = String(message);
+  for (const secret of [fakeKey, ...Object.entries(process.env)
+    .filter(([key, value]) => /(?:TOKEN|SECRET|KEY)$/.test(key) && value.length >= 8)
+    .map(([, value]) => value)]) text = text.replaceAll(secret, "[redacted]");
+  return text.replace(/data:[^\s"']+/g, "[data redacted]").slice(0, 1500);
+}
+
+function summarizeOutput(output) {
+  const summary = { content: output.map((item) => ({
+    type: item.type, text_length: item.text?.length, image_url_length: item.image_url?.length,
+  })) };
+  try {
+    const value = jsonReceipt(output);
+    const errorSummary = (error) => error && {
+      code: error.code, kind: error.kind,
+      message: redactMessage(typeof error === "string" ? error : error.message || ""),
+    };
+    summary.receipt = {
+      ok: value.ok, serial: value.serial, action_id: value.action_id, outcome: value.outcome,
+      attempted_action_count: value.attempted_action_count, executed_action_count: value.executed_action_count,
+      failed_index: value.failed_index, error: errorSummary(value.error),
+      actions: value.actions?.slice(0, 16).map((row) => ({
+        index: row.index, tool: row.tool, outcome: row.outcome,
+        error: errorSummary(row.error || row.receipt?.error),
+      })),
+    };
+  } catch {
+    // Keep only a framework error prefix, never arbitrary receipt text or image data.
+    summary.errors = output.filter((item) => item.type === "input_text" && /^(?:Error|error|tool error)/.test(item.text || ""))
+      .map((item) => redactMessage(item.text)).slice(0, 2);
+  }
+  return summary;
+}
+
+function evidence(status) {
+  return {
+    schema_version: 1, status, scenario, started_at: startedAt,
+    completed_at: new Date().toISOString(), consumer: consumerProvenance,
+    mcp_source_sha: process.env.MCP_SOURCE_SHA || null,
+    mcp_binary_sha256: process.env.MCP_BINARY_SHA256 || null,
+    requested_protocol_mode: protocolMode || "client_default", negotiated_protocol_version: null,
+    serial, android_build_fingerprint: process.env.ANDROID_BUILD_FINGERPRINT || null,
+    emulator_version: process.env.ANDROID_EMULATOR_VERSION || null,
+    scripted_model_fixture: true, live_model_judgement: false,
+    tool_discovery: requestCount === 0 ? "not_reached" : deferredDiscovery ? "client_tool_search" : "initial_catalog",
+    hosted_build_install_tested: checks.some((check) => check.gate === "hosted_install_receipt_and_image"), checks,
+  };
+}
 
 try {
-  const version = spawnSync("codex", ["--version"], {
-    encoding: "utf8",
-    env: { PATH: process.env.PATH || "", HOME: process.env.HOME },
-  });
-  assert.equal(version.status, 0, "The pinned Codex CLI did not start.");
-  assert.match(version.stdout, new RegExp(`\\b${codexVersion.replaceAll(".", "\\.")}\\b`));
+  await verifyConsumer();
 
   api = createServer(async (request, response) => {
     try {
@@ -163,36 +317,40 @@ try {
       const body = JSON.parse(bytes.toString("utf8"));
       requestCount++;
 
-      let stream;
       if (requestCount === 1) {
+        currentGate = "initial_tool_catalog";
         const android = body.tools?.find((tool) => tool.type === "namespace" && tool.name === "mcp__android");
-        assert.deepEqual(android?.tools?.map((tool) => tool.name).sort(), [
-          "android_capture_screenshot",
-          "android_wait_for_boot",
-        ]);
-        stream = toolCall("android-mcp-response-1", "android-mcp-call-1", "android_wait_for_boot", {
-          serial: "emulator-5554",
-          timeout_secs: 120,
-        });
-      } else if (requestCount === 2) {
-        const output = callOutput(body, "android-mcp-call-1");
-        assertBootReadiness(output);
-        stream = toolCall("android-mcp-response-2", "android-mcp-call-2", "android_capture_screenshot", {
-          serial: "emulator-5554",
-          filename: "codex-consumer-screenshot.png",
-        });
-      } else if (requestCount === 3) {
-        const output = callOutput(body, "android-mcp-call-2");
-        const imageBytes = assertTypedPng(output);
-        assertScreenshotReceipt(output);
-        stream = finalMessage("android-mcp-response-3");
-        response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
-        response.end(stream);
-        process.stdout.write(`Codex ${codexVersion} generic HTTP MCP journey passed: Android tools discovered, device readiness checked, and screenshot forwarded as typed PNG (${imageBytes} bytes).\n`);
-        return;
-      } else {
-        throw new Error(`Unexpected extra Responses API request ${requestCount}.`);
+        if (!android) {
+          // The pinned consumer defers MCP tools and exposes them through its
+          // client-executed discovery tool. Require the entire allowlist to be
+          // returned before dispatching any Android operation.
+          const search = body.tools?.find((tool) => tool.type === "tool_search");
+          const advertised = body.tools?.map((tool) => ({ type: tool.type, name: tool.name }));
+          assert.equal(search?.execution, "client", `Android tools and client discovery are both missing: ${JSON.stringify(advertised)}.`);
+          deferredDiscovery = true;
+          response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
+          response.end(discoverTools(`android-mcp-response-${requestCount}`, enabledTools));
+          return;
+        }
+        assertAndroidToolCatalog(body.tools, enabledTools);
+      } else if (requestCount === 2 && deferredDiscovery) {
+        currentGate = "deferred_tool_discovery";
+        const names = assertAndroidToolDiscovery(body, toolDiscoveryCallId, enabledTools);
+        checks.push({ gate: "deferred_tool_discovery", namespace: "mcp__android", tools: names });
       }
+      const toolRequestNumber = requestCount - Number(deferredDiscovery);
+      if (toolRequestNumber > 1) {
+        const previous = steps[toolRequestNumber - 2];
+        assert.ok(previous, `Unexpected extra Responses API request ${requestCount}.`);
+        currentGate = `${previous.name}:android-mcp-call-${toolRequestNumber - 1}`;
+        const output = callOutput(body, `android-mcp-call-${toolRequestNumber - 1}`);
+        lastOutputSummary = summarizeOutput(output);
+        checks.push(previous.check(output));
+      }
+      const next = steps[toolRequestNumber - 1];
+      const stream = next
+        ? toolCall(`android-mcp-response-${requestCount}`, `android-mcp-call-${toolRequestNumber}`, next.name, typeof next.args === "function" ? next.args() : next.args)
+        : finalMessage(`android-mcp-response-${requestCount}`);
 
       response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
       response.end(stream);
@@ -227,14 +385,15 @@ try {
     `url = ${JSON.stringify(mcpEndpoint)}`,
     "required = true",
     "startup_timeout_sec = 20",
-    "tool_timeout_sec = 60",
-    'enabled_tools = ["android.wait_for_boot", "android.capture_screenshot"]',
+    "tool_timeout_sec = 420",
+    `enabled_tools = ${JSON.stringify(enabledTools)}`,
+    ...(protocolMode ? [`protocol_mode = ${JSON.stringify(protocolMode)}`] : []),
     'default_tools_approval_mode = "approve"',
     "",
   ].join("\n");
   await writeFile(path.join(codexHome, "config.toml"), config, { mode: 0o600 });
 
-  codex = spawn("codex", [
+  codex = spawn(codexBinary, [
     "exec",
     "--json",
     "--ephemeral",
@@ -247,7 +406,7 @@ try {
     "never",
     "--cd",
     codexCwd,
-    "Use only the configured Android MCP server. First verify the emulator is ready, then capture one screenshot. Do not use shell tools or other servers.",
+    "Use only the configured Android MCP server to execute the disposable emulator fixture. Do not use shell tools or other servers.",
   ], {
     cwd: codexCwd,
     env: {
@@ -264,14 +423,25 @@ try {
     const softKill = setTimeout(() => {
       codex.kill("SIGTERM");
       hardKill = setTimeout(() => codex.kill("SIGKILL"), 10000);
-    }, 150000);
+    }, scenario === "production" ? 720000 : 360000);
     codex.once("error", reject);
     codex.once("close", (code, signal) => resolve({ code, signal }));
     codex.once("close", () => { clearTimeout(softKill); clearTimeout(hardKill); });
   });
   assert.equal(apiFailure, undefined, apiFailure?.message);
   assert.equal(exit.code, 0, `Codex CLI exited ${exit.code ?? exit.signal}: ${stderr.replaceAll(fakeKey, "[redacted]").slice(-1200)}`);
-  assert.equal(requestCount, 3, "Expected readiness and screenshot calls followed by a model request containing its typed image.");
+  assert.equal(requestCount, steps.length + 1 + Number(deferredDiscovery), "Every tool result must return to the model before the fixture completes.");
+  if (process.env.ANDROID_MCP_JOURNEY_EVIDENCE) {
+    await writeFile(process.env.ANDROID_MCP_JOURNEY_EVIDENCE, `${JSON.stringify(evidence("passed"), null, 2)}\n`, { mode: 0o600 });
+  }
+  process.stdout.write(`Codex generic MCP ${scenario} journey passed: ${checks.length} wire assertions, typed PNGs preserved.\n`);
+} catch (error) {
+  const failure = { gate: currentGate, message: redactMessage(error.message), output: lastOutputSummary };
+  console.error(JSON.stringify({ status: "failed", scenario, failure }));
+  if (process.env.ANDROID_MCP_JOURNEY_EVIDENCE) {
+    await writeFile(process.env.ANDROID_MCP_JOURNEY_EVIDENCE, `${JSON.stringify({ ...evidence("failed"), failure }, null, 2)}\n`, { mode: 0o600 });
+  }
+  throw error;
 } finally {
   if (codex && codex.exitCode === null && codex.signalCode === null) {
     codex.kill("SIGTERM");
@@ -281,5 +451,7 @@ try {
     api.closeAllConnections?.();
     await new Promise((resolve) => api.close(resolve));
   }
-  await rm(tmpRoot, { recursive: true, force: true });
+  // Background plugin checkout can briefly outlive the CLI and race removal.
+  // Retry transient filesystem errors with bounded backoff; final errors still fail.
+  await rm(tmpRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 }

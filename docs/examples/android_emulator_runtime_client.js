@@ -382,7 +382,7 @@ export function createAndroidEmulatorRuntime({
         waitForSelector = null,
         waitForActivity = null,
         waitForPackage = null,
-        timeoutSecs = 5,
+        timeoutSecs,
       } = {},
     ) {
       const result = await callAndroidTool(
@@ -394,7 +394,7 @@ export function createAndroidEmulatorRuntime({
           wait_for_selector: waitForSelector,
           wait_for_activity: waitForActivity,
           wait_for_package: waitForPackage,
-          timeout_secs: timeoutSecs,
+          ...(timeoutSecs == null ? {} : { timeout_secs: timeoutSecs }),
         },
         {
           reason: "enter the target app before observation or interaction",
@@ -521,7 +521,7 @@ export function createAndroidEmulatorRuntime({
         hierarchyFilename = "tap-element.xml",
         waitUntilAbsent = false,
         waitForSelector = null,
-        timeoutSecs = 5,
+        timeoutSecs,
         retryWithAdbOnNoChange = true,
         allowVerificationFailure = false,
         matchIndex = null,
@@ -535,7 +535,7 @@ export function createAndroidEmulatorRuntime({
           hierarchy_filename: hierarchyFilename,
           wait_until_absent: waitUntilAbsent,
           wait_for_selector: waitForSelector,
-          timeout_secs: timeoutSecs,
+          ...(timeoutSecs == null ? {} : { timeout_secs: timeoutSecs }),
           retry_with_adb_on_no_change: retryWithAdbOnNoChange,
           allow_verification_failure: allowVerificationFailure,
           match_index: matchIndex,
@@ -554,7 +554,7 @@ export function createAndroidEmulatorRuntime({
     async typeIntoElement(
       selector,
       text,
-      { hierarchyFilename = "type-into-element.xml", timeoutSecs = 5, matchIndex = null } = {},
+      { hierarchyFilename = "type-into-element.xml", timeoutSecs, matchIndex = null } = {},
     ) {
       const result = await callAndroidTool(
         "android.type_into_element",
@@ -563,7 +563,7 @@ export function createAndroidEmulatorRuntime({
           selector,
           text,
           hierarchy_filename: hierarchyFilename,
-          timeout_secs: timeoutSecs,
+          ...(timeoutSecs == null ? {} : { timeout_secs: timeoutSecs }),
           match_index: matchIndex,
         },
         {
@@ -580,7 +580,7 @@ export function createAndroidEmulatorRuntime({
     async scrollUntilVisible(
       selector,
       {
-        direction = "down",
+        direction = "up",
         maxSwipes = 5,
         hierarchyFilename = "scroll-until-visible.xml",
         matchIndex = null,
@@ -625,7 +625,7 @@ export function createAndroidEmulatorRuntime({
         tappedSelector = null,
         waitUntilAbsent = false,
         waitForSelector = null,
-        timeoutSecs = 5,
+        timeoutSecs,
         retryWithAdbOnNoChange = true,
       } = {},
     ) {
@@ -638,7 +638,7 @@ export function createAndroidEmulatorRuntime({
           tapped_selector: tappedSelector,
           wait_until_absent: waitUntilAbsent,
           wait_for_selector: waitForSelector,
-          timeout_secs: timeoutSecs,
+          ...(timeoutSecs == null ? {} : { timeout_secs: timeoutSecs }),
           retry_with_adb_on_no_change: retryWithAdbOnNoChange,
         },
         {
@@ -650,7 +650,7 @@ export function createAndroidEmulatorRuntime({
 
     async typeText(
       text,
-      { expectFocusSelector = null, waitForSelector = null, timeoutSecs = 5 } = {},
+      { expectFocusSelector = null, waitForSelector = null, timeoutSecs } = {},
     ) {
       const result = await callAndroidTool(
         "android.input.text",
@@ -659,7 +659,7 @@ export function createAndroidEmulatorRuntime({
           text,
           expect_focus_selector: expectFocusSelector,
           wait_for_selector: waitForSelector,
-          timeout_secs: timeoutSecs,
+          ...(timeoutSecs == null ? {} : { timeout_secs: timeoutSecs }),
         },
         {
           reason: "fall back to raw text input when semantic field targeting is not the right fit",
@@ -673,7 +673,7 @@ export function createAndroidEmulatorRuntime({
       y1,
       x2,
       y2,
-      { durationMs, waitForSelector = null, expectScrollChange = false, timeoutSecs = 5 } = {},
+      { durationMs, waitForSelector = null, expectScrollChange = false, timeoutSecs } = {},
     ) {
       const result = await callAndroidTool(
         "android.input.swipe",
@@ -686,7 +686,7 @@ export function createAndroidEmulatorRuntime({
           duration_ms: durationMs,
           wait_for_selector: waitForSelector,
           expect_scroll_change: expectScrollChange,
-          timeout_secs: timeoutSecs,
+          ...(timeoutSecs == null ? {} : { timeout_secs: timeoutSecs }),
         },
         {
           reason: "use a raw swipe only when semantic scrolling or stable selectors are not enough",
@@ -697,7 +697,7 @@ export function createAndroidEmulatorRuntime({
 
     async keyevent(
       keycode,
-      { waitForSelector = null, waitForActivity = null, waitForPackage = null, timeoutSecs = 5 } = {},
+      { waitForSelector = null, waitForActivity = null, waitForPackage = null, timeoutSecs } = {},
     ) {
       const result = await callAndroidTool(
         "android.input.keyevent",
@@ -707,7 +707,7 @@ export function createAndroidEmulatorRuntime({
           wait_for_selector: waitForSelector,
           wait_for_activity: waitForActivity,
           wait_for_package: waitForPackage,
-          timeout_secs: timeoutSecs,
+          ...(timeoutSecs == null ? {} : { timeout_secs: timeoutSecs }),
         },
         {
           reason: "send a bounded low-level key event as a fallback action",

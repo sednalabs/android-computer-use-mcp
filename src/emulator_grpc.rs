@@ -10,4 +10,7 @@
 //! ## References
 //! * [Android Emulator gRPC API](https://developer.android.com/studio/run/emulator-console)
 
+// Documentation is emitted from Google's SDK proto, outside this crate's control.
+#![allow(clippy::doc_lazy_continuation)]
+
 tonic::include_proto!("android.emulation.control");

@@ -1,0 +1,226 @@
+# Production validation
+
+The release gates distinguish source tests, real Android execution and model
+behaviour. Passing one gate does not imply that the others ran. Keep the exact
+Android MCP commit, consumer commit and binary digests with each result.
+
+## Automated gates
+
+| Gate | What it establishes | What it does not establish |
+| --- | --- | --- |
+| Rust validation | Locked dependency build, formatting, Clippy, tool schemas and Rust regression tests | A real device journey |
+| HTTP workflow contracts | Independent MCP sessions share duplicate-action protection; exact simulated mutation counts and offline receipt recovery survive provider restart | Real Android execution or Codex image conversion |
+| Adapter and consumer contracts | JavaScript contracts and negative tests for missing/corrupt images, wrong-device receipts and unsafe retry flags | Actual Codex or Android execution |
+| Upstream image smoke | Pinned upstream Codex 0.163.0 discovers Android tools and forwards a real emulator PNG and JSON receipt | Sedna fork compatibility or action parity |
+| Android provider acceptance | A disposable Android app is installed from an exact GitHub Actions artifact; identity rejection, install-only behaviour, semantic controls, lifecycle, rotation and simultaneous touch run on a real emulator | Codex wire compatibility, multiple physical devices or production app behaviour |
+| Sedna Codex acceptance | Exact source-built fork discovers generic MCP tools; hosted install, observe, successful action, duplicate ID and partial failure preserve typed PNGs and truthful receipts | Live model judgement, multi-device races or a long session |
+
+The consumer fixture drives a disposable local Responses endpoint with fixed
+tool calls. It sends no real API credential and makes no call to a live model.
+This tests what reaches the model-facing request, not whether a model correctly
+understands the screen.
+
+The hosted install gate builds the small app in `tests/android-fixture`, uploads
+its APK and manifest to the same workflow run, and passes the upload's archive
+digest to `android.install_build_from_run` through Codex. The request binds the
+resolved provider epoch and device to the exact repository, source commit, run,
+artifact and archive digest. The model-facing receipt must preserve the known
+installation and launch effects, build identity and typed post-install PNG.
+The provider alone receives an Actions read token through its environment; the
+Codex subprocess and disposable model endpoint receive only a fake API key.
+
+Image results must retain one JSON text receipt and one typed PNG. They must not
+acquire `structuredContent` while a supported Codex consumer suppresses image
+blocks when that field is present. The assertion walks PNG chunks, checks their
+checksums, records dimensions and hashes the exact bytes.
+
+The failure journey executes Back, attempts a selector that cannot match, and
+places Home after it. It requires one completed action, two attempted calls,
+`failed_index: 1`, a fresh failure screenshot and `do_not_replay: true`. Retrying
+the successful batch with the same action ID must return
+`duplicate_action_id: true`. Rust fake-provider tests are the stronger proof of
+underlying dispatch counts; the consumer fixture checks the public receipt.
+
+The HTTP regression uses a disposable simulated SDK and the built provider's
+actual HTTP endpoint. Run it after `cargo build --locked` with
+`python3 scripts/test_mcp_workflow_http.py`. It requires Node.js and Python, and
+uses no real device or model credential. It checks image-bearing results,
+cross-session and concurrent duplicate IDs, the exact underlying mutation log,
+and durable status after restarting the provider with its device offline.
+
+## UI observation and verification
+
+Automatic stability and semantic verification use full UI hierarchy observations.
+The original action deadline, required confirmation observations, target baseline
+and exact editable-text checks continue to apply. A system ANR Wait can help a
+blocked application recover, but it never proves the original postcondition or
+replays the original input. Recovery stays within the existing deadline and cap.
+
+The runtime does not poll `cmd window dump-visible-window-views`. In Android 15,
+that diagnostic requests encoded views from all visible and recents windows
+before collecting their pipes. Its one-way requests carry no cancellation or
+deadline; if writing the output ZIP fails, the remaining unvisited pipes are not
+explicitly closed by that command. A one-second host ADB timeout therefore does
+not bound the lifetime of that Android-side work. See the source-defined
+[request and collection path](https://android.googlesource.com/platform/frameworks/base/+/android-15.0.0_r1/services/core/java/com/android/server/wm/WindowManagerShellCommand.java),
+[one-way window interface](https://android.googlesource.com/platform/frameworks/base/+/android-15.0.0_r1/core/java/android/view/IWindow.aidl)
+and [pipe cleanup](https://android.googlesource.com/platform/frameworks/base/+/android-15.0.0_r1/core/java/com/android/internal/os/TransferPipe.java).
+Full hierarchy polling removes this additional diagnostic workload. Host command
+deadlines bound the provider's wait; Android-side completion is a separate concern.
+
+## Logical display coordinates and rotation
+
+The [first complete provider qualification, at `d56fc928`](https://github.com/sednalabs/android-computer-use-mcp/actions/runs/44446926247/job/135301212030),
+passed all 64 checks on Android 15 / API 35 in 289.7 seconds. It recorded a native
+2400 by 1080 landscape PNG, a coordinate tap that changed the intended counter,
+and distinct completed two-pointer gestures in landscape and portrait. Exact
+ASCII and Unicode replacement, clipboard restoration, ten repeated increments,
+force-stop/relaunch and stop-on-error batch behavior also passed. That run used
+the source tree at `d56fc928`; later candidates require their own complete gate
+results. No ANR recovery was recorded in that passing run, so it does not establish
+the cause of earlier intermittent ANRs.
+
+The [provider run for `5960d205`](https://github.com/sednalabs/android-computer-use-mcp/actions/runs/44436813896/job/135267615481)
+reached landscape orientation, but its post-action and fresh-observation PNGs
+both remained 1080 by 2400. That run did not qualify landscape pointing or finish
+the remaining provider gates. An orientation receipt alone is insufficient proof
+that a screenshot and an input backend share a coordinate space.
+
+The [capture and input implementation](../src/tools.rs) selects exact-serial ADB
+for screenshots, taps, double taps, long presses and swipes. These operations use
+guest logical display coordinates, including the guest's current rotation.
+Capture has a bounded command timeout, a 32 MiB encoded-image limit and a 64 MiB
+decode budget. The complete PNG must decode as one static frame before the
+artifact is written; a PNG signature or header alone is insufficient.
+
+The [workflow checks](../src/workflow.rs) sample display geometry, rotation and
+window identity before and after capture. Coordinate observations require equal
+contexts and PNG dimensions that match the logical display, as well as stable
+boot identity and the existing 30-second freshness limit. A change from rotation
+0 to 2 is rejected even though image dimensions can remain identical. Before
+coordinate dispatch, the provider checks the logical geometry again and brackets
+a fresh screenshot with the same context checks. An unqualified image remains
+visible with degraded notes and coordinate actions disabled; it does not create
+or retain a usable coordinate observation.
+
+Atomic multi-touch retains the emulator gRPC backend. Its coordinate conversion
+requires a checked full-panel viewport, matching physical dimensions, supported
+raw touch axes and reported identity calibration. Android's `dumpsys input`
+rounds affine coefficients to three decimal places; this guard is not a
+full-precision calibration measurement or proof of exact runtime inversion.
+Real-device qualification is scoped to the stock Android API 35 `default`
+`x86_64` emulator with the `pixel_7` profile in the
+[provider workflow](../.github/workflows/android-provider-acceptance.yml).
+Other system images and arbitrary custom calibration remain unqualified even
+when the printed coefficients appear to be identity. The source-derived rotation
+mapping applies only after the geometry checks; unsupported or unavailable
+geometry must fail before input.
+Transport acknowledgement alone does not establish that the intended target
+received simultaneous touches.
+
+A passing real-device run must record native image dimensions and selected
+backends, prove a coordinate tap changes the intended control in landscape, and
+verify the simultaneous-touch effect. Source tests for geometry conversion and
+typed-image consumer delivery do not replace those device postconditions or
+establish live-model pointing accuracy.
+
+## Text input and clipboard ownership
+
+Printable ASCII text uses the validated ADB text route. The emulator keyboard
+API translates text into key events; its scheduling acknowledgement did not
+produce even ASCII field contents in [real acceptance](https://github.com/sednalabs/android-computer-use-mcp/actions/runs/44434613937) and cannot preserve
+arbitrary Unicode. Non-ASCII text, control characters and literal `%s` use the
+serial-bound emulator clipboard API and one exact-device ADB paste.
+The provider selects this route before input, verifies the target field, then
+restores the previous clipboard text if the clipboard still contains its staged
+value. Raw text input needs a uniquely observable focused editable field for
+this route. A failed or uncertain paste is never retried through another backend.
+Use `android.type_into_element` for exact replacement of an existing value.
+Raw input keeps insertion semantics and can confirm success only when the final
+editable value exactly matches the requested text; hidden or deferred editor
+contents cannot supply that proof.
+
+Clipboard transfers are serialized in the provider process. Prior clipboard
+text stays in private memory and is excluded from receipts and diagnostics.
+Snapshot, staging and restoration are bounded; cleanup continues after request
+cancellation. If a scheduled clipboard write or restoration has an uncertain
+outcome, that emulator endpoint cannot start another clipboard transfer in the
+same provider process. Inspect and reset the emulator clipboard before
+restarting the provider to resume these transfers.
+
+The emulator API exposes text only, so it cannot preserve rich clipboard
+formats. A `restored` cleanup receipt confirms emulator API readback; propagation
+to the Android guest is asynchronous and the fixture checks it separately.
+The API has no atomic compare-and-set: ownership checks preserve an
+observed intervening change but cannot exclude an external write racing the
+restore itself. Use this path with an emulator dedicated to automation and avoid
+concurrent host clipboard writers. The real-device gate verifies ASCII entry,
+exact Unicode replacement and restoration of a known nonempty clipboard value.
+
+## Pinning the actual Sedna consumer
+
+`scripts/sedna_codex_consumer_revision.txt` contains a full immutable commit ID.
+The hosted workflow checks out that exact revision and builds `codex-cli` with
+its declared Rust toolchain and locked dependencies. The build emits a receipt
+binding the source revision to the executable's SHA-256. The journey rehashes
+the executable before running it and rejects a mismatched receipt.
+
+Update the pin deliberately after reviewing consumer changes. A passing run on
+an earlier pin is not proof for a newer installed Codex executable.
+
+The workflow runs both `protocol_mode = "legacy"` and
+`protocol_mode = "2026-07-28"`. The latter permits consumer fallback when the
+server does not implement the newer lifecycle. Evidence records the requested
+preference; it does not claim that the newer protocol was negotiated.
+
+To reproduce with an already checked-out pinned Codex source and a disposable
+booted emulator:
+
+```bash
+bash scripts/build_sedna_codex_consumer.sh \
+  <codex-checkout> <consumer-output-directory>
+
+export CODEX_BINARY=<consumer-output-directory>/codex
+export CODEX_BUILD_PROVENANCE=<consumer-output-directory>/provenance.json
+export CODEX_SOURCE_SHA="$(cat scripts/sedna_codex_consumer_revision.txt)"
+export ANDROID_ACCEPTANCE_ARTIFACT_NAME=<uploaded-fixture-artifact-name>
+export ANDROID_ACCEPTANCE_ARTIFACT_SHA256=<upload-artifact-archive-digest>
+export ANDROID_ACCEPTANCE_SOURCE_SHA=<fixture-source-commit>
+export GITHUB_REPOSITORY=<owner/repository>
+export GITHUB_RUN_ID=<run-containing-the-fixture-artifact>
+export ANDROID_COMPUTER_USE_MCP_INTERACTIVE_SESSION_ROOT=<private-session-directory>
+export ANDROID_COMPUTER_USE_MCP_INTERACTIVE_SESSION_GITHUB_REPOSITORY="$GITHUB_REPOSITORY"
+export ANDROID_COMPUTER_USE_MCP_INTERACTIVE_SESSION_APP_PACKAGE=com.sednalabs.mcp.acceptance
+export ANDROID_COMPUTER_USE_MCP_INTERACTIVE_SESSION_APP_ACTIVITY=com.sednalabs.mcp.acceptance.MainActivity
+# Provide ANDROID_COMPUTER_USE_MCP_INTERACTIVE_SESSION_GITHUB_TOKEN securely.
+export ANDROID_SDK_ROOT=<android-sdk-directory>
+export ANDROID_SERIAL=emulator-5554
+export ANDROID_COMPUTER_USE_MCP_BIND_ADDR=127.0.0.1:9526
+export RUNNER_TEMP=<temporary-test-directory>
+sh scripts/run_sedna_codex_acceptance.sh
+```
+
+Use absolute output and SDK paths. Build the MCP with `cargo build --locked`
+first, or set `MCP_BINARY` to the built executable. The runner refuses an already
+healthy endpoint so an unrelated running server cannot satisfy the test. CI
+preserves small JSON evidence receipts, without publishing screenshots, UI
+hierarchies, arbitrary device logs or account content.
+
+## Promotion evidence still required
+
+Before declaring a deployment production-ready, collect successful results for
+the actual deployed consumer/provider pair and its configuration, including:
+
+- Hosted build installation with correct repository, run, APK and manifest
+  digests; wrong identity and partial post-install failures must fail truthfully.
+- A representative app journey including Unicode input, app lifecycle,
+  orientation and atomic multi-touch on a backend that supports it.
+- Two-device isolation and concurrent mutations; disconnects and dropped
+  responses must not replay an uncertain operation.
+- Long sessions and bounded artefact retention, with measured latency on the
+  named host and emulator configuration.
+
+Consumer receipts set `hosted_build_install_tested` only after the hosted install
+result passes its model-facing assertions. `live_model_judgement` remains false.
+These are results of executed checks; a workflow definition or queued run is not
+a passing result.

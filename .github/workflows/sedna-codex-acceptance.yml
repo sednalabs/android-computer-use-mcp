@@ -1,0 +1,197 @@
+name: Sedna Codex Android acceptance
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/sedna-codex-acceptance.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "build.rs"
+      - "src/**"
+      - "spec/**"
+      - "scripts/**"
+      - "tests/android-fixture/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: sedna-codex-android-acceptance-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pinned-consumer:
+    name: Pinned Sedna Codex with real Android
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout Android MCP
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Read the pinned consumer revision
+        id: consumer
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha=$(cat scripts/sedna_codex_consumer_revision.txt)
+          [[ "${sha}" =~ ^[a-f0-9]{40}$ ]]
+          echo "sha=${sha}" >> "${GITHUB_OUTPUT}"
+
+      - name: Checkout the exact Sedna Codex consumer
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          repository: sednalabs/codex
+          ref: ${{ steps.consumer.outputs.sha }}
+          path: consumer-source
+          persist-credentials: false
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler pkg-config libcap-dev libssl-dev libasound2-dev clang cmake acl
+
+      - name: Enable KVM for the isolated runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -c /dev/kvm
+          sudo setfacl -m "u:$(id -un):rw" /dev/kvm
+          test -r /dev/kvm
+          test -w /dev/kvm
+
+      - name: Install Node.js for the consumer fixture
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24.22.3"
+
+      - name: Restore the completed pinned consumer
+        id: consumer-cache
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            ${{ runner.temp }}/sedna-codex-consumer/codex
+            ${{ runner.temp }}/sedna-codex-consumer/provenance.json
+          key: sedna-codex-ubuntu24-${{ runner.arch }}-v1-${{ steps.consumer.outputs.sha }}-${{ hashFiles('scripts/build_sedna_codex_consumer.sh') }}
+
+      - name: Build and fingerprint the pinned consumer
+        if: steps.consumer-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: bash scripts/build_sedna_codex_consumer.sh consumer-source "${RUNNER_TEMP}/sedna-codex-consumer"
+
+      - name: Verify the completed consumer before use or caching
+        env:
+          EXPECTED_CONSUMER_SHA: ${{ steps.consumer.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, subprocess, tomllib
+          source = pathlib.Path('consumer-source')
+          output = pathlib.Path(os.environ['RUNNER_TEMP']) / 'sedna-codex-consumer'
+          receipt = json.loads((output / 'provenance.json').read_text())
+          sha = os.environ['EXPECTED_CONSUMER_SHA']
+          assert subprocess.check_output(['git', '-C', str(source), 'rev-parse', 'HEAD'], text=True).strip() == sha
+          assert not subprocess.check_output(['git', '-C', str(source), 'status', '--porcelain', '--untracked-files=normal'], text=True).strip()
+          assert receipt['repository'] == 'sednalabs/codex'
+          assert receipt['source_sha'] == sha
+          assert receipt['rust_toolchain'] == tomllib.loads((source / 'codex-rs/rust-toolchain.toml').read_text())['toolchain']['channel']
+          assert receipt['binary_sha256'] == hashlib.file_digest((output / 'codex').open('rb'), 'sha256').hexdigest()
+          assert os.access(output / 'codex', os.X_OK)
+          print('Pinned source and completed consumer executable match their provenance.')
+          PY
+
+      - name: Cache only the verified completed consumer
+        if: steps.consumer-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            ${{ runner.temp }}/sedna-codex-consumer/codex
+            ${{ runner.temp }}/sedna-codex-consumer/provenance.json
+          key: ${{ steps.consumer-cache.outputs.cache-primary-key }}
+
+      - name: Install the Android emulator SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdk_root="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=${sdk_root}" >> "${GITHUB_ENV}"
+          echo "ANDROID_SDK_ROOT=${sdk_root}" >> "${GITHUB_ENV}"
+          set +o pipefail
+          yes | "${sdk_root}/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null
+          set -o pipefail
+          "${sdk_root}/cmdline-tools/latest/bin/sdkmanager" "emulator" "platforms;android-35" "build-tools;35.0.0"
+          test -f "${sdk_root}/emulator/lib/emulator_controller.proto"
+          "${sdk_root}/emulator/emulator" -accel-check
+
+      - name: Build the disposable Android acceptance app
+        id: fixture
+        env:
+          ANDROID_ACCEPTANCE_ARTIFACT_NAME: sedna-consumer-fixture-${{ github.run_id }}-${{ github.run_attempt }}
+        run: bash scripts/build_android_acceptance_fixture.sh "${RUNNER_TEMP}/android-acceptance-build"
+
+      - name: Publish the exact install candidate to this workflow run
+        id: fixture-artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ steps.fixture.outputs.artifact_name }}
+          path: ${{ steps.fixture.outputs.bundle_dir }}
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Build the exact Android MCP checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.99.0 --profile minimal --no-self-update
+          ANDROID_COMPUTER_USE_MCP_SDK_ROOT="${ANDROID_HOME}" cargo +1.99.0 build --locked
+
+      - name: Exercise hosted install, observation, duplicate ID and partial failure
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2
+        env:
+          CODEX_BINARY: ${{ runner.temp }}/sedna-codex-consumer/codex
+          CODEX_SOURCE_SHA: ${{ steps.consumer.outputs.sha }}
+          CODEX_BUILD_PROVENANCE: ${{ runner.temp }}/sedna-codex-consumer/provenance.json
+          ANDROID_COMPUTER_USE_MCP_BIND_ADDR: 127.0.0.1:9526
+          ANDROID_COMPUTER_USE_MCP_ALLOWED_HOSTS: localhost,127.0.0.1,::1
+          ANDROID_COMPUTER_USE_MCP_HTTP_ALLOW_RESUME: "0"
+          ANDROID_COMPUTER_USE_MCP_INTERACTIVE_SESSION_ROOT: ${{ runner.temp }}/sedna-consumer-session
+          ANDROID_COMPUTER_USE_MCP_INTERACTIVE_SESSION_GITHUB_REPOSITORY: ${{ github.repository }}
+          ANDROID_COMPUTER_USE_MCP_INTERACTIVE_SESSION_GITHUB_TOKEN: ${{ github.token }}
+          ANDROID_COMPUTER_USE_MCP_INTERACTIVE_SESSION_APP_PACKAGE: ${{ steps.fixture.outputs.package_name }}
+          ANDROID_COMPUTER_USE_MCP_INTERACTIVE_SESSION_APP_ACTIVITY: ${{ steps.fixture.outputs.activity_name }}
+          ANDROID_ACCEPTANCE_ARTIFACT_NAME: ${{ steps.fixture.outputs.artifact_name }}
+          ANDROID_ACCEPTANCE_SOURCE_SHA: ${{ steps.fixture.outputs.source_sha }}
+          ANDROID_ACCEPTANCE_ARTIFACT_SHA256: ${{ steps.fixture-artifact.outputs.artifact-digest }}
+          ANDROID_SERIAL: emulator-5554
+          MCP_ENDPOINT: http://127.0.0.1:9526/mcp
+        with:
+          api-level: 35
+          target: default
+          arch: x86_64
+          profile: pixel_7
+          emulator-boot-timeout: 1200
+          disable-animations: false
+          disable-linux-hw-accel: false
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot-save -noaudio -no-boot-anim -camera-back none
+          script: sh "${GITHUB_WORKSPACE}/scripts/run_sedna_codex_acceptance.sh"
+
+      - name: Preserve exact consumer and provider evidence
+        if: ${{ always() && !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: sedna-codex-android-acceptance-evidence
+          path: |
+            ${{ runner.temp }}/sedna-codex-consumer/provenance.json
+            ${{ runner.temp }}/android-mcp-evidence-legacy.json
+            ${{ runner.temp }}/android-mcp-evidence-2026-07-28.json
+          if-no-files-found: warn
+          retention-days: 14

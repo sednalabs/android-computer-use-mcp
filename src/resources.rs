@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 
 use mcp_toolkit_core::rmcp_models;
-use rmcp::model::{Annotated, RawResource, ReadResourceResult, Resource, ResourceContents};
+use rmcp::model::{ReadResourceResult, Resource, ResourceContents};
 use serde_json::json;
 
 use crate::tool_surface::{ToolSurfaceEntry, tool_surface_entries};
@@ -109,31 +109,7 @@ fn build_about_text() -> String {
 }
 
 fn build_help_text() -> String {
-    [
-        "# Android Computer Use MCP help",
-        "",
-        "Recommended interaction order:",
-        "1. interactive_session.get_status when working against a hosted runner-backed session.",
-        "2. android.health or android.list_devices to understand the current harness state.",
-        "3. android.wait_for_boot if a device may still be starting.",
-        "4. interactive_session.install_build_from_run to swap a fresh remote-built APK into a live hosted session.",
-        "5. android.launch_app or a Solar Lab scenario to reach the target surface.",
-        "6. android.wait_for_stable_ui before acting through semantic UI tools.",
-        "7. android.tap_element or android.type_into_element for semantic interaction.",
-        "8. android.input.* only when semantic tools are insufficient.",
-        "",
-        "Guidance:",
-        "- Prefer semantic UI tools over raw input whenever a selector can describe the target.",
-        "- Prefer scenario tools for durable Solar Lab flows instead of rebuilding them ad hoc.",
-        "- Use observation tools when you need artifacts or structured state, not just one action.",
-        "",
-        "Hosted usage notes:",
-        "- This server works well as a runner-backed Android substrate over Streamable HTTP.",
-        "- interactive_session.* tools exist to avoid restarting the hosted runner for each new build.",
-        "- Discovery resources exist so a fresh agent can orient without local repo context.",
-        "",
-    ]
-    .join("\n")
+    include_str!("../docs/agent-workflows.md").to_owned()
 }
 
 fn build_tool_catalog() -> String {
@@ -145,7 +121,7 @@ fn build_tool_catalog() -> String {
 
     let payload = json!({
         "server": "android-computer-use-mcp",
-        "preferred_lane": "semantic-ui-first",
+        "preferred_lane": "observe-step-status",
         "fallback_lane": "raw-input",
         "groups": groups,
         "tools": entries.iter().map(entry_json).collect::<Vec<_>>(),
@@ -188,19 +164,12 @@ fn resource_for_text(
     mime_type: &str,
     size: Option<usize>,
 ) -> Resource {
-    Annotated::new(
-        RawResource {
-            uri: uri.to_string(),
-            name: name.to_string(),
-            title: Some(title.to_string()),
-            description: Some(description.to_string()),
-            mime_type: Some(mime_type.to_string()),
-            size: size.map(|value| value.min(u32::MAX as usize) as u32),
-            icons: None,
-            meta: None,
-        },
-        None,
-    )
+    let mut resource = Resource::new(uri, name)
+        .with_title(title)
+        .with_description(description)
+        .with_mime_type(mime_type);
+    resource.size = size.map(|value| value as u64);
+    resource
 }
 
 #[cfg(test)]

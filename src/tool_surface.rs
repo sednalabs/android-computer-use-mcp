@@ -20,7 +20,35 @@ pub(crate) struct ToolSurfaceEntry {
     pub(crate) use_when: &'static str,
 }
 
-const TOOL_SURFACE: [ToolSurfaceEntry; 29] = [
+const TOOL_SURFACE: &[ToolSurfaceEntry] = &[
+    ToolSurfaceEntry {
+        name: "android.get_action_status",
+        group: "workflow",
+        read_only: true,
+        description: "Recover a durable action receipt without touching the device.",
+        use_when: "Use this after a lost response, disconnect or provider restart before deciding the next action.",
+    },
+    ToolSurfaceEntry {
+        name: "android.observe",
+        group: "workflow",
+        read_only: true,
+        description: "Return a fresh image, compact UI and exact device observation identity.",
+        use_when: "Use this to inspect the device before planning or reconciling an uncertain action.",
+    },
+    ToolSurfaceEntry {
+        name: "android.step",
+        group: "workflow",
+        read_only: false,
+        description: "Execute a short action batch once and return receipts plus a fresh image.",
+        use_when: "Use a unique action ID for serial actions with stop-on-failure and no replay.",
+    },
+    ToolSurfaceEntry {
+        name: "android.install_build_from_run",
+        group: "workflow",
+        read_only: false,
+        description: "Install an exact hosted build once and return phase receipts plus a fresh image.",
+        use_when: "Use this for verified build installation with durable recovery by action ID.",
+    },
     ToolSurfaceEntry {
         name: "interactive_session.get_status",
         group: "interactive-session",
@@ -39,7 +67,7 @@ const TOOL_SURFACE: [ToolSurfaceEntry; 29] = [
         name: "interactive_session.install_build_from_run",
         group: "interactive-session",
         read_only: false,
-        description: "Download a reusable interactive build artifact from a GitHub Actions run, install it into the live session, and relaunch the app.",
+        description: "Download a reusable interactive build artifact from a GitHub Actions run, install it into the live session, and optionally relaunch the app.",
         use_when: "Use this to swap a newly built APK into an already-live hosted session instead of restarting the runner.",
     },
     ToolSurfaceEntry {
@@ -69,6 +97,13 @@ const TOOL_SURFACE: [ToolSurfaceEntry; 29] = [
         read_only: true,
         description: "List adb-visible Android devices.",
         use_when: "Use this when you need the current device serials or want to confirm device visibility.",
+    },
+    ToolSurfaceEntry {
+        name: "android.resolve_target",
+        group: "status",
+        read_only: true,
+        description: "Resolve one exact Android provider, session, and device target.",
+        use_when: "Use this before a target-bound Android operation to reject a stale or mismatched provider session.",
     },
     ToolSurfaceEntry {
         name: "android.launch_avd",
@@ -106,11 +141,53 @@ const TOOL_SURFACE: [ToolSurfaceEntry; 29] = [
         use_when: "Use this to bring an app to the foreground before semantic UI interaction.",
     },
     ToolSurfaceEntry {
+        name: "android.list_apps",
+        group: "app-control",
+        read_only: true,
+        description: "List installed Android apps, optionally limited to launcher-visible apps.",
+        use_when: "Use this when you need package names before launching, terminating, or uninstalling apps.",
+    },
+    ToolSurfaceEntry {
+        name: "android.terminate_app",
+        group: "app-control",
+        read_only: false,
+        description: "Force-stop an installed Android app by package name.",
+        use_when: "Use this to reset app state without uninstalling it.",
+    },
+    ToolSurfaceEntry {
+        name: "android.uninstall_app",
+        group: "app-control",
+        read_only: false,
+        description: "Uninstall an Android app by package name.",
+        use_when: "Use this only when the app should be removed from the device.",
+    },
+    ToolSurfaceEntry {
+        name: "android.open_url",
+        group: "app-control",
+        read_only: false,
+        description: "Open an http:// or https:// URL on the Android device.",
+        use_when: "Use this when the browser or URL intent path is the task under test.",
+    },
+    ToolSurfaceEntry {
+        name: "android.get_orientation",
+        group: "status",
+        read_only: true,
+        description: "Read the device user_rotation setting and normalized orientation class.",
+        use_when: "Use this to record orientation before choosing gestures or validation expectations.",
+    },
+    ToolSurfaceEntry {
+        name: "android.set_orientation",
+        group: "app-control",
+        read_only: false,
+        description: "Set the device user_rotation after disabling accelerometer rotation.",
+        use_when: "Use this when validation needs a known portrait or landscape posture.",
+    },
+    ToolSurfaceEntry {
         name: "android.capture_screenshot",
         group: "observation",
         read_only: false,
-        description: "Capture a PNG screenshot, save it as an artifact, and return it as MCP image content.",
-        use_when: "Use this when a model-visible visual observation is needed.",
+        description: "Capture a PNG screenshot from the device and save it locally.",
+        use_when: "Use this when a visual artifact is more important than the normalized UI tree.",
     },
     ToolSurfaceEntry {
         name: "android.dump_ui_hierarchy",
@@ -120,17 +197,24 @@ const TOOL_SURFACE: [ToolSurfaceEntry; 29] = [
         use_when: "Use this when you need raw hierarchy XML for debugging or later parsing.",
     },
     ToolSurfaceEntry {
+        name: "android.read_artifact",
+        group: "observation",
+        read_only: true,
+        description: "Read a previously generated artifact file from the configured artifact directory and return its contents for remote consumers.",
+        use_when: "Use this when a remote consumer needs the bytes or text for a screenshot, UI dump, or other artifact path that was returned earlier.",
+    },
+    ToolSurfaceEntry {
         name: "android.inspect_ui",
         group: "observation",
         read_only: false,
-        description: "Capture the current UI hierarchy and normalized tree, optionally attaching the screenshot as MCP image content.",
+        description: "Capture the current UI hierarchy, optionally pair it with a screenshot, and return a normalized UI tree.",
         use_when: "Use this for a rich one-shot observation of the current Android state.",
     },
     ToolSurfaceEntry {
         name: "android.wait_for_stable_ui",
         group: "observation",
         read_only: false,
-        description: "Wait for a stable UI and return its structured observation, optionally attaching the screenshot as MCP image content.",
+        description: "Wait until the UI hierarchy and top window state stop changing, then return a paired observation bundle.",
         use_when: "Use this before acting when the UI may still be animating or transitioning.",
     },
     ToolSurfaceEntry {
@@ -183,6 +267,20 @@ const TOOL_SURFACE: [ToolSurfaceEntry; 29] = [
         use_when: "Use this only when semantic selection is insufficient and you already know the screen coordinates.",
     },
     ToolSurfaceEntry {
+        name: "android.input.double_tap",
+        group: "raw-input",
+        read_only: false,
+        description: "Send a double-tap input event to the device as one bounded gesture.",
+        use_when: "Use this only when a genuine Android double-tap gesture is needed and semantic interaction is insufficient.",
+    },
+    ToolSurfaceEntry {
+        name: "android.input.long_press",
+        group: "raw-input",
+        read_only: false,
+        description: "Send a long-press input event to the device as one bounded gesture.",
+        use_when: "Use this only when a genuine Android long-press gesture is needed and semantic interaction is insufficient.",
+    },
+    ToolSurfaceEntry {
         name: "android.input.text",
         group: "raw-input",
         read_only: false,
@@ -197,11 +295,25 @@ const TOOL_SURFACE: [ToolSurfaceEntry; 29] = [
         use_when: "Use this only when semantic scrolling is insufficient or you need an exact gesture path.",
     },
     ToolSurfaceEntry {
+        name: "android.input.multi_touch",
+        group: "raw-input",
+        read_only: false,
+        description: "Send two to five pointer paths as one atomic emulator gRPC gesture.",
+        use_when: "Use this for pinch, two-finger pan, or another gesture that must keep every pointer in the same device frame.",
+    },
+    ToolSurfaceEntry {
         name: "android.input.keyevent",
         group: "raw-input",
         read_only: false,
         description: "Send a keyevent to the device.",
         use_when: "Use this for bounded low-level actions like Back or Enter when semantic tools are not the right fit.",
+    },
+    ToolSurfaceEntry {
+        name: "android.input.keycombination",
+        group: "raw-input",
+        read_only: false,
+        description: "Send a chorded key combination to the device.",
+        use_when: "Use this for computer-use key chords such as Ctrl+C that must be dispatched atomically.",
     },
     ToolSurfaceEntry {
         name: "solarlab.scenario.stage_first_focus_earth",
@@ -227,7 +339,7 @@ const TOOL_SURFACE: [ToolSurfaceEntry; 29] = [
 ];
 
 pub(crate) fn tool_surface_entries() -> &'static [ToolSurfaceEntry] {
-    &TOOL_SURFACE
+    TOOL_SURFACE
 }
 
 pub(crate) fn build_tool_inventory() -> Result<ToolInventory, ToolInventoryError> {

@@ -57,10 +57,12 @@ test("findUiElement throws when selector resolution is ambiguous", async () => {
   );
 });
 
-test("scrollUntilVisible throws when swipe budget is exhausted", async () => {
+test("scrollUntilVisible defaults to an upward finger swipe, preserves overrides, and rejects exhaustion", async () => {
+  const calls = [];
   const runtime = createAndroidEmulatorRuntime({
-    callMcp: async (toolName) => {
+    callMcp: async (toolName, args) => {
       if (toolName === "android.scroll_until_visible") {
+        calls.push(args);
         return {
           ok: false,
           matched: false,
@@ -72,14 +74,22 @@ test("scrollUntilVisible throws when swipe budget is exhausted", async () => {
     },
   });
 
-  await assert.rejects(
-    runtime.scrollUntilVisible({ text: "Earth" }, { maxSwipes: 2 }),
-    (error) =>
-      error instanceof Error &&
-      error.message.includes("scrollUntilVisible did not resolve a unique visible target") &&
-      error.result?.ok === false &&
-      error.result?.matched === false,
-  );
+  for (const [options, expectedDirection] of [
+    [{ maxSwipes: 2 }, "up"],
+    [{ maxSwipes: 2, direction: "down" }, "down"],
+    [{ maxSwipes: 2, direction: "up" }, "up"],
+  ]) {
+    await assert.rejects(
+      runtime.scrollUntilVisible({ text: "Earth" }, options),
+      (error) =>
+        error instanceof Error &&
+        error.message.includes("scrollUntilVisible did not resolve a unique visible target") &&
+        error.result?.ok === false &&
+        error.result?.matched === false,
+    );
+    assert.equal(calls.at(-1).direction, expectedDirection);
+    assert.equal(calls.at(-1).max_swipes, 2);
+  }
 });
 
 test("launchApp throws when postcondition is not satisfied", async () => {
@@ -137,6 +147,34 @@ test("typeIntoElement forwards timeout and stores stabilized hierarchy artifact"
   assert.equal(typeIntoCall?.args?.timeout_secs, 9);
   assert.equal(typeIntoCall?.args?.hierarchy_filename, "custom-type.xml");
   assert.equal(runtime.getState().lastUiDumpPath, "/tmp/type-stable.xml");
+});
+
+test("action helpers leave the MCP timeout default intact and preserve explicit overrides", async () => {
+  const calls = [];
+  const runtime = createAndroidEmulatorRuntime({
+    callMcp: async (toolName, args) => {
+      calls.push({ toolName, args });
+      return { ok: true };
+    },
+  });
+  const actions = [
+    ["launchApp", ["com.example.app"]],
+    ["tapElement", [{ text: "Search" }]],
+    ["typeIntoElement", [{ resource_id: "com.example:id/query" }, "earth"]],
+    ["tap", [10, 20]],
+    ["typeText", ["earth"]],
+    ["swipe", [10, 20, 30, 40]],
+    ["keyevent", ["KEYCODE_BACK"]],
+  ];
+
+  for (const [method, args] of actions) {
+    await runtime[method](...args);
+    assert.equal(Object.hasOwn(calls.at(-1).args, "timeout_secs"), false, method);
+    await runtime[method](...args, { timeoutSecs: null });
+    assert.equal(Object.hasOwn(calls.at(-1).args, "timeout_secs"), false, method);
+    await runtime[method](...args, { timeoutSecs: 9 });
+    assert.equal(calls.at(-1).args.timeout_secs, 9, method);
+  }
 });
 
 test("getToolLoadingPlan exposes eager bootstrap tools and deferred semantic tools", () => {

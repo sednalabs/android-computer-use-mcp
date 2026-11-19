@@ -15,6 +15,10 @@ use std::str::FromStr;
 
 use anyhow::{Result, anyhow};
 use clap::Parser;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+pub const ANDROID_PROVIDER_EXECUTION_CONTRACT_VERSION: &str = "android-provider-execution/v1";
 
 #[derive(Debug, Parser)]
 pub struct Cli {
@@ -75,15 +79,97 @@ pub struct Config {
     pub use_sg_kvm: bool,
     pub streamable_http: StreamableHttpConfig,
     pub interactive_session: Option<InteractiveSessionConfig>,
+    pub execution_identity: ProviderExecutionIdentity,
 }
 
-#[derive(Debug, Clone)]
+/// Stable identity for the one Android provider session served by this process.
+///
+/// Operators running more than one hosted candidate must configure distinct
+/// values. The local defaults remain a single, explicit provider tuple rather
+/// than an implicit "current device" selection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ProviderExecutionIdentity {
+    pub environment_id: String,
+    pub provider_instance_id: String,
+    /// Fresh process identity; never persisted or supplied through environment variables.
+    pub provider_epoch: String,
+    pub session_id: String,
+}
+
+/// Optional app identity supplied with an Android execution target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AndroidAppTarget {
+    pub package_name: String,
+    #[serde(default)]
+    pub activity: Option<String>,
+}
+
+/// Complete GitHub build identity requested for an Android installation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ExpectedBuildProvenance {
+    pub repository: String,
+    pub commit_sha: String,
+    pub workflow_run_id: u64,
+    pub artifact_name: String,
+    pub artifact_sha256: String,
+}
+
+/// A caller-supplied exact Android target. Omitted fields may be resolved only
+/// from this process's single configured provider session.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AndroidExecutionTarget {
+    #[serde(default)]
+    pub environment_id: Option<String>,
+    #[serde(default)]
+    pub provider_instance_id: Option<String>,
+    #[serde(default)]
+    pub provider_epoch: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub device_serial: Option<String>,
+    #[serde(default)]
+    pub app: Option<AndroidAppTarget>,
+    #[serde(default)]
+    pub expected_build: Option<ExpectedBuildProvenance>,
+}
+
+/// Provider-observed execution target returned with every resolution receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ResolvedAndroidExecutionTarget {
+    pub environment_id: String,
+    pub provider_instance_id: String,
+    #[serde(default)]
+    pub provider_epoch: String,
+    pub session_id: String,
+    pub device_serial: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app: Option<AndroidAppTarget>,
+}
+
+#[derive(Clone)]
 pub struct InteractiveSessionConfig {
     pub session_root: PathBuf,
     pub github_repository: String,
     pub github_token: Option<String>,
     pub app_package: String,
     pub app_activity: String,
+}
+
+impl std::fmt::Debug for InteractiveSessionConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InteractiveSessionConfig")
+            .field("session_root", &self.session_root)
+            .field("github_repository", &self.github_repository)
+            .field(
+                "github_token",
+                &self.github_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("app_package", &self.app_package)
+            .field("app_activity", &self.app_activity)
+            .finish()
+    }
 }
 
 impl Config {
@@ -117,6 +203,7 @@ impl Config {
         let use_sg_kvm = env_flag("ANDROID_COMPUTER_USE_MCP_USE_SG_KVM", false)?;
         let streamable_http = load_streamable_http_config()?;
         let interactive_session = load_interactive_session_config()?;
+        let execution_identity = load_execution_identity()?;
 
         ensure_file(&adb_path, "adb")?;
         ensure_file(&emulator_path, "emulator")?;
@@ -132,8 +219,32 @@ impl Config {
             use_sg_kvm,
             streamable_http,
             interactive_session,
+            execution_identity,
         })
     }
+}
+
+fn load_execution_identity() -> Result<ProviderExecutionIdentity> {
+    Ok(ProviderExecutionIdentity {
+        environment_id: env_setting("ANDROID_COMPUTER_USE_MCP_ENVIRONMENT_ID", "local")?,
+        provider_instance_id: env_setting(
+            "ANDROID_COMPUTER_USE_MCP_PROVIDER_INSTANCE_ID",
+            "android-computer-use-mcp",
+        )?,
+        provider_epoch: process_epoch().to_string(),
+        session_id: env_setting("ANDROID_COMPUTER_USE_MCP_SESSION_ID", "default")?,
+    })
+}
+
+pub(crate) fn process_epoch() -> &'static str {
+    static EPOCH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    EPOCH.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock must be after the Unix epoch")
+            .as_nanos();
+        format!("{}-{nanos}", std::process::id())
+    })
 }
 
 fn load_interactive_session_config() -> Result<Option<InteractiveSessionConfig>> {
@@ -156,6 +267,18 @@ fn load_interactive_session_config() -> Result<Option<InteractiveSessionConfig>>
     if github_repository.is_empty() || app_package.is_empty() || app_activity.is_empty() {
         return Err(anyhow!(
             "interactive session config requires repository, app package, and app activity when enabled"
+        ));
+    }
+    if !app_package.contains('.')
+        || !app_package
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._".contains(&byte))
+        || !app_activity
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._$".contains(&byte))
+    {
+        return Err(anyhow!(
+            "interactive session package and activity must be Android component identifiers"
         ));
     }
 
@@ -302,6 +425,26 @@ mod tests {
             .get_or_init(|| Mutex::new(()))
             .lock()
             .expect("env test mutex should not be poisoned")
+    }
+
+    #[test]
+    fn interactive_session_debug_redacts_credentials() {
+        let config = InteractiveSessionConfig {
+            session_root: PathBuf::from("session"),
+            github_repository: "example/android-app".to_string(),
+            github_token: Some("private-test-credential".to_string()),
+            app_package: "com.example.app".to_string(),
+            app_activity: ".MainActivity".to_string(),
+        };
+        let debug = format!("{config:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("private-test-credential"));
+    }
+
+    #[test]
+    fn provider_epoch_is_shared_within_the_running_process() {
+        assert!(!process_epoch().is_empty());
+        assert_eq!(process_epoch(), process_epoch());
     }
 
     #[test]

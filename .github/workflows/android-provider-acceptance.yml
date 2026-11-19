@@ -1,0 +1,126 @@
+name: Android provider acceptance
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/android-provider-acceptance.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "build.rs"
+      - "src/**"
+      - "spec/**"
+      - "scripts/**"
+      - "tests/android-fixture/**"
+      - "adapters/openai/mcp_streamable_http_client.js"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: android-provider-acceptance-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  real-android:
+    name: Hosted install and real Android parity
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - name: Checkout exact provider source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24.22.3"
+
+      - name: Install build tools and SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler acl
+          test -c /dev/kvm
+          sudo setfacl -m "u:$(id -un):rw" /dev/kvm
+          test -r /dev/kvm
+          test -w /dev/kvm
+          sdk_root="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=${sdk_root}" >> "${GITHUB_ENV}"
+          echo "ANDROID_SDK_ROOT=${sdk_root}" >> "${GITHUB_ENV}"
+          echo "XDG_RUNTIME_DIR=${RUNNER_TEMP}/android-runtime" >> "${GITHUB_ENV}"
+          mkdir -p "${RUNNER_TEMP}/android-runtime"
+          chmod 700 "${RUNNER_TEMP}/android-runtime"
+          set +o pipefail
+          yes | "${sdk_root}/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null
+          set -o pipefail
+          "${sdk_root}/cmdline-tools/latest/bin/sdkmanager" "emulator" "platforms;android-35" "build-tools;35.0.0"
+          test -f "${sdk_root}/emulator/lib/emulator_controller.proto"
+          "${sdk_root}/emulator/emulator" -accel-check
+          javac -version
+
+      - name: Validate acceptance scripts
+        run: |
+          bash -n scripts/build_android_acceptance_fixture.sh
+          node --check scripts/android_provider_acceptance.mjs
+          node --test scripts/android_provider_geometry.test.mjs
+
+      - name: Build provider
+        run: cargo build --locked
+
+      - name: Build the disposable Android fixture
+        id: fixture
+        env:
+          ANDROID_ACCEPTANCE_ARTIFACT_NAME: android-provider-fixture-${{ github.run_id }}-${{ github.run_attempt }}
+        run: bash scripts/build_android_acceptance_fixture.sh "${RUNNER_TEMP}/android-acceptance-build"
+
+      - name: Publish this run's exact hosted install bundle
+        id: bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ steps.fixture.outputs.artifact_name }}
+          path: ${{ steps.fixture.outputs.bundle_dir }}
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Verify installation, semantic actions, Unicode, rotation and simultaneous touch
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2
+        env:
+          ANDROID_SERIAL: emulator-5554
+          MCP_ENDPOINT: http://127.0.0.1:9526/mcp
+          ANDROID_COMPUTER_USE_MCP_ALLOWED_HOSTS: localhost,127.0.0.1,::1
+          ANDROID_COMPUTER_USE_MCP_HTTP_ALLOW_RESUME: "0"
+          ANDROID_COMPUTER_USE_MCP_EMULATOR_GRPC_PORT: "8554"
+          ANDROID_COMPUTER_USE_MCP_INTERACTIVE_SESSION_GITHUB_TOKEN: ${{ github.token }}
+          ANDROID_ACCEPTANCE_ARTIFACT_NAME: ${{ steps.fixture.outputs.artifact_name }}
+          ANDROID_ACCEPTANCE_SOURCE_SHA: ${{ steps.fixture.outputs.source_sha }}
+          ANDROID_ACCEPTANCE_ARTIFACT_SHA256: ${{ steps.bundle.outputs.artifact-digest }}
+        with:
+          api-level: 35
+          target: default
+          arch: x86_64
+          profile: pixel_7
+          emulator-boot-timeout: 1200
+          disable-animations: false
+          disable-linux-hw-accel: false
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot-save -noaudio -no-boot-anim -camera-back none -grpc 8554
+          script: node "${GITHUB_WORKSPACE}/scripts/android_provider_acceptance.mjs"
+
+      - name: Preserve bounded evidence without screen or account content
+        if: ${{ always() && !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: android-provider-acceptance-evidence
+          path: ${{ runner.temp }}/android-provider-acceptance.json
+          if-no-files-found: warn
+          retention-days: 14
