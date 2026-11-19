@@ -73,6 +73,7 @@ jobs:
         run: |
           bash -n scripts/build_android_acceptance_fixture.sh
           node --check scripts/android_provider_acceptance.mjs
+          node --test scripts/android_provider_geometry.test.mjs
 
       - name: Build provider
         run: cargo build --locked

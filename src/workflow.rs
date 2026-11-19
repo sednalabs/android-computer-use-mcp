@@ -27,6 +27,14 @@ const MAX_RECEIPT_BYTES: usize = 16 * 1024;
 const OBSERVATION_TTL: Duration = Duration::from_secs(30);
 const BATCH_TIMEOUT: Duration = Duration::from_secs(120);
 
+#[derive(Debug, PartialEq, Eq)]
+struct CoordinateContext {
+    rotation: u8,
+    width: u32,
+    height: u32,
+    window_identity: String,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ObserveArgs {
@@ -341,7 +349,7 @@ fn receipt_from_result(result: &CallToolResult) -> Result<Value, McpError> {
     ))
 }
 
-fn png_dimensions(bytes: &[u8]) -> Result<(u32, u32), McpError> {
+pub(crate) fn png_dimensions(bytes: &[u8]) -> Result<(u32, u32), McpError> {
     const MAX_DECODED_BYTES: usize = 64 * 1024 * 1024;
     if bytes.len() < 33 || bytes.len() > MAX_IMAGE_BYTES || &bytes[..8] != b"\x89PNG\r\n\x1a\n" {
         return Err(McpError::internal_error(
@@ -527,9 +535,20 @@ impl AndroidEmulatorMcp {
     async fn workflow_coordinate_context(
         &self,
         serial: &str,
-    ) -> Result<(String, String), McpError> {
+        deadline: Instant,
+    ) -> Result<CoordinateContext, McpError> {
+        let remaining = || {
+            let budget = deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_secs(3));
+            if budget.is_zero() {
+                Err(invalid("Coordinate freshness budget expired"))
+            } else {
+                Ok(budget)
+            }
+        };
         let result = timeout(
-            Duration::from_secs(3),
+            remaining()?,
             self.android_get_orientation(Parameters(SerialArgs {
                 serial: Some(serial.into()),
             })),
@@ -541,9 +560,19 @@ impl AndroidEmulatorMcp {
             .as_u64()
             .filter(|rotation| *rotation < 4)
             .ok_or_else(|| invalid("Display rotation unavailable"))?;
+        let dimension = |field: &str| {
+            receipt[field]
+                .as_u64()
+                .and_then(|value| u32::try_from(value).ok())
+                .filter(|value| *value > 0)
+                .ok_or_else(|| invalid("Logical display dimensions unavailable"))
+        };
+        let width = dimension("display_width")?;
+        let height = dimension("display_height")?;
+        let window_budget = remaining()?;
         let window = timeout(
-            Duration::from_secs(3),
-            self.window_state_internal_with_timeout(serial, Duration::from_secs(3)),
+            window_budget,
+            self.window_state_internal_with_timeout(serial, window_budget),
         )
         .await
         .map_err(|_| invalid("Window identity unavailable"))??;
@@ -555,10 +584,12 @@ impl AndroidEmulatorMcp {
         }
         let identity =
             serde_json::to_vec(&window).map_err(|_| invalid("Window identity unavailable"))?;
-        Ok((
-            rotation.to_string(),
-            format!("{:x}", Sha256::digest(identity)),
-        ))
+        Ok(CoordinateContext {
+            rotation: rotation as u8,
+            width,
+            height,
+            window_identity: format!("{:x}", Sha256::digest(identity)),
+        })
     }
 
     async fn workflow_observation(
@@ -567,7 +598,12 @@ impl AndroidEmulatorMcp {
         ui_budget: Duration,
     ) -> (Value, Option<Vec<u8>>) {
         let started = Instant::now();
+        let coordinate_deadline = started + OBSERVATION_TTL;
         let before_boot = self.workflow_boot_id(serial).await.ok();
+        let before_context = self
+            .workflow_coordinate_context(serial, coordinate_deadline)
+            .await
+            .ok();
         let mut errors = Vec::new();
         let mut observation = json!({ "serial": serial, "ui_available": false });
         let mut image = None;
@@ -618,10 +654,36 @@ impl AndroidEmulatorMcp {
                 _ => errors.push("Screenshot capture unavailable"),
             }
         }
-        let coordinate_context = if image.is_some() {
-            self.workflow_coordinate_context(serial).await.ok()
+        let after_context = if image.is_some() {
+            self.workflow_coordinate_context(serial, coordinate_deadline)
+                .await
+                .ok()
         } else {
             None
+        };
+        let dimensions = image
+            .as_ref()
+            .map(|bytes| png_dimensions(bytes).expect("validated image"));
+        let coordinate_context = match (before_context, after_context) {
+            (Some(before), Some(after)) if before != after => {
+                errors.push(
+                    "Display geometry, rotation or window changed during capture; coordinate actions are disabled",
+                );
+                None
+            }
+            (Some(_), Some(after)) if dimensions != Some((after.width, after.height)) => {
+                errors.push(
+                    "Screenshot dimensions do not match the logical display; coordinate actions are disabled",
+                );
+                None
+            }
+            (Some(_), Some(after)) => Some(after),
+            _ => {
+                errors.push(
+                    "Display geometry or window identity unavailable; coordinate actions are disabled",
+                );
+                None
+            }
         };
         let after_boot = self.workflow_boot_id(serial).await.ok();
         let stable_boot = before_boot.filter(|before| Some(before) == after_boot.as_ref());
@@ -651,9 +713,6 @@ impl AndroidEmulatorMcp {
         if stable_boot.is_none() {
             errors.push("Stable device boot identity unavailable; coordinate actions are disabled");
         }
-        if coordinate_context.is_none() {
-            errors.push("Display or window identity unavailable; coordinate actions are disabled");
-        }
         if !frame_fresh {
             errors.push("Observation exceeded coordinate freshness budget; observe again");
         }
@@ -662,17 +721,15 @@ impl AndroidEmulatorMcp {
         observation["notes"] = json!(errors);
         if let Some(bytes) = &image {
             let digest = format!("{:x}", Sha256::digest(bytes));
-            let (width, height) = png_dimensions(bytes).expect("validated image");
+            let (width, height) = dimensions.expect("validated image dimensions");
             observation["screenshot_sha256"] = json!(digest);
             observation["width"] = json!(width);
             observation["height"] = json!(height);
-            if let (Some(boot_id), Some((orientation, window_identity))) =
-                (stable_boot, coordinate_context)
+            if let (Some(boot_id), Some(context)) = (stable_boot, coordinate_context)
                 && frame_fresh
             {
-                observation["rotation_quarter_turns"] =
-                    json!(orientation.parse::<u8>().expect("validated rotation"));
-                observation["window_identity"] = json!(window_identity);
+                observation["rotation_quarter_turns"] = json!(context.rotation);
+                observation["window_identity"] = json!(context.window_identity);
                 let mut observations = self.workflow.observations.lock().await;
                 observations.retain(|_, record| record.captured.elapsed() <= OBSERVATION_TTL);
                 observations.insert(
@@ -684,8 +741,8 @@ impl AndroidEmulatorMcp {
                         boot_id,
                         width,
                         height,
-                        orientation,
-                        window_identity,
+                        orientation: context.rotation.to_string(),
+                        window_identity: context.window_identity,
                     },
                 );
             } else {
@@ -773,8 +830,20 @@ impl AndroidEmulatorMcp {
         if current_boot != boot_id {
             return Err(invalid("Device restarted after observation; observe again"));
         }
+        let deadline = captured + OBSERVATION_TTL;
+        let before_context = self.workflow_coordinate_context(serial, deadline).await?;
+        if (before_context.width, before_context.height) != (expected_width, expected_height)
+            || before_context.rotation.to_string() != expected_orientation
+            || before_context.window_identity != expected_window
+        {
+            return Err(invalid(
+                "Display geometry, orientation or window changed; observe again before using coordinates",
+            ));
+        }
         let result = timeout(
-            Duration::from_secs(10),
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_secs(10)),
             self.android_capture_screenshot(Parameters(ScreenshotArgs {
                 serial: Some(serial.into()),
                 filename: None,
@@ -792,13 +861,12 @@ impl AndroidEmulatorMcp {
             return Err(invalid("Device changed during coordinate validation"));
         }
         let (width, height) = png_dimensions(&bytes)?;
-        let (orientation, window_identity) = self.workflow_coordinate_context(serial).await?;
-        if (width, height) != (expected_width, expected_height)
-            || orientation != expected_orientation
-            || window_identity != expected_window
+        let after_context = self.workflow_coordinate_context(serial, deadline).await?;
+        if before_context != after_context
+            || (width, height) != (after_context.width, after_context.height)
         {
             return Err(invalid(
-                "Display geometry, orientation or window changed; observe again before using coordinates",
+                "Screenshot and logical display geometry, orientation or window changed during capture; observe again before using coordinates",
             ));
         }
         if captured.elapsed() > OBSERVATION_TTL {
@@ -1407,7 +1475,18 @@ shift 2
 command=$(printf '%s' "$*" | tr -d "'")
 case "$command" in
   'shell cat /proc/sys/kernel/random/boot_id') cat "$fixture/boot-id" ;;
-  'exec-out screencap -p') [ ! -f "$fixture/fail-screenshot" ] || exit 1; cat "$fixture/screen.png" ;;
+  'exec-out screencap -p')
+    [ ! -f "$fixture/fail-screenshot" ] || exit 1
+    cat "$fixture/screen.png"
+    if [ -f "$fixture/rotate-during-screenshot" ]; then
+      printf '2' > "$fixture/rotation"
+      rm "$fixture/rotate-during-screenshot"
+    fi
+    if [ -f "$fixture/change-window-during-screenshot" ]; then
+      : > "$fixture/changed-window"
+      rm "$fixture/change-window-during-screenshot"
+    fi
+    ;;
   'exec-out uiautomator dump /dev/tty') cat "$fixture/ui.xml" ;;
   'shell input keyevent '*|'shell input tap '*)
     printf '%s\n' "$command" >> "$fixture/events"
@@ -1425,7 +1504,10 @@ case "$command" in
     if [ -f "$fixture/rotation" ]; then rotation=$(cat "$fixture/rotation"); fi
     printf 'Viewport INTERNAL displayId=0, orientation=%s, valid=true\n' "$rotation"
     ;;
-  'shell wm size') printf 'Physical size: 1x1\n' ;;
+  'shell wm size')
+    if [ -f "$fixture/display-size" ]; then cat "$fixture/display-size"
+    else printf 'Physical size: 1x1\n'; fi
+    ;;
   'shell dumpsys window windows'|'shell dumpsys window')
     if [ -f "$fixture/changed-window" ]; then printf 'mCurrentFocus=Window{b u0 other/.Main}\n'
     else printf 'mCurrentFocus=Window{a u0 fixture/.Main}\n'; fi
@@ -1692,8 +1774,86 @@ esac
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn inconsistent_capture_geometry_preserves_image_but_invalidates_coordinates() {
+        for (kind, note) in [
+            (
+                "dimensions",
+                "Screenshot dimensions do not match the logical display",
+            ),
+            ("rotation", "changed during capture"),
+            ("window", "changed during capture"),
+        ] {
+            let fixture = Fixture::new();
+            let server = fixture.server("epoch-a");
+            let old_args = observed_tap(&server, kind).await;
+            match kind {
+                "dimensions" => {
+                    std::fs::write(fixture.root.join("display-size"), "Physical size: 2x1\n")
+                        .unwrap();
+                }
+                "rotation" => fixture.marker("rotate-during-screenshot"),
+                "window" => fixture.marker("change-window-during-screenshot"),
+                _ => unreachable!(),
+            }
+            let result = server
+                .android_observe(Parameters(ObserveArgs {
+                    serial: Some("workflow-device".into()),
+                    target: None,
+                    timeout_secs: None,
+                }))
+                .await
+                .unwrap();
+            let receipt = receipt_from_result(&result).unwrap();
+            let observation = &receipt["observation"];
+            assert_eq!(receipt["ok"], true, "{kind}: {receipt}");
+            assert_eq!(
+                png_dimensions(&image_from_result(&result).unwrap()).unwrap(),
+                (1, 1)
+            );
+            assert_eq!(
+                observation["coordinate_actions_available"], false,
+                "{kind}: {receipt}"
+            );
+            assert_eq!(observation["degraded"], true, "{kind}: {receipt}");
+            assert!(
+                observation["notes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|value| value.as_str().is_some_and(|value| value.contains(note))),
+                "{kind}: {receipt}"
+            );
+            assert!(
+                !server
+                    .workflow
+                    .observations
+                    .lock()
+                    .await
+                    .contains_key("workflow-device"),
+                "{kind} retained an inconsistent coordinate observation"
+            );
+            let result = server.android_step(Parameters(old_args)).await.unwrap();
+            assert_eq!(
+                receipt_from_result(&result).unwrap()["outcome"],
+                "rejected",
+                "{kind}"
+            );
+            assert!(fixture.events().is_empty(), "{kind} dispatched input");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn strict_pixels_or_changed_geometry_rotation_and_window_refuse_coordinates() {
-        for kind in ["strict", "geometry", "rotation", "window"] {
+        for kind in [
+            "strict",
+            "geometry",
+            "logical_geometry",
+            "rotation",
+            "rotation_during_capture",
+            "window",
+            "window_during_capture",
+        ] {
             let fixture = Fixture::new();
             let server = fixture.server("epoch-a");
             let mut args = observed_tap(&server, kind).await;
@@ -1703,8 +1863,14 @@ esac
                     fixture.screen(1, 1, [255, 0, 0]);
                 }
                 "geometry" => fixture.screen(2, 1, [0, 0, 0]),
+                "logical_geometry" => {
+                    std::fs::write(fixture.root.join("display-size"), "Physical size: 2x1\n")
+                        .unwrap();
+                }
                 "rotation" => std::fs::write(fixture.root.join("rotation"), "2").unwrap(),
+                "rotation_during_capture" => fixture.marker("rotate-during-screenshot"),
                 "window" => fixture.marker("changed-window"),
+                "window_during_capture" => fixture.marker("change-window-during-screenshot"),
                 _ => unreachable!(),
             }
             let result = server.android_step(Parameters(args)).await.unwrap();

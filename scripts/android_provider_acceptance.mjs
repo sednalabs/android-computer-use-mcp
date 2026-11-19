@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import { createMcpStreamableHttpClient } from "../adapters/openai/mcp_streamable_http_client.js";
 import { assertTypedPng } from "./codex_journey_assertions.mjs";
+import { summarizeDisplayGeometry, summarizeInputGeometry, summarizeWmSize } from "./android_provider_geometry.mjs";
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const required = (name) => {
@@ -47,6 +48,7 @@ await mkdir(artifacts, { mode: 0o700 });
 await mkdir(hostedSession, { mode: 0o700 });
 const log = await open(path.join(work, "server.log"), "wx", 0o600);
 const checks = [];
+const geometryEvidence = [];
 let currentGate = "start";
 let server;
 let client;
@@ -72,7 +74,7 @@ const fixtureLabels = new Set([
   "Android MCP Acceptance isn't responding", "Wait", "Close app",
 ]);
 const staticFixtureLabel = (label) => typeof label === "string" &&
-  (fixtureLabels.has(label) || /^(?:Count: \d{1,3}|Max pointers: [0-5]|Scroll row \d{1,2})$/.test(label))
+  (fixtureLabels.has(label) || /^(?:Count: \d{1,3}|Max pointers: [0-5]|Completed two-pointer gestures: \d{1,3}|Scroll row \d{1,2})$/.test(label))
   ? label : undefined;
 function deviceState() {
   const capture = (args) => {
@@ -82,6 +84,19 @@ function deviceState() {
     return { available: true, fields: [...result.stdout.toString("utf8").matchAll(pattern)].slice(0, 40).map((match) => ({ name: match[1], value: match[2] })) };
   };
   return { power: capture(["power"]), window_policy: capture(["window", "policy"]) };
+}
+function recordDeviceGeometry(phase) {
+  const capture = (args, summarize) => {
+    const result = spawnSync(adb, ["-s", serial, "shell", ...args], { timeout: 5000, maxBuffer: 1024 * 1024 });
+    if (result.error || result.status !== 0) return { available: false };
+    return { available: true, ...summarize(result.stdout.toString("utf8")) };
+  };
+  geometryEvidence.push({
+    phase,
+    wm_size: capture(["wm", "size"], summarizeWmSize),
+    input: capture(["dumpsys", "input"], summarizeInputGeometry),
+    display: capture(["dumpsys", "display"], summarizeDisplayGeometry),
+  });
 }
 async function hierarchyEvidence(value) {
   const candidates = [
@@ -106,6 +121,7 @@ async function hierarchyEvidence(value) {
         return {
           package_name: attrs.package?.slice(0, 160), class_name: attrs.class?.slice(0, 160),
           resource_id: attrs["resource-id"]?.slice(0, 200), label: staticFixtureLabel(attrs.text),
+          content_description: staticFixtureLabel(attrs["content-desc"]),
           text_length: attrs.text?.length, bounds: attrs.bounds?.slice(0, 80),
           enabled: attrs.enabled, clickable: attrs.clickable, focused: attrs.focused,
         };
@@ -177,6 +193,15 @@ async function call(name, args, { ok = true, image = false } = {}) {
   const result = await client.callTool(name, args);
   const value = receipt(result);
   const check = { tool: name, action_id: args.action_id, ok: value.ok, expected_ok: ok, elapsed_ms: Date.now() - begin };
+  if (image && value.observation) {
+    const observation = value.observation;
+    check.observation = {
+      screenshot_backend: observation.artifacts?.screenshot_backend || observation.screenshot_receipt?.backend_used,
+      width: observation.width, height: observation.height,
+      rotation_quarter_turns: observation.rotation_quarter_turns,
+      coordinate_actions_available: observation.coordinate_actions_available,
+    };
+  }
   const recoveredDialogs = [value.postcondition, ...(value.actions || []).map((row) =>
     row.receipt?.postcondition || row.error?.data?.postcondition,
   )].flatMap(handledDialogs).slice(0, 16);
@@ -194,7 +219,11 @@ async function call(name, args, { ok = true, image = false } = {}) {
   }
   if (image) assert.equal(Boolean(result.isError), !ok, `${name} MCP error flag must match the receipt.`);
   const imageReceipt = image ? imageEvidence(result) : undefined;
-  if (imageReceipt) check.image = imageReceipt;
+  if (imageReceipt) {
+    check.image = imageReceipt;
+    assert.equal(imageReceipt.width, value.observation.width, "Receipt width must match decoded PNG pixels.");
+    assert.equal(imageReceipt.height, value.observation.height, "Receipt height must match decoded PNG pixels.");
+  }
   return value;
 }
 async function step(name, actions, extra = {}) {
@@ -210,6 +239,39 @@ async function step(name, actions, extra = {}) {
 const action = (tool, args) => ({ tool, arguments: args });
 async function waitFor(selector) {
   return call("android.wait_for_ui_element", { serial, selector, timeout_secs: 15 });
+}
+async function verifyTwoPointerGesture(orientation, completedGestures) {
+  await waitFor({ ...id("pointer_count"), ...text(`Completed two-pointer gestures: ${completedGestures - 1}`) });
+  const pad = (await call("android.find_ui_element", { serial, selector: id("touch_pad") })).node.bounds;
+  const observed = await call("android.observe", { serial }, { image: true });
+  currentGate = `${orientation}_multi_touch_geometry`;
+  assert.equal(observed.observation.coordinate_actions_available, true);
+  assert.equal(observed.observation.width > observed.observation.height, orientation === "landscape");
+  assert.ok(pad.left >= 0 && pad.top >= 0 && pad.right > pad.left && pad.bottom > pad.top &&
+    pad.right <= observed.observation.width && pad.bottom <= observed.observation.height,
+  "The complete native touch pad must fit the observed image.");
+  const x = (fraction) => Math.round(pad.left + (pad.right - pad.left) * fraction);
+  const y = (fraction) => Math.round(pad.top + (pad.bottom - pad.top) * fraction);
+  const pointers = [
+    { x1: x(0.3), y1: y(0.35), x2: x(0.2), y2: y(0.35) },
+    { x1: x(0.7), y1: y(0.65), x2: x(0.8), y2: y(0.65) },
+  ];
+  const touched = await step(`${orientation}-simultaneous-touch`, [action("android.input.multi_touch", {
+    pointers, duration_ms: 300,
+  })], { observation_id: observed.observation_id });
+  assert.match(JSON.stringify(touched.actions), /emulator_grpc/);
+  await waitFor({ ...id("pointer_count"), ...text("Max pointers: 2") });
+  // The fixture increments only after ACTION_UP with both pointers in their
+  // separate expected pad regions. A prior orientation's success cannot satisfy this.
+  await waitFor({ ...id("pointer_count"), ...text(`Completed two-pointer gestures: ${completedGestures}`) });
+  checks.push({
+    gate: `${orientation}_simultaneous_motion_event_pointers`, orientation, ok: true,
+    maximum_pointer_count: 2, completed_two_pointer_gestures: completedGestures,
+    target_regions_verified: true, target_bounds: pad, pointers,
+    image_width: observed.observation.width, image_height: observed.observation.height,
+    rotation_quarter_turns: observed.observation.rotation_quarter_turns,
+    backend: touched.actions[0].receipt.backend_used,
+  });
 }
 
 try {
@@ -344,27 +406,37 @@ try {
   await step("scroll-to-end", [action("android.scroll_until_visible", { selector: id("back_to_controls"), direction: "up", max_swipes: 8 })]);
   await waitFor(text("Scroll destination reached"));
   await step("scroll-back", [action("android.tap_element", { selector: id("back_to_controls"), wait_for_selector: id("increment") })]);
+  recordDeviceGeometry("before_landscape");
   await step("landscape", [action("android.set_orientation", { orientation: "landscape", timeout_secs: 20 })]);
+  recordDeviceGeometry("landscape");
   assert.equal((await call("android.get_orientation", { serial })).orientation, "landscape");
+  const landscapeTarget = (await call("android.find_ui_element", { serial, selector: id("increment") })).node.bounds;
   const landscape = await call("android.observe", { serial }, { image: true });
+  currentGate = "landscape_native_pixel_geometry";
   assert.ok(landscape.observation.width > landscape.observation.height);
+  assert.equal(landscape.observation.coordinate_actions_available, true);
+  assert.ok(landscapeTarget.left >= 0 && landscapeTarget.top >= 0 &&
+    landscapeTarget.right > landscapeTarget.left && landscapeTarget.bottom > landscapeTarget.top &&
+    landscapeTarget.right <= landscape.observation.width && landscapeTarget.bottom <= landscape.observation.height,
+  "Native landscape target bounds must fit the observed image.");
+  const landscapeTap = await step("landscape-increment-2", [action("android.input.tap", {
+    x: Math.floor((landscapeTarget.left + landscapeTarget.right) / 2),
+    y: Math.floor((landscapeTarget.top + landscapeTarget.bottom) / 2),
+    tapped_selector: id("increment"), wait_for_selector: text("Count: 2"),
+  })], { observation_id: landscape.observation_id });
+  await waitFor(text("Count: 2"));
+  checks.push({
+    gate: "landscape_native_coordinate_tap", ok: true, expected_counter: 2,
+    image_width: landscape.observation.width, image_height: landscape.observation.height,
+    rotation_quarter_turns: landscape.observation.rotation_quarter_turns,
+    target_bounds: landscapeTarget, backend: landscapeTap.actions[0].receipt.backend_used,
+  });
+  await verifyTwoPointerGesture("landscape", 1);
   await step("portrait", [action("android.set_orientation", { orientation: "portrait", timeout_secs: 20 })]);
+  recordDeviceGeometry("portrait");
   assert.equal((await call("android.get_orientation", { serial })).orientation, "portrait");
-  const pad = (await call("android.find_ui_element", { serial, selector: id("touch_pad") })).node.bounds;
-  const observed = await call("android.observe", { serial }, { image: true });
-  assert.equal(observed.observation.coordinate_actions_available, true);
-  const x = (fraction) => Math.round(pad.left + (pad.right - pad.left) * fraction);
-  const y = Math.round((pad.top + pad.bottom) / 2);
-  const touched = await step("simultaneous-touch", [action("android.input.multi_touch", {
-    pointers: [
-      { x1: x(0.3), y1: y, x2: x(0.2), y2: y },
-      { x1: x(0.7), y1: y, x2: x(0.8), y2: y },
-    ], duration_ms: 300,
-  })], { observation_id: observed.observation_id });
-  assert.match(JSON.stringify(touched.actions), /emulator_grpc/);
-  await waitFor(text("Max pointers: 2"));
-  checks.push({ gate: "simultaneous_motion_event_pointers", maximum_pointer_count: 2, ok: true });
-  for (let count = 2; count <= 11; count++) {
+  await verifyTwoPointerGesture("portrait", 2);
+  for (let count = 3; count <= 12; count++) {
     await step(`increment-${count}`, [action("android.tap_element", {
       selector: id("increment"), wait_for_selector: text(`Count: ${count}`),
     })]);
@@ -392,19 +464,25 @@ try {
     device_serial: serial, android_build_fingerprint: adbText(["shell", "getprop", "ro.build.fingerprint"]),
     emulator_version: spawnSync(path.join(sdk, "emulator/emulator"), ["-version"], { encoding: "utf8", timeout: 10000 }).stdout.split("\n")[0],
     hosted_build_install_tested: true, actual_simultaneous_touch_tested: true,
+    simultaneous_touch_orientations: ["landscape", "portrait"],
     clipboard_restoration_tested: true,
+    landscape_coordinate_input_tested: true,
     live_model_judgement: false, multi_device_isolation_tested: false,
-    install: installEvidence, checks,
+    install: installEvidence, device_geometry: geometryEvidence, checks,
   };
   await writeFile(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`, { mode: 0o600 });
   console.log(`Real Android provider acceptance passed (${checks.length} recorded checks).`);
 } catch (error) {
+  recordDeviceGeometry("failure");
   await writeFile(evidencePath, `${JSON.stringify({
     schema_version: 1, status: "failed", failed_gate: currentGate,
     provider_source_sha: sourceSha, elapsed_ms: Date.now() - started,
     hosted_build_install_tested: Boolean(installEvidence),
     clipboard_restoration_tested: checks.some((check) => check.gate === "clipboard_restored_after_unicode" && check.ok),
+    landscape_coordinate_input_tested: checks.some((check) => check.gate === "landscape_native_coordinate_tap" && check.ok),
+    simultaneous_touch_orientations: checks.filter((check) => check.target_regions_verified && check.ok).map((check) => check.orientation),
     device_readiness: deviceReadiness,
+    device_geometry: geometryEvidence,
     install: installEvidence,
     live_model_judgement: false, checks,
   }, null, 2)}\n`, { mode: 0o600 });

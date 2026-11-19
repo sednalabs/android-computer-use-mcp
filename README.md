@@ -153,19 +153,32 @@ and adapter guidance.
 
 ## Backend Notes
 
-ADB is the stable baseline backend. The server can opportunistically use the
-Android emulator gRPC endpoint for screenshot and raw input operations when a
-usable endpoint is discovered or configured:
+Screenshots and ordinary pointer gestures use exact-device ADB commands.
+Taps, double taps, long presses and swipes use Android's logical display pixels,
+the same coordinate space as UI hierarchy bounds and the captured PNG.
+`android.observe` enables coordinate actions only when the PNG dimensions agree
+with stable display geometry, rotation and window identity around capture.
+An unstable observation can still return its image, with coordinate actions
+disabled and an explicit degradation note.
 
-- if a running emulator publishes `grpc.port`, the MCP can prefer that endpoint
+Emulator gRPC remains available for verified clipboard transfers and atomic
+multi-touch:
+
+- a running emulator must publish an endpoint bound to the requested serial
 - if a `grpc.token` is published, the MCP attaches the required bearer token
 - if `ANDROID_COMPUTER_USE_MCP_EMULATOR_GRPC_PORT` is set, launched emulators include
-  `-grpc <port>`
-- mutating calls use ADB only before gRPC dispatch, never to replay an uncertain action
-- atomic multi-touch requires a serial-bound gRPC backend and has no sequential ADB substitute
+  `-grpc <port>`; a global port setting alone cannot establish device identity
+- atomic multi-touch requires qualified full-panel display and touch geometry
+  before converting logical coordinates to emulator touch axes; unsupported
+  geometry is rejected before input, with no sequential ADB substitute
+- an uncertain mutation is never automatically replayed through another backend
 
-This keeps the tool contract stable while allowing lower-latency local emulator
-control where it is available.
+Qualify multi-touch with the provider gate's stock Android API 35 emulator
+configuration. Its checks of reported calibration do not establish support for
+arbitrary custom calibration.
+
+See [Production validation](docs/production-validation.md) for geometry checks,
+clipboard ownership and the real-device evidence required for a release.
 
 ## Adapter Packages
 

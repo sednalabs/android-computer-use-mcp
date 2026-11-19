@@ -816,10 +816,15 @@ impl AndroidEmulatorMcp {
             "avdmanager_path": self.config.avdmanager_path,
             "artifact_dir": self.config.artifact_dir,
             "emulator_grpc_port": self.config.emulator_grpc_port,
-            "io_backend_preference": if self.config.emulator_grpc_port.is_some() || discovery::any_grpc_endpoint_published() {
-                "serial-bound-grpc-or-adb-no-mutation-replay"
-            } else {
-                "adb"
+            "io_backend_preference": "adb",
+            "io_backends": {
+                "screenshots": "adb-logical-display",
+                "ordinary_pointer_input": "adb-logical-display",
+                "printable_ascii_text": "adb",
+                "unicode_text": "verified-emulator-clipboard-with-adb-paste",
+                "multi_touch": "serial-bound-emulator-grpc-with-verified-geometry",
+                "grpc_endpoint_published": self.config.emulator_grpc_port.is_some()
+                    || discovery::any_grpc_endpoint_published(),
             },
             "use_sg_kvm": self.config.use_sg_kvm,
             "avds": avds,
@@ -1330,11 +1335,14 @@ impl AndroidEmulatorMcp {
             )
             .await?;
         let natural_size = self.natural_display_size_internal(&serial).await?;
+        let (display_width, display_height) = rotated_display_size(natural_size, raw_rotation);
         Ok(structured_receipt(json!({
             "ok": true,
             "serial": serial,
             "raw_rotation": raw_rotation,
             "orientation": orientation_for_display_rotation(raw_rotation, natural_size),
+            "display_width": display_width,
+            "display_height": display_height,
             "evidence_source": "dumpsys_input_default_display",
         })))
     }
@@ -1716,7 +1724,12 @@ impl AndroidEmulatorMcp {
                 .await?;
             let nodes = parse_ui_nodes_from_path(&hierarchy_path)?;
             match self
-                .check_system_dialog(&serial, &hierarchy_path, &nodes)
+                .check_system_dialog(
+                    &serial,
+                    &hierarchy_path,
+                    &nodes,
+                    Some(started + timeout.min(Duration::from_secs(300))),
+                )
                 .await?
             {
                 SystemDialogCheck::Handled(report) => {
@@ -1889,7 +1902,7 @@ impl AndroidEmulatorMcp {
                 .await?;
             let nodes = parse_ui_nodes_from_path(&hierarchy_path)?;
             match self
-                .check_system_dialog(&serial, &hierarchy_path, &nodes)
+                .check_system_dialog(&serial, &hierarchy_path, &nodes, Some(deadline))
                 .await?
             {
                 SystemDialogCheck::Handled(report) => {
@@ -1904,8 +1917,8 @@ impl AndroidEmulatorMcp {
                             "ambiguous": false,
                             "selected_match_index": 0,
                             "allow_verification_failure": args.allow_verification_failure,
-                            "backend_used": "grpc-system-dialog-auto-handle",
-                            "attempted_backends": ["grpc-system-dialog-auto-handle"],
+                            "backend_used": "adb",
+                            "attempted_backends": ["adb"],
                             "attempts": [],
                             "artifacts": {
                                 "hierarchy_path": hierarchy_path.display().to_string(),
@@ -1951,7 +1964,9 @@ impl AndroidEmulatorMcp {
         })?;
         let node = Some(selection.node.clone());
         let center = actionable_center(&node, &selector, "tap")?;
-        let dispatch = self.tap_point_internal(&serial, center.0, center.1).await?;
+        let dispatch = self
+            .tap_point_internal(&serial, center.0, center.1, deadline)
+            .await?;
         let attempted_backends = vec![dispatch.backend];
         let verification = self
             .verify_tap_outcome(TapVerificationRequest {
@@ -2046,7 +2061,7 @@ impl AndroidEmulatorMcp {
                 .await?;
             let nodes = parse_ui_nodes_from_path(&hierarchy_path)?;
             match self
-                .check_system_dialog(&serial, &hierarchy_path, &nodes)
+                .check_system_dialog(&serial, &hierarchy_path, &nodes, Some(deadline))
                 .await?
             {
                 SystemDialogCheck::Handled(report) => {
@@ -2113,7 +2128,9 @@ impl AndroidEmulatorMcp {
             }
         } else {
             let center = actionable_center(&node, &selector, "type into")?;
-            tap_dispatch = self.tap_point_internal(&serial, center.0, center.1).await?;
+            tap_dispatch = self
+                .tap_point_internal(&serial, center.0, center.1, deadline)
+                .await?;
             self.verify_tap_outcome(TapVerificationRequest {
                 serial: &serial,
                 tapped_selector: &selector,
@@ -2307,7 +2324,7 @@ impl AndroidEmulatorMcp {
                 .await?;
             let nodes = parse_ui_nodes_from_path(&hierarchy_path)?;
             match self
-                .check_system_dialog(&serial, &hierarchy_path, &nodes)
+                .check_system_dialog(&serial, &hierarchy_path, &nodes, None)
                 .await?
             {
                 SystemDialogCheck::Handled(report) => {
@@ -2390,11 +2407,10 @@ impl AndroidEmulatorMcp {
                 let dispatch = self
                     .swipe_points_internal(
                         &serial,
-                        swipe_points.0,
-                        swipe_points.1,
-                        swipe_points.2,
-                        swipe_points.3,
+                        (swipe_points.0, swipe_points.1),
+                        (swipe_points.2, swipe_points.3),
                         DEFAULT_SWIPE_DURATION_MS,
+                        tool_deadline(None, DEFAULT_ADB_COMMAND_TIMEOUT_SECS),
                     )
                     .await?;
                 swipe_backend = Some(dispatch.backend);
@@ -2492,7 +2508,9 @@ impl AndroidEmulatorMcp {
         } else {
             None
         };
-        let dispatch = self.tap_point_internal(&serial, args.x, args.y).await?;
+        let dispatch = self
+            .tap_point_internal(&serial, args.x, args.y, deadline)
+            .await?;
         let verification = if let Some(tapped_selector) = tapped_selector.as_ref() {
             Some(
                 self.verify_tap_outcome(TapVerificationRequest {
@@ -2589,7 +2607,7 @@ impl AndroidEmulatorMcp {
             .await?;
         let deadline = tool_deadline(args.timeout_secs, DEFAULT_ACTION_TIMEOUT_SECS);
         let dispatch = self
-            .double_tap_point_internal(&serial, args.x, args.y)
+            .double_tap_point_internal(&serial, args.x, args.y, deadline)
             .await?;
         let postcondition = self
             .wait_for_tool_postcondition(ToolPostconditionRequest {
@@ -2639,7 +2657,7 @@ impl AndroidEmulatorMcp {
         let duration_ms = args.duration_ms.unwrap_or(500);
         let deadline = tool_deadline(args.timeout_secs, DEFAULT_ACTION_TIMEOUT_SECS);
         let dispatch = self
-            .long_press_point_internal(&serial, args.x, args.y, duration_ms)
+            .long_press_point_internal(&serial, args.x, args.y, duration_ms, deadline)
             .await?;
         let postcondition = self
             .wait_for_tool_postcondition(ToolPostconditionRequest {
@@ -2855,7 +2873,13 @@ impl AndroidEmulatorMcp {
             None
         };
         let dispatch = self
-            .swipe_points_internal(&serial, args.x1, args.y1, args.x2, args.y2, duration)
+            .swipe_points_internal(
+                &serial,
+                (args.x1, args.y1),
+                (args.x2, args.y2),
+                duration,
+                deadline,
+            )
             .await?;
         let selector_postcondition = self
             .wait_for_tool_postcondition(ToolPostconditionRequest {
@@ -2932,11 +2956,16 @@ impl AndroidEmulatorMcp {
             .resolve_serial_for_tools(args.serial.as_deref())
             .await?;
         let duration_ms = args.duration_ms.unwrap_or(DEFAULT_MULTI_TOUCH_DURATION_MS);
-        let display_size = self.display_size_internal(&serial).await?;
-        validate_multi_touch_request(&args.pointers, duration_ms, display_size)?;
         let deadline = tool_deadline(args.timeout_secs, DEFAULT_ACTION_TIMEOUT_SECS);
+        let display_size = timeout(
+            require_remaining_budget(deadline, "multi-touch display preflight")?,
+            self.display_size_internal(&serial),
+        )
+        .await
+        .map_err(|_| multi_touch_capability_error("display geometry preflight timed out"))??;
+        validate_multi_touch_request(&args.pointers, duration_ms, display_size)?;
         let dispatch = self
-            .multi_touch_internal(&serial, &args.pointers, duration_ms, deadline)
+            .multi_touch_internal(&serial, &args.pointers, duration_ms, display_size, deadline)
             .await?;
 
         Ok(structured_receipt(json!({
@@ -2952,7 +2981,9 @@ impl AndroidEmulatorMcp {
             "capability": {
                 "name": "multi_touch",
                 "status": "supported",
-                "transport": "emulator_grpc"
+                "transport": "emulator_grpc",
+                "coordinate_space": "android_logical_display",
+                "geometry_guard": "full_panel_reported_identity_calibration"
             }
         })))
     }
@@ -3945,40 +3976,71 @@ impl AndroidEmulatorMcp {
         })
     }
 
+    async fn run_adb_pointer_with_deadline<I, S>(
+        &self,
+        serial: &str,
+        args: I,
+        deadline: Instant,
+        gesture_duration: Duration,
+        operation: &str,
+    ) -> Result<CommandOutput, McpError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let budget =
+            remaining_until(deadline).min(Duration::from_secs(DEFAULT_ADB_COMMAND_TIMEOUT_SECS));
+        if budget.is_zero() || budget < gesture_duration {
+            return Err(McpError::invalid_params(
+                format!(
+                    "android.input.{operation} has insufficient time remaining before dispatch"
+                ),
+                Some(json!({
+                    // A parent semantic action may already have handled a dialog
+                    // or completed an earlier gesture. Only this dispatch is known
+                    // not to have started; the whole action must not be replayed.
+                    "outcome": "rejected", "retry_safe": false, "do_not_replay": true,
+                    "next_mutation_dispatched": false,
+                })),
+            ));
+        }
+        self.run_adb_shell_with_timeout(serial, args, budget)
+            .await
+            .map_err(|error| {
+                if error
+                    .data
+                    .as_ref()
+                    .is_some_and(|data| data["outcome"] == "cancelled")
+                {
+                    error
+                } else {
+                    uncertain_mutation_error(operation, "adb", &error.to_string())
+                }
+            })
+    }
+
     async fn tap_point_internal(
         &self,
         serial: &str,
         x: u32,
         y: u32,
+        deadline: Instant,
     ) -> Result<ActionDispatch, McpError> {
-        let mut preflight_failure = None;
-        if let Some(endpoint) = self.grpc_endpoint_for_serial(serial) {
-            match grpc_backend::send_tap(endpoint.port, endpoint.auth_token.as_deref(), x, y).await
-            {
-                Ok(()) => {
-                    return Ok(ActionDispatch {
-                        backend: "grpc",
-                        output: CommandOutput::default(),
-                        detail: None,
-                    });
-                }
-                Err(grpc_backend::GrpcMutationError::BeforeDispatch(detail)) => {
-                    preflight_failure = Some(detail)
-                }
-                Err(grpc_backend::GrpcMutationError::CancelledBeforeDispatch) => {
-                    return Err(cancelled_mutation_error());
-                }
-                Err(err) => return Err(uncertain_mutation_error("tap", &err.to_string())),
-            }
-        }
-
+        // Android input uses the same logical display coordinates as hierarchy
+        // bounds and screencap, including guest rotation and display overrides.
         let output = self
-            .run_adb_shell(serial, ["input", "tap", &x.to_string(), &y.to_string()])
+            .run_adb_pointer_with_deadline(
+                serial,
+                ["input", "tap", &x.to_string(), &y.to_string()],
+                deadline,
+                Duration::ZERO,
+                "tap",
+            )
             .await?;
         Ok(ActionDispatch {
             backend: "adb",
             output,
-            detail: preflight_failure.map(|detail| format!("selected ADB before any gRPC mutation after read-only preflight failure: {detail}")),
+            detail: Some("selected ADB input in guest logical coordinates".to_string()),
         })
     }
 
@@ -3987,43 +4049,27 @@ impl AndroidEmulatorMcp {
         serial: &str,
         x: u32,
         y: u32,
+        deadline: Instant,
     ) -> Result<ActionDispatch, McpError> {
-        let mut preflight_failure = None;
-        if let Some(endpoint) = self.grpc_endpoint_for_serial(serial) {
-            match grpc_backend::send_double_tap(endpoint.port, endpoint.auth_token.as_deref(), x, y)
-                .await
-            {
-                Ok(()) => {
-                    return Ok(ActionDispatch {
-                        backend: "grpc",
-                        output: CommandOutput::default(),
-                        detail: Some(
-                            "sent both taps through one gRPC connection with a bounded interval"
-                                .to_string(),
-                        ),
-                    });
-                }
-                Err(grpc_backend::GrpcMutationError::BeforeDispatch(detail)) => {
-                    preflight_failure = Some(detail)
-                }
-                Err(grpc_backend::GrpcMutationError::CancelledBeforeDispatch) => {
-                    return Err(cancelled_mutation_error());
-                }
-                Err(err) => return Err(uncertain_mutation_error("double_tap", &err.to_string())),
-            }
-        }
         let command = format!("input tap {x} {y} && sleep 0.08 && input tap {x} {y}");
         // This fixed script is one gesture; do not cancel between its two taps.
         ensure_mutation_not_cancelled()?;
-        let output = self.run_adb_shell(serial, ["sh", "-c", &command]).await?;
+        let output = self
+            .run_adb_pointer_with_deadline(
+                serial,
+                ["sh", "-c", &command],
+                deadline,
+                Duration::from_millis(80),
+                "double_tap",
+            )
+            .await?;
         Ok(ActionDispatch {
             backend: "adb",
             output,
-            detail: Some(merge_dispatch_detail(
-                "sent both taps through one adb shell invocation with an 80 ms interval"
+            detail: Some(
+                "sent both taps in guest logical coordinates through one ADB shell with an 80 ms interval"
                     .to_string(),
-                preflight_failure.as_deref(),
-            )),
+            ),
         })
     }
 
@@ -4033,10 +4079,11 @@ impl AndroidEmulatorMcp {
         x: u32,
         y: u32,
         duration_ms: u64,
+        deadline: Instant,
     ) -> Result<ActionDispatch, McpError> {
         validate_gesture_duration(duration_ms)?;
         let output = self
-            .run_adb_shell(
+            .run_adb_pointer_with_deadline(
                 serial,
                 [
                     "input".to_string(),
@@ -4047,6 +4094,9 @@ impl AndroidEmulatorMcp {
                     y.to_string(),
                     duration_ms.to_string(),
                 ],
+                deadline,
+                Duration::from_millis(duration_ms),
+                "long_press",
             )
             .await?;
         Ok(ActionDispatch {
@@ -4464,61 +4514,33 @@ impl AndroidEmulatorMcp {
     async fn swipe_points_internal(
         &self,
         serial: &str,
-        x1: u32,
-        y1: u32,
-        x2: u32,
-        y2: u32,
+        start: (u32, u32),
+        end: (u32, u32),
         duration_ms: u64,
+        deadline: Instant,
     ) -> Result<ActionDispatch, McpError> {
         validate_gesture_duration(duration_ms)?;
-        let mut preflight_failure = None;
-        if let Some(endpoint) = self.grpc_endpoint_for_serial(serial) {
-            match grpc_backend::send_swipe(
-                endpoint.port,
-                endpoint.auth_token.as_deref(),
-                x1,
-                y1,
-                x2,
-                y2,
-                duration_ms,
-            )
-            .await
-            {
-                Ok(()) => {
-                    return Ok(ActionDispatch {
-                        backend: "grpc",
-                        output: CommandOutput::default(),
-                        detail: None,
-                    });
-                }
-                Err(grpc_backend::GrpcMutationError::BeforeDispatch(detail)) => {
-                    preflight_failure = Some(detail)
-                }
-                Err(grpc_backend::GrpcMutationError::CancelledBeforeDispatch) => {
-                    return Err(cancelled_mutation_error());
-                }
-                Err(err) => return Err(uncertain_mutation_error("swipe", &err.to_string())),
-            }
-        }
-
         let output = self
-            .run_adb_shell(
+            .run_adb_pointer_with_deadline(
                 serial,
                 [
                     "input",
                     "swipe",
-                    &x1.to_string(),
-                    &y1.to_string(),
-                    &x2.to_string(),
-                    &y2.to_string(),
+                    &start.0.to_string(),
+                    &start.1.to_string(),
+                    &end.0.to_string(),
+                    &end.1.to_string(),
                     &duration_ms.to_string(),
                 ],
+                deadline,
+                Duration::from_millis(duration_ms),
+                "swipe",
             )
             .await?;
         Ok(ActionDispatch {
             backend: "adb",
             output,
-            detail: preflight_failure.map(|detail| format!("selected ADB before any gRPC mutation after read-only preflight failure: {detail}")),
+            detail: Some("selected ADB swipe in guest logical coordinates".to_string()),
         })
     }
 
@@ -4527,23 +4549,80 @@ impl AndroidEmulatorMcp {
         serial: &str,
         pointers: &[MultiTouchPointer],
         duration_ms: u64,
+        expected_display_size: (u32, u32),
         deadline: Instant,
     ) -> Result<ActionDispatch, McpError> {
         let Some(endpoint) = self.grpc_endpoint_for_serial(serial) else {
-            return Err(McpError::invalid_params(
-                "android.input.multi_touch unsupported capability: an emulator gRPC endpoint is required; operator action is required",
-                None,
+            return Err(multi_touch_capability_error(
+                "a serial-bound emulator gRPC endpoint is required",
             ));
         };
+        let panel_size = timeout(
+            require_remaining_budget(deadline, "multi-touch panel preflight")?,
+            grpc_backend::default_panel_size(endpoint.port, endpoint.auth_token.as_deref()),
+        )
+        .await
+        .map_err(|_| multi_touch_capability_error("emulator panel query timed out"))?
+        .map_err(|detail| multi_touch_capability_error(&detail))?;
+        let wm_size = self
+            .adb_shell_output_with_timeout(
+                serial,
+                ["wm", "size"],
+                require_remaining_budget(deadline, "multi-touch wm size")?,
+            )
+            .await?;
+        let input = self
+            .adb_shell_output_with_timeout(
+                serial,
+                ["dumpsys", "input"],
+                require_remaining_budget(deadline, "multi-touch input geometry")?,
+            )
+            .await?;
+        let geometry =
+            grpc_backend::LogicalTouchGeometry::from_diagnostics(panel_size, &wm_size, &input)
+                .map_err(multi_touch_capability_error)?;
+        if geometry.logical_size() != expected_display_size {
+            return Err(multi_touch_capability_error(
+                "logical display changed during gesture preflight; observe again",
+            ));
+        }
         let paths = pointers
             .iter()
-            .map(|pointer| grpc_backend::MultiTouchPath {
-                x1: pointer.x1,
-                y1: pointer.y1,
-                x2: pointer.x2,
-                y2: pointer.y2,
+            .map(|pointer| {
+                let (x1, y1) = geometry
+                    .panel_point(pointer.x1, pointer.y1)
+                    .map_err(multi_touch_capability_error)?;
+                let (x2, y2) = geometry
+                    .panel_point(pointer.x2, pointer.y2)
+                    .map_err(multi_touch_capability_error)?;
+                Ok(grpc_backend::MultiTouchPath { x1, y1, x2, y2 })
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, McpError>>()?;
+        let confirmed_wm_size = self
+            .adb_shell_output_with_timeout(
+                serial,
+                ["wm", "size"],
+                require_remaining_budget(deadline, "multi-touch geometry confirmation")?,
+            )
+            .await?;
+        let confirmed_input = self
+            .adb_shell_output_with_timeout(
+                serial,
+                ["dumpsys", "input"],
+                require_remaining_budget(deadline, "multi-touch input confirmation")?,
+            )
+            .await?;
+        let confirmed = grpc_backend::LogicalTouchGeometry::from_diagnostics(
+            panel_size,
+            &confirmed_wm_size,
+            &confirmed_input,
+        )
+        .map_err(multi_touch_capability_error)?;
+        if confirmed != geometry {
+            return Err(multi_touch_capability_error(
+                "display changed before gesture dispatch; observe again",
+            ));
+        }
         let remaining = require_remaining_budget(deadline, "android.input.multi_touch dispatch")?;
         if remaining < Duration::from_millis(duration_ms) {
             return Err(McpError::internal_error(
@@ -4556,22 +4635,31 @@ impl AndroidEmulatorMcp {
         // The backend owns the movement and release sequence. Do not wrap this
         // future in an outer timeout: cancellation between frames could strand
         // active pointers before the guaranteed release attempt runs.
-        grpc_backend::send_multi_touch(
+        grpc_backend::send_multi_touch_with_deadline(
             endpoint.port,
             endpoint.auth_token.as_deref(),
             &paths,
             duration_ms,
+            deadline,
         )
         .await
         .map_err(|err| match err {
             grpc_backend::GrpcMutationError::CancelledBeforeDispatch => cancelled_mutation_error(),
-            _ => uncertain_mutation_error("multi_touch", &err.to_string()),
+            grpc_backend::GrpcMutationError::BeforeDispatch(detail) => {
+                multi_touch_capability_error(&detail)
+            }
+            grpc_backend::GrpcMutationError::OutcomeUnknown(detail) => {
+                uncertain_mutation_error("multi_touch", "grpc", &detail)
+            }
         })?;
 
         Ok(ActionDispatch {
             backend: "grpc",
             output: CommandOutput::default(),
-            detail: Some("dispatched all pointers atomically through emulator gRPC".to_string()),
+            detail: Some(format!(
+                "dispatched all pointers through emulator gRPC after verifying full-panel geometry and mapping logical rotation {} to panel coordinates",
+                geometry.rotation()
+            )),
         })
     }
 
@@ -4892,16 +4980,9 @@ impl AndroidEmulatorMcp {
         let path = self
             .artifact_path("screenshots", Some(filename), Some("png"))
             .await?;
-        if let Some(endpoint) = self.grpc_endpoint_for_serial(serial)
-            && let Ok(png_bytes) =
-                grpc_backend::capture_screenshot_png(endpoint.port, endpoint.auth_token.as_deref())
-                    .await
-            && png_bytes.starts_with(b"\x89PNG\r\n\x1a\n")
-            && png_bytes.len() as u64 <= MAX_SCREENSHOT_BYTES
-        {
-            self.write_artifact_bytes(&path, &png_bytes).await?;
-            return Ok((path, "grpc"));
-        }
+        // Emulator screenshots use sensor orientation, which can disagree with
+        // guest user_rotation. ADB captures the logical display used by UI
+        // hierarchy bounds and ordinary pointer input. Select it before capture.
         let mut command = Command::new(&self.config.adb_path);
         command
             .arg("-s")
@@ -4913,6 +4994,7 @@ impl AndroidEmulatorMcp {
             &format!("adb -s {serial} exec-out screencap -p"),
         )
         .await?;
+        crate::workflow::png_dimensions(&output.stdout)?;
         self.write_artifact_bytes(&path, &output.stdout).await?;
         Ok((path, "adb"))
     }
@@ -5253,8 +5335,9 @@ impl AndroidEmulatorMcp {
         serial: &str,
         ui_path: &Path,
         nodes: &[NormalizedUiNode],
+        deadline: Option<Instant>,
     ) -> Result<SystemDialogCheck, McpError> {
-        self.check_system_dialog_with_deadline(serial, ui_path, nodes, None, true)
+        self.check_system_dialog_with_deadline(serial, ui_path, nodes, deadline, true, false)
             .await
     }
 
@@ -5272,6 +5355,7 @@ impl AndroidEmulatorMcp {
             nodes,
             Some(deadline),
             allow_anr_wait,
+            true,
         )
         .await
     }
@@ -5283,6 +5367,7 @@ impl AndroidEmulatorMcp {
         nodes: &[NormalizedUiNode],
         deadline: Option<Instant>,
         allow_action: bool,
+        restrict_to_anr: bool,
     ) -> Result<SystemDialogCheck, McpError> {
         let labels = labels_from_nodes(nodes);
         if labels.is_empty() {
@@ -5292,14 +5377,14 @@ impl AndroidEmulatorMcp {
         let Some(plan) = classify_system_dialog(&labels) else {
             return Ok(SystemDialogCheck::None);
         };
-        if deadline.is_some() && plan.kind != "anr" {
+        if restrict_to_anr && plan.kind != "anr" {
             // Other dialogs may themselves be the requested selector. Preserve
             // their normal verification without granting permissions or closing.
             return Ok(SystemDialogCheck::None);
         }
         let action = if !allow_action {
             None
-        } else if deadline.is_some() {
+        } else if restrict_to_anr {
             // Verification may recover only Android's real ANR Wait button.
             // It must never grant permissions or choose a destructive button.
             postcondition_anr_wait_button(&plan, nodes).and_then(|node| {
@@ -5327,9 +5412,14 @@ impl AndroidEmulatorMcp {
             && let Some(label) = plan.action_label
             && deadline.is_none_or(|deadline| Instant::now() < deadline)
         {
-            // Once dispatched, retain the existing bounded mutation cleanup.
-            // Dropping this future at the observation deadline could strand input.
-            self.tap_point_internal(serial, x, y).await?;
+            // Bound dispatch by the action budget and never replay an uncertain tap.
+            self.tap_point_internal(
+                serial,
+                x,
+                y,
+                deadline.unwrap_or_else(|| tool_deadline(None, DEFAULT_ADB_COMMAND_TIMEOUT_SECS)),
+            )
+            .await?;
             let settle = if plan.kind == "anr" {
                 Duration::from_secs(2)
             } else {
@@ -5370,7 +5460,10 @@ impl AndroidEmulatorMcp {
                 )
                 .await?;
             let nodes = parse_ui_nodes_from_path(&ui_path)?;
-            match self.check_system_dialog(serial, &ui_path, &nodes).await? {
+            match self
+                .check_system_dialog(serial, &ui_path, &nodes, None)
+                .await?
+            {
                 SystemDialogCheck::Handled(_) => continue,
                 SystemDialogCheck::Blocked(report) => {
                     return Err(McpError::internal_error(
@@ -5386,7 +5479,13 @@ impl AndroidEmulatorMcp {
             }
             let node = find_ui_node_by_label(&ui_path, label)?;
             let (x, y) = node.bounds.center();
-            self.tap_point_internal(serial, x, y).await?;
+            self.tap_point_internal(
+                serial,
+                x,
+                y,
+                tool_deadline(None, DEFAULT_ADB_COMMAND_TIMEOUT_SECS),
+            )
+            .await?;
             sleep(Duration::from_millis(500)).await;
             return Ok(node);
         }
@@ -5415,7 +5514,15 @@ impl AndroidEmulatorMcp {
                 )
                 .await?;
             let nodes = parse_ui_nodes_from_path(&ui_path)?;
-            match self.check_system_dialog(serial, &ui_path, &nodes).await? {
+            match self
+                .check_system_dialog(
+                    serial,
+                    &ui_path,
+                    &nodes,
+                    Some(started + Duration::from_secs(timeout_secs.min(300))),
+                )
+                .await?
+            {
                 SystemDialogCheck::Handled(_) => continue,
                 SystemDialogCheck::Blocked(report) => {
                     return Err(McpError::internal_error(
@@ -6280,7 +6387,7 @@ fn adb_shell_command_mutates(args: &[String]) -> bool {
     }
 }
 
-fn uncertain_mutation_error(action: &str, detail: &str) -> McpError {
+fn uncertain_mutation_error(action: &str, backend: &str, detail: &str) -> McpError {
     McpError::internal_error(
         format!(
             "{action} dispatch outcome is unknown; observe before issuing another action; the mutation was not replayed"
@@ -6289,7 +6396,7 @@ fn uncertain_mutation_error(action: &str, detail: &str) -> McpError {
             "outcome": "outcome_unknown",
             "retry_safe": false,
             "do_not_replay": true,
-            "backend": "grpc",
+            "backend": backend,
             "detail": detail.chars().take(1024).collect::<String>(),
         })),
     )
@@ -7401,6 +7508,17 @@ fn parse_display_size(output: &str) -> Option<(u32, u32)> {
         })
 }
 
+fn multi_touch_capability_error(detail: &str) -> McpError {
+    McpError::invalid_params(
+        format!("android.input.multi_touch unsupported capability: {detail}"),
+        Some(json!({
+            "outcome": "rejected", "retry_safe": true, "do_not_replay": false,
+            "next_mutation_dispatched": false,
+            "capability": { "name": "multi_touch", "status": "unsupported" },
+        })),
+    )
+}
+
 fn validate_multi_touch_request(
     pointers: &[MultiTouchPointer],
     duration_ms: u64,
@@ -7593,7 +7711,7 @@ mod tests {
                     .is_err()
             );
             assert!(
-                mcp.double_tap_point_internal("cancel-fixture", 10, 20)
+                mcp.double_tap_point_internal("cancel-fixture", 10, 20, tool_deadline(None, 5))
                     .await
                     .is_err()
             );
@@ -7718,6 +7836,260 @@ if command[:2] == ['input', 'text'] and (root / 'fail-text').exists():
             [expected.clone(), expected].concat(),
             "An uncertain input command must not be retried"
         );
+        fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn adb_logical_capture_validates_pixels_and_obeys_serial_and_deadline() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(timestamp_filename("logical-capture", None));
+        fs::create_dir_all(&root).await.unwrap();
+        let mut pixels = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut pixels, 7, 3);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().unwrap();
+            writer.write_image_data(&[0; 7 * 3 * 4]).unwrap();
+        }
+        fs::write(root.join("capture.png"), &pixels).await.unwrap();
+        let adb = root.join("adb");
+        fs::write(
+            &adb,
+            r#"#!/usr/bin/env python3
+import pathlib, shlex, sys, time
+root = pathlib.Path(__file__).resolve().parent
+args = sys.argv[1:]
+if args == ['devices', '-l']:
+    print('List of devices attached\ngeometry-fixture device model:fixture')
+    sys.exit(0)
+if args[:2] != ['-s', 'geometry-fixture']:
+    sys.exit('wrong serial')
+args = args[2:]
+if args == ['exec-out', 'screencap', '-p']:
+    if (root / 'stall').exists():
+        time.sleep(5)
+    sys.stdout.buffer.write((root / 'capture.png').read_bytes())
+elif len(args) == 2 and args[0] == 'shell':
+    command = shlex.split(args[1])
+    if command == ['dumpsys', 'input']:
+        print('Viewport INTERNAL: displayId=0, orientation=1, logicalFrame=[0,0,7,3]')
+    elif command == ['wm', 'size']:
+        print('Physical size: 3x7')
+    else:
+        sys.exit('unexpected shell command')
+else:
+    sys.exit('unexpected transport')
+"#,
+        )
+        .await
+        .unwrap();
+        fs::set_permissions(&adb, std::fs::Permissions::from_mode(0o700))
+            .await
+            .unwrap();
+        let mcp = adb_fixture_server(&root);
+        let orientation = mcp
+            .android_get_orientation(Parameters(SerialArgs {
+                serial: Some("geometry-fixture".into()),
+            }))
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap();
+        assert_eq!(orientation["raw_rotation"], 1);
+        assert_eq!(orientation["display_width"], 7);
+        assert_eq!(orientation["display_height"], 3);
+        let (path, backend) = mcp
+            .capture_screenshot_internal_with_timeout(
+                "geometry-fixture",
+                "logical.png".into(),
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        assert_eq!(backend, "adb");
+        assert_eq!(fs::read(&path).await.unwrap(), pixels);
+        assert_eq!(crate::workflow::png_dimensions(&pixels).unwrap(), (7, 3));
+        let capture_files = || {
+            std::fs::read_dir(root.join("artifacts/screenshots"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let valid_files = capture_files();
+        assert_eq!(valid_files.len(), 1);
+
+        fs::write(root.join("capture.png"), b"\x89PNG\r\n\x1a\ntruncated")
+            .await
+            .unwrap();
+        assert!(
+            mcp.capture_screenshot_internal_with_timeout(
+                "geometry-fixture",
+                "invalid.png".into(),
+                Duration::from_secs(2),
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            capture_files(),
+            valid_files,
+            "Invalid PNGs must not create artifacts"
+        );
+
+        fs::write(root.join("capture.png"), &pixels).await.unwrap();
+        fs::write(root.join("stall"), b"stall").await.unwrap();
+        let started = Instant::now();
+        assert!(
+            mcp.capture_screenshot_internal_with_timeout(
+                "geometry-fixture",
+                "expired.png".into(),
+                Duration::from_millis(50),
+            )
+            .await
+            .is_err()
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(
+            capture_files(),
+            valid_files,
+            "Timed-out captures must not create artifacts"
+        );
+        assert_eq!(fs::read(path).await.unwrap(), pixels);
+        fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn ordinary_pointer_input_preserves_logical_coordinates_deadlines_and_no_replay() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(timestamp_filename("logical-pointer", None));
+        fs::create_dir_all(&root).await.unwrap();
+        let adb = root.join("adb");
+        fs::write(
+            &adb,
+            r#"#!/usr/bin/env python3
+import json, pathlib, shlex, sys, time
+root = pathlib.Path(__file__).resolve().parent
+if sys.argv[1:3] != ['-s', 'geometry-fixture']:
+    sys.exit('wrong serial')
+args = sys.argv[3:]
+if len(args) != 2 or args[0] != 'shell':
+    sys.exit('unexpected transport')
+command = shlex.split(args[1])
+with (root / 'calls').open('a') as log:
+    log.write(json.dumps(command) + '\n')
+if (root / 'stall-input').exists():
+    time.sleep(5)
+if (root / 'fail-input').exists():
+    sys.exit('input acknowledgement lost')
+"#,
+        )
+        .await
+        .unwrap();
+        fs::set_permissions(&adb, std::fs::Permissions::from_mode(0o700))
+            .await
+            .unwrap();
+        let mcp = adb_fixture_server(&root);
+        assert_eq!(
+            mcp.tap_point_internal("geometry-fixture", 1200, 400, tool_deadline(None, 5))
+                .await
+                .unwrap()
+                .backend,
+            "adb"
+        );
+        assert_eq!(
+            mcp.swipe_points_internal(
+                "geometry-fixture",
+                (2200, 700),
+                (100, 200),
+                250,
+                tool_deadline(None, 5)
+            )
+            .await
+            .unwrap()
+            .backend,
+            "adb"
+        );
+        assert_eq!(
+            mcp.double_tap_point_internal("geometry-fixture", 1000, 200, tool_deadline(None, 5))
+                .await
+                .unwrap()
+                .backend,
+            "adb"
+        );
+        let read_calls = || async {
+            fs::read_to_string(root.join("calls"))
+                .await
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let mut expected = vec![
+            json!(["input", "tap", "1200", "400"]),
+            json!(["input", "swipe", "2200", "700", "100", "200", "250"]),
+            json!([
+                "sh",
+                "-c",
+                "input tap 1000 200 && sleep 0.08 && input tap 1000 200"
+            ]),
+        ];
+        assert_eq!(read_calls().await, expected);
+        fs::write(root.join("fail-input"), b"fail").await.unwrap();
+        assert!(
+            mcp.tap_point_internal("geometry-fixture", 1200, 400, tool_deadline(None, 5))
+                .await
+                .is_err()
+        );
+        expected.push(json!(["input", "tap", "1200", "400"]));
+        assert_eq!(
+            read_calls().await,
+            expected,
+            "An uncertain tap must not be replayed"
+        );
+        assert!(
+            mcp.tap_point_internal("geometry-fixture", 1200, 400, Instant::now())
+                .await
+                .is_err()
+        );
+        assert!(
+            mcp.swipe_points_internal(
+                "geometry-fixture",
+                (2200, 700),
+                (100, 200),
+                250,
+                Instant::now() + Duration::from_millis(100),
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            read_calls().await,
+            expected,
+            "Expired gestures must not dispatch"
+        );
+        fs::write(root.join("stall-input"), b"stall").await.unwrap();
+        let started = Instant::now();
+        let error = mcp
+            .tap_point_internal(
+                "geometry-fixture",
+                1200,
+                400,
+                Instant::now() + Duration::from_millis(500),
+            )
+            .await
+            .err()
+            .expect("A stalled ADB tap must obey the action deadline");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(error.data.as_ref().unwrap()["outcome"], "outcome_unknown");
+        assert_eq!(error.data.as_ref().unwrap()["do_not_replay"], true);
+        assert_eq!(error.data.as_ref().unwrap()["backend"], "adb");
+        expected.push(json!(["input", "tap", "1200", "400"]));
+        assert_eq!(read_calls().await, expected);
         fs::remove_dir_all(root).await.unwrap();
     }
 
@@ -8091,7 +8463,7 @@ else:
 
     #[test]
     fn dispatch_error_carries_non_replayable_unknown_outcome() {
-        let error = uncertain_mutation_error("tap", "response lost");
+        let error = uncertain_mutation_error("tap", "grpc", "response lost");
         let data = error.data.expect("structured recovery guidance");
         assert_eq!(data["outcome"], "outcome_unknown");
         assert_eq!(data["retry_safe"], false);

@@ -4,6 +4,7 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.ClipData;
 import android.content.ClipboardManager;
+import android.content.res.Configuration;
 import android.graphics.Color;
 import android.os.Bundle;
 import android.view.Gravity;
@@ -20,6 +21,11 @@ public final class MainActivity extends Activity {
     private static final String CLIPBOARD_SENTINEL = "sednalabs-acceptance-clipboard-sentinel";
     private int count;
     private int maxPointers;
+    private int completedTwoPointerGestures;
+    private boolean gestureActive;
+    private boolean sawTwoPointers;
+    private boolean gesturePositionsValid;
+    private boolean controlsVisible;
     private String text = "";
     private EditText input;
     private TextView counter;
@@ -30,6 +36,14 @@ public final class MainActivity extends Activity {
         ClipboardManager clipboard = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
         clipboard.setPrimaryClip(ClipData.newPlainText("Android MCP acceptance", CLIPBOARD_SENTINEL));
         showControls();
+    }
+
+    @Override public void onConfigurationChanged(Configuration configuration) {
+        super.onConfigurationChanged(configuration);
+        if (controlsVisible) {
+            text = input.getText().toString();
+            showControls();
+        }
     }
 
     private boolean clipboardPreserved() {
@@ -73,12 +87,29 @@ public final class MainActivity extends Activity {
     }
 
     private void showControls() {
+        controlsVisible = true;
         LinearLayout page = page();
-        page.addView(label("Android MCP acceptance"));
+        LinearLayout controls = page;
+        LinearLayout touchArea = page;
+        if (getResources().getConfiguration().orientation == Configuration.ORIENTATION_LANDSCAPE) {
+            // Keep the complete touch pad visible in the shorter landscape viewport.
+            page.setOrientation(LinearLayout.HORIZONTAL);
+            page.setPadding(dp(16), dp(12), dp(16), dp(12));
+            controls = new LinearLayout(this);
+            controls.setOrientation(LinearLayout.VERTICAL);
+            touchArea = new LinearLayout(this);
+            touchArea.setOrientation(LinearLayout.VERTICAL);
+            touchArea.setPadding(dp(16), 0, 0, 0);
+            page.addView(controls, new LinearLayout.LayoutParams(0,
+                LinearLayout.LayoutParams.MATCH_PARENT, 1));
+            page.addView(touchArea, new LinearLayout.LayoutParams(0,
+                LinearLayout.LayoutParams.MATCH_PARENT, 1));
+        }
+        controls.addView(label("Android MCP acceptance"));
         counter = label("Count: " + count);
         counter.setId(R.id.counter);
-        page.addView(counter);
-        page.addView(button(R.id.increment, "Increment", view -> {
+        controls.addView(counter);
+        controls.addView(button(R.id.increment, "Increment", view -> {
             count++;
             counter.setText("Count: " + count);
         }));
@@ -88,36 +119,77 @@ public final class MainActivity extends Activity {
         input.setSingleLine(true);
         input.setHint("Enter test text");
         input.setText(text);
-        page.addView(input);
-        page.addView(button(R.id.dialog, "Open dialog", view ->
+        controls.addView(input);
+        controls.addView(button(R.id.dialog, "Open dialog", view ->
             new AlertDialog.Builder(this).setTitle("Acceptance dialog")
                 .setMessage(clipboardPreserved() ? "Clipboard preserved" : "Clipboard changed")
                 .setPositiveButton("Close dialog", (dialog, which) -> dialog.dismiss())
                 .show()));
-        page.addView(button(R.id.scroll, "Open scroll page", view -> {
+        controls.addView(button(R.id.scroll, "Open scroll page", view -> {
             text = input.getText().toString();
             showScrollPage();
         }));
         pointerCount = label("Max pointers: " + maxPointers);
         pointerCount.setId(R.id.pointer_count);
-        page.addView(pointerCount);
+        pointerCount.setContentDescription("Completed two-pointer gestures: " + completedTwoPointerGestures);
+        touchArea.addView(pointerCount);
         TextView pad = label("Touch pad");
         pad.setId(R.id.touch_pad);
         pad.setGravity(Gravity.CENTER);
         pad.setContentDescription("Acceptance touch pad");
         pad.setBackgroundColor(Color.rgb(220, 235, 245));
         pad.setOnTouchListener((view, event) -> {
+            int action = event.getActionMasked();
+            if (action == MotionEvent.ACTION_DOWN) {
+                maxPointers = 0;
+                gestureActive = true;
+                sawTwoPointers = false;
+                gesturePositionsValid = true;
+            }
             maxPointers = Math.max(maxPointers, event.getPointerCount());
+            for (int pointer = 0; pointer < event.getPointerCount(); pointer++) {
+                float x = event.getX(pointer);
+                float y = event.getY(pointer);
+                gesturePositionsValid &= x >= 0 && x < view.getWidth()
+                    && y >= 0 && y < view.getHeight();
+            }
+            if (event.getPointerCount() == 2) {
+                sawTwoPointers = true;
+                // Asymmetric target regions prove both pointers reached this pad.
+                // Merely receiving two pointers elsewhere or two independent taps
+                // cannot advance the completed-gesture count.
+                gesturePositionsValid &= (inTouchRegion(view, event, 0, true)
+                    && inTouchRegion(view, event, 1, false))
+                    || (inTouchRegion(view, event, 1, true)
+                    && inTouchRegion(view, event, 0, false));
+            }
+            if (action == MotionEvent.ACTION_UP) {
+                if (gestureActive && maxPointers == 2 && sawTwoPointers && gesturePositionsValid) {
+                    completedTwoPointerGestures++;
+                }
+                gestureActive = false;
+            } else if (action == MotionEvent.ACTION_CANCEL) {
+                gestureActive = false;
+            }
             pointerCount.setText("Max pointers: " + maxPointers);
+            pointerCount.setContentDescription("Completed two-pointer gestures: " + completedTwoPointerGestures);
             return true;
         });
-        page.addView(pad, new LinearLayout.LayoutParams(
+        touchArea.addView(pad, new LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, dp(150)));
         setContentView(page);
         page.requestFocus();
     }
 
+    private boolean inTouchRegion(View view, MotionEvent event, int pointer, boolean left) {
+        float x = event.getX(pointer) / view.getWidth();
+        float y = event.getY(pointer) / view.getHeight();
+        return left ? x >= 0.1f && x <= 0.45f && y >= 0.2f && y <= 0.5f
+            : x >= 0.55f && x <= 0.9f && y >= 0.5f && y <= 0.8f;
+    }
+
     private void showScrollPage() {
+        controlsVisible = false;
         ScrollView scroll = new ScrollView(this);
         scroll.setFillViewport(true);
         LinearLayout page = page();

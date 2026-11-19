@@ -48,6 +48,52 @@ uses no real device or model credential. It checks image-bearing results,
 cross-session and concurrent duplicate IDs, the exact underlying mutation log,
 and durable status after restarting the provider with its device offline.
 
+## Logical display coordinates and rotation
+
+The [provider run for `5960d205`](https://github.com/sednalabs/android-computer-use-mcp/actions/runs/44436813896/job/135267615481)
+reached landscape orientation, but its post-action and fresh-observation PNGs
+both remained 1080 by 2400. That run did not qualify landscape pointing or finish
+the remaining provider gates. An orientation receipt alone is insufficient proof
+that a screenshot and an input backend share a coordinate space.
+
+The [capture and input implementation](../src/tools.rs) selects exact-serial ADB
+for screenshots, taps, double taps, long presses and swipes. These operations use
+guest logical display coordinates, including the guest's current rotation.
+Capture has a bounded command timeout, a 32 MiB encoded-image limit and a 64 MiB
+decode budget. The complete PNG must decode as one static frame before the
+artifact is written; a PNG signature or header alone is insufficient.
+
+The [workflow checks](../src/workflow.rs) sample display geometry, rotation and
+window identity before and after capture. Coordinate observations require equal
+contexts and PNG dimensions that match the logical display, as well as stable
+boot identity and the existing 30-second freshness limit. A change from rotation
+0 to 2 is rejected even though image dimensions can remain identical. Before
+coordinate dispatch, the provider checks the logical geometry again and brackets
+a fresh screenshot with the same context checks. An unqualified image remains
+visible with degraded notes and coordinate actions disabled; it does not create
+or retain a usable coordinate observation.
+
+Atomic multi-touch retains the emulator gRPC backend. Its coordinate conversion
+requires a checked full-panel viewport, matching physical dimensions, supported
+raw touch axes and reported identity calibration. Android's `dumpsys input`
+rounds affine coefficients to three decimal places; this guard is not a
+full-precision calibration measurement or proof of exact runtime inversion.
+Real-device qualification is scoped to the stock Android API 35 `default`
+`x86_64` emulator with the `pixel_7` profile in the
+[provider workflow](../.github/workflows/android-provider-acceptance.yml).
+Other system images and arbitrary custom calibration remain unqualified even
+when the printed coefficients appear to be identity. The source-derived rotation
+mapping applies only after the geometry checks; unsupported or unavailable
+geometry must fail before input.
+Transport acknowledgement alone does not establish that the intended target
+received simultaneous touches.
+
+A passing real-device run must record native image dimensions and selected
+backends, prove a coordinate tap changes the intended control in landscape, and
+verify the simultaneous-touch effect. Source tests for geometry conversion and
+typed-image consumer delivery do not replace those device postconditions or
+establish live-model pointing accuracy.
+
 ## Text input and clipboard ownership
 
 Printable ASCII text uses the validated ADB text route. The emulator keyboard

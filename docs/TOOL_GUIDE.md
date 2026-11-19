@@ -38,6 +38,8 @@ not inherit the composite workflow's durable action-ID guarantee.
 - `android.list_apps`, `android.terminate_app`, `android.uninstall_app` and
   `android.open_url` provide explicit app lifecycle operations.
 - `android.get_orientation` and `android.set_orientation` use observed default-display rotation.
+  The orientation read also returns `display_width` and `display_height` in
+  guest logical pixels.
 
 ## Observation
 
@@ -53,6 +55,19 @@ not inherit the composite workflow's durable action-ID guarantee.
 
 Observation tools should be preferred whenever the next decision depends on
 what the user or model can actually see.
+
+Screenshots use exact-device ADB capture and contain the guest logical display.
+The provider validates the complete static PNG before saving it. An observation
+qualifies coordinates only when display size, rotation and window identity are
+unchanged around capture, and the PNG dimensions match that display size.
+Before a coordinate step, the provider repeats these checks along with the
+observation's boot identity, age and bounds.
+
+If geometry is unavailable or changes during capture, the image remains available
+with `coordinate_actions_available: false`, `degraded: true` and an explanatory
+note. Observe again before submitting a coordinate action. Map any client-resized
+image back to the receipt's native dimensions as described in
+[Codex image coordinates](codex-mcp-wiring.md#coordinates-after-client-image-resizing).
 
 ## Semantic UI
 
@@ -85,6 +100,18 @@ nodes are valid targets.
 Raw input is useful for fallback control, but it should not be the first choice
 when a stable semantic selector exists. Raw actions can include postcondition
 checks so callers do not treat dispatch alone as proof of success.
+
+Taps, double taps, long presses and swipes use ADB in guest logical coordinates.
+Atomic multi-touch uses emulator gRPC only after the provider verifies a complete,
+unscaled panel viewport, physical dimensions, raw touch axes and reported identity
+calibration. The provider then converts logical points for the observed rotation.
+Missing or unsupported geometry fails before mutation; separate single-pointer
+gestures do not substitute for simultaneous touch.
+
+Android rounds the reported calibration coefficients, so that check does not
+measure full-precision calibration. Device qualification is scoped to the provider
+gate's stock API 35 emulator configuration; arbitrary custom calibration remains
+unqualified even if the rounded values appear unchanged.
 
 ## Hosted Interactive Sessions
 

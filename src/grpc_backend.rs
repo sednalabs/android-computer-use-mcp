@@ -10,7 +10,7 @@
 //! * Enforces communication over loopback only.
 //!
 use std::future::Future;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::time::sleep;
 use tonic::Request;
@@ -21,9 +21,11 @@ use crate::emulator_grpc::emulator_controller_client::EmulatorControllerClient;
 use crate::emulator_grpc::{ImageFormat, KeyboardEvent, Touch, TouchEvent, image_format};
 
 mod clipboard;
+mod geometry;
 pub(crate) use clipboard::{
     ClipboardRestoreOutcome, ClipboardTransfer, begin_clipboard_transfer, requires_clipboard_text,
 };
+pub(crate) use geometry::LogicalTouchGeometry;
 
 const GRPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const GRPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -113,6 +115,27 @@ pub async fn capture_screenshot_png(
         .await
         .map_err(grpc_status)?;
     Ok(image.into_inner().image)
+}
+
+/// Read the emulator panel size without using sensor-oriented screenshot metadata.
+/// Multi-display configurations require a separate input mapping and fail closed.
+pub(crate) async fn default_panel_size(
+    port: u16,
+    auth_token: Option<&str>,
+) -> Result<(u32, u32), String> {
+    let mut client = grpc_client(port).await?;
+    let configurations = client
+        .get_display_configurations(authorized_request((), auth_token)?)
+        .await
+        .map_err(grpc_status)?
+        .into_inner();
+    let [display] = configurations.displays.as_slice() else {
+        return Err("multi-touch requires exactly one emulator display configuration".into());
+    };
+    if display.display != 0 || display.width == 0 || display.height == 0 {
+        return Err("the default emulator panel dimensions are unavailable".into());
+    }
+    Ok((display.width, display.height))
 }
 
 pub async fn send_tap(
@@ -243,28 +266,84 @@ pub async fn send_multi_touch(
     paths: &[MultiTouchPath],
     duration_ms: u64,
 ) -> Result<(), GrpcMutationError> {
+    send_multi_touch_with_deadline(
+        port,
+        auth_token,
+        paths,
+        duration_ms,
+        Instant::now() + Duration::from_secs(30),
+    )
+    .await
+}
+
+pub(crate) async fn send_multi_touch_with_deadline(
+    port: u16,
+    auth_token: Option<&str>,
+    paths: &[MultiTouchPath],
+    duration_ms: u64,
+    deadline: Instant,
+) -> Result<(), GrpcMutationError> {
     if !(2..=5).contains(&paths.len()) || !(50..=2_000).contains(&duration_ms) {
         return Err(GrpcMutationError::BeforeDispatch(
             "multi-touch requires two to five pointers and duration between 50 and 2000 ms"
                 .to_string(),
         ));
     }
-    let mut client = mutation_client(port, auth_token).await?;
+    let duration = Duration::from_millis(duration_ms);
+    let mut client =
+        multi_touch_preflight(deadline, duration, mutation_client(port, auth_token)).await?;
     let frames = multi_touch_frames(paths, duration_ms);
     let step_interval = Duration::from_millis(multi_touch_step_interval(
         duration_ms,
         frames.len().saturating_sub(1) as u32,
     ));
-    send_touch_sequence(
+    // Connection/status are read-only and may use the last of the budget.
+    // Admit the first mutation only while the complete nominal gesture fits.
+    let remaining = remaining_touch_budget(deadline, duration)?;
+    ensure_mutation_not_cancelled()?;
+    let movement_budget = touch_movement_budget(&frames, step_interval).min(remaining);
+    send_touch_sequence_with_budgets(
         &mut GrpcTouchSender {
             client: &mut client,
             auth_token,
         },
         &frames,
         step_interval,
+        movement_budget,
+        GRPC_REQUEST_TIMEOUT,
     )
     .await
     .map_err(GrpcMutationError::OutcomeUnknown)
+}
+
+fn remaining_touch_budget(
+    deadline: Instant,
+    gesture_duration: Duration,
+) -> Result<Duration, GrpcMutationError> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() || remaining < gesture_duration {
+        return Err(GrpcMutationError::BeforeDispatch(
+            "multi-touch action deadline leaves insufficient time before first touch".into(),
+        ));
+    }
+    Ok(remaining)
+}
+
+async fn multi_touch_preflight<T>(
+    deadline: Instant,
+    gesture_duration: Duration,
+    preflight: impl Future<Output = Result<T, GrpcMutationError>>,
+) -> Result<T, GrpcMutationError> {
+    let remaining = remaining_touch_budget(deadline, gesture_duration)?;
+    let result = tokio::time::timeout(remaining, preflight)
+        .await
+        .map_err(|_| {
+            GrpcMutationError::BeforeDispatch(
+                "multi-touch connection/status preflight timed out before input".into(),
+            )
+        })??;
+    remaining_touch_budget(deadline, gesture_duration)?;
+    Ok(result)
 }
 
 trait TouchSender: Send {
@@ -287,11 +366,7 @@ async fn send_touch_sequence(
     frames: &[Vec<Touch>],
     step_interval: Duration,
 ) -> Result<(), String> {
-    let intervals = frames.len().saturating_sub(2).min(625) as u32;
-    let movement_budget = step_interval
-        .saturating_mul(intervals)
-        .min(Duration::from_secs(10))
-        + GRPC_REQUEST_TIMEOUT;
+    let movement_budget = touch_movement_budget(frames, step_interval);
     send_touch_sequence_with_budgets(
         sender,
         frames,
@@ -300,6 +375,14 @@ async fn send_touch_sequence(
         GRPC_REQUEST_TIMEOUT,
     )
     .await
+}
+
+fn touch_movement_budget(frames: &[Vec<Touch>], step_interval: Duration) -> Duration {
+    let intervals = frames.len().saturating_sub(2).min(625) as u32;
+    step_interval
+        .saturating_mul(intervals)
+        .min(Duration::from_secs(10))
+        + GRPC_REQUEST_TIMEOUT
 }
 
 async fn send_touch_sequence_with_budgets(
@@ -515,6 +598,54 @@ mod tests {
                 Ok(())
             }
         }
+    }
+
+    #[tokio::test]
+    async fn multi_touch_read_only_preflight_preserves_the_first_touch_deadline() {
+        let mut polled = false;
+        let expired = multi_touch_preflight(Instant::now(), Duration::from_millis(50), async {
+            polled = true;
+            Ok(())
+        })
+        .await;
+        assert!(matches!(expired, Err(GrpcMutationError::BeforeDispatch(_))));
+        assert!(
+            !polled,
+            "Expired gestures must not even begin connection preflight"
+        );
+
+        let started = Instant::now();
+        let stalled = multi_touch_preflight(
+            started + Duration::from_millis(50),
+            Duration::from_millis(10),
+            std::future::pending::<Result<(), GrpcMutationError>>(),
+        )
+        .await;
+        assert!(matches!(stalled, Err(GrpcMutationError::BeforeDispatch(_))));
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        let consumed_budget = multi_touch_preflight(
+            Instant::now() + Duration::from_millis(100),
+            Duration::from_millis(80),
+            async {
+                sleep(Duration::from_millis(30)).await;
+                Ok(())
+            },
+        )
+        .await;
+        assert!(matches!(
+            consumed_budget,
+            Err(GrpcMutationError::BeforeDispatch(_))
+        ));
+        assert_eq!(
+            multi_touch_preflight(
+                Instant::now() + Duration::from_secs(5),
+                Duration::from_secs(1),
+                async { Ok(7) },
+            )
+            .await,
+            Ok(7)
+        );
     }
 
     #[tokio::test]
