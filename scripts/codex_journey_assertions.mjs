@@ -46,6 +46,9 @@ export function jsonReceipt(output) {
   const receipts = output
     .filter((item) => item.type === "input_text" && typeof item.text === "string")
     .map((item) => item.text.trim())
+    // Codex adds this exact timing envelope to text-only structured receipts.
+    // Image content remains typed and is checked separately without coercion.
+    .map((text) => text.replace(/^Wall time: \d+\.\d{4} seconds\nOutput:\n/, ""))
     .filter((text) => text.startsWith("{"));
   assert.equal(receipts.length, 1, "Expected one JSON text receipt alongside the image.");
   const receipt = JSON.parse(receipts[0]);

@@ -29,6 +29,14 @@ budget stops further actions; an already dispatched action finishes its bounded
 execution and cleanup before the final observation. A batch is not a
 transaction: completed actions are not rolled back.
 
+App launch, semantic tap/type and raw input use a 30-second default budget for
+dispatch and verification. This allows the initial UI hierarchy read and repeated
+confirmation reads to finish on a real emulator. Set an action's `timeout_secs`
+explicitly when a different budget is needed; `android.step` accepts 1 through 90
+seconds per action. The two-minute batch dispatch budget still prevents starting
+further actions after it expires, and increasing a deadline never enables
+automatic mutation retries.
+
 ```json
 {
   "serial": "emulator-5554",

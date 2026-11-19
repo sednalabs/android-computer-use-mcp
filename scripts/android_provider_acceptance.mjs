@@ -233,7 +233,7 @@ try {
 
   await step("launch", [action("android.launch_app", {
     package_name: packageName, activity: activityName,
-    wait_for_selector: id("increment"), wait_for_package: packageName, timeout_secs: 30,
+    wait_for_selector: id("increment"), wait_for_package: packageName,
   })]);
   const increment = [action("android.tap_element", { selector: id("increment"), wait_for_selector: text("Count: 1") })];
   await step("increment-1", increment);
@@ -279,7 +279,7 @@ try {
   await step("terminate", [action("android.terminate_app", { package_name: packageName })]);
   assert.equal(adbText(["shell", "pidof", packageName], true), "");
   await step("relaunch", [action("android.launch_app", {
-    package_name: packageName, activity: activityName, wait_for_selector: text("Count: 0"), timeout_secs: 30,
+    package_name: packageName, activity: activityName, wait_for_selector: text("Count: 0"),
   })]);
   const failed = await call("android.step", {
     serial, action_id: "provider-acceptance-partial-failure", actions: [

@@ -78,7 +78,10 @@ const SOLARLAB_FOCUS_ACK_MARKER: &str = "solarlab semantic focus acknowledged";
 const SOLARLAB_SEMANTIC_REQUEST_ID_EXTRA: &str = "com.sednalabs.solarlab.extra.SEMANTIC_REQUEST_ID";
 const DEFAULT_ADB_COMMAND_TIMEOUT_SECS: u64 = 20;
 const DEFAULT_EMULATOR_COMMAND_TIMEOUT_SECS: u64 = 20;
-pub(crate) const DEFAULT_ACTION_TIMEOUT_SECS: u64 = 5;
+// A verified action may need an initial UIAutomator capture, dispatch and two
+// confirming captures. Keep that complete pipeline bounded without starving it
+// on a real emulator; callers can still request a shorter explicit deadline.
+pub(crate) const DEFAULT_ACTION_TIMEOUT_SECS: u64 = 30;
 const MIN_OBSERVATION_BUDGET_MS: u64 = 500;
 const MIN_FAST_UI_FINGERPRINT_BUDGET_MS: u64 = 1000;
 const MAX_ARTIFACT_READ_BYTES: u64 = 8 * 1024 * 1024;
@@ -6572,7 +6575,10 @@ fn is_deadline_limited_observation_timeout(error: &McpError) -> bool {
     if !is_command_timeout_error(error) {
         return false;
     }
-    message.contains("exec-out uiautomator dump /dev/tty")
+    // The bounded ADB runner uses this generic label. This classifier is only
+    // called by read-only observation capture, never by mutation dispatch.
+    error.message.starts_with("adb command timed out after ")
+        || message.contains("exec-out uiautomator dump /dev/tty")
         || message.contains(" shell uiautomator dump ")
         || (message.contains(" pull ") && message.contains("window-dump"))
 }
@@ -10518,10 +10524,13 @@ mod tests {
             "adb -s emulator-5554 pull /sdcard/window-dump-1.xml local.xml timed out after 1800 ms",
             None,
         );
+        let bounded_adb_error =
+            McpError::internal_error("adb command timed out after 583 ms", None);
 
         assert!(is_deadline_limited_observation_timeout(&exec_out_error));
         assert!(is_deadline_limited_observation_timeout(&shell_error));
         assert!(is_deadline_limited_observation_timeout(&pull_error));
+        assert!(is_deadline_limited_observation_timeout(&bounded_adb_error));
     }
 
     #[test]
@@ -10531,6 +10540,14 @@ mod tests {
             None,
         );
         assert!(!is_deadline_limited_observation_timeout(&error));
+        for message in [
+            "adb command failed with exit status 1: device offline",
+            "adb command failed with exit status 1: permission denied",
+            "gRPC request timed out after 5000 ms",
+        ] {
+            let error = McpError::internal_error(message, None);
+            assert!(!is_deadline_limited_observation_timeout(&error));
+        }
     }
 
     #[test]

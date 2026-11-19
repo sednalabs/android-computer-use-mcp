@@ -239,6 +239,58 @@ let apiFailure;
 let requestCount = 0;
 let deferredDiscovery = false;
 let stderr = "";
+let currentGate = "consumer_startup";
+let lastOutputSummary;
+
+function redactMessage(message) {
+  let text = String(message);
+  for (const secret of [fakeKey, ...Object.entries(process.env)
+    .filter(([key, value]) => /(?:TOKEN|SECRET|KEY)$/.test(key) && value.length >= 8)
+    .map(([, value]) => value)]) text = text.replaceAll(secret, "[redacted]");
+  return text.replace(/data:[^\s"']+/g, "[data redacted]").slice(0, 1500);
+}
+
+function summarizeOutput(output) {
+  const summary = { content: output.map((item) => ({
+    type: item.type, text_length: item.text?.length, image_url_length: item.image_url?.length,
+  })) };
+  try {
+    const value = jsonReceipt(output);
+    const errorSummary = (error) => error && {
+      code: error.code, kind: error.kind,
+      message: redactMessage(typeof error === "string" ? error : error.message || ""),
+    };
+    summary.receipt = {
+      ok: value.ok, serial: value.serial, action_id: value.action_id, outcome: value.outcome,
+      attempted_action_count: value.attempted_action_count, executed_action_count: value.executed_action_count,
+      failed_index: value.failed_index, error: errorSummary(value.error),
+      actions: value.actions?.slice(0, 16).map((row) => ({
+        index: row.index, tool: row.tool, outcome: row.outcome,
+        error: errorSummary(row.error || row.receipt?.error),
+      })),
+    };
+  } catch {
+    // Keep only a framework error prefix, never arbitrary receipt text or image data.
+    summary.errors = output.filter((item) => item.type === "input_text" && /^(?:Error|error|tool error)/.test(item.text || ""))
+      .map((item) => redactMessage(item.text)).slice(0, 2);
+  }
+  return summary;
+}
+
+function evidence(status) {
+  return {
+    schema_version: 1, status, scenario, started_at: startedAt,
+    completed_at: new Date().toISOString(), consumer: consumerProvenance,
+    mcp_source_sha: process.env.MCP_SOURCE_SHA || null,
+    mcp_binary_sha256: process.env.MCP_BINARY_SHA256 || null,
+    requested_protocol_mode: protocolMode || "client_default", negotiated_protocol_version: null,
+    serial, android_build_fingerprint: process.env.ANDROID_BUILD_FINGERPRINT || null,
+    emulator_version: process.env.ANDROID_EMULATOR_VERSION || null,
+    scripted_model_fixture: true, live_model_judgement: false,
+    tool_discovery: deferredDiscovery ? "client_tool_search" : "initial_catalog",
+    hosted_build_install_tested: checks.some((check) => check.gate === "hosted_install_receipt_and_image"), checks,
+  };
+}
 
 try {
   await verifyConsumer();
@@ -266,6 +318,7 @@ try {
       requestCount++;
 
       if (requestCount === 1) {
+        currentGate = "initial_tool_catalog";
         const android = body.tools?.find((tool) => tool.type === "namespace" && tool.name === "mcp__android");
         if (!android) {
           // The pinned consumer defers MCP tools and exposes them through its
@@ -281,6 +334,7 @@ try {
         }
         assertAndroidToolCatalog(body.tools, enabledTools);
       } else if (requestCount === 2 && deferredDiscovery) {
+        currentGate = "deferred_tool_discovery";
         const names = assertAndroidToolDiscovery(body, toolDiscoveryCallId, enabledTools);
         checks.push({ gate: "deferred_tool_discovery", namespace: "mcp__android", tools: names });
       }
@@ -288,7 +342,10 @@ try {
       if (toolRequestNumber > 1) {
         const previous = steps[toolRequestNumber - 2];
         assert.ok(previous, `Unexpected extra Responses API request ${requestCount}.`);
-        checks.push(previous.check(callOutput(body, `android-mcp-call-${toolRequestNumber - 1}`)));
+        currentGate = `${previous.name}:android-mcp-call-${toolRequestNumber - 1}`;
+        const output = callOutput(body, `android-mcp-call-${toolRequestNumber - 1}`);
+        lastOutputSummary = summarizeOutput(output);
+        checks.push(previous.check(output));
       }
       const next = steps[toolRequestNumber - 1];
       const stream = next
@@ -374,23 +431,17 @@ try {
   assert.equal(apiFailure, undefined, apiFailure?.message);
   assert.equal(exit.code, 0, `Codex CLI exited ${exit.code ?? exit.signal}: ${stderr.replaceAll(fakeKey, "[redacted]").slice(-1200)}`);
   assert.equal(requestCount, steps.length + 1 + Number(deferredDiscovery), "Every tool result must return to the model before the fixture completes.");
-  const evidence = {
-    schema_version: 1, status: "passed", scenario, started_at: startedAt,
-    completed_at: new Date().toISOString(), consumer: consumerProvenance,
-    mcp_source_sha: process.env.MCP_SOURCE_SHA || null,
-    mcp_binary_sha256: process.env.MCP_BINARY_SHA256 || null,
-    requested_protocol_mode: protocolMode || "client_default",
-    negotiated_protocol_version: null,
-    serial, android_build_fingerprint: process.env.ANDROID_BUILD_FINGERPRINT || null,
-    emulator_version: process.env.ANDROID_EMULATOR_VERSION || null,
-    scripted_model_fixture: true, live_model_judgement: false,
-    tool_discovery: deferredDiscovery ? "client_tool_search" : "initial_catalog",
-    hosted_build_install_tested: checks.some((check) => check.gate === "hosted_install_receipt_and_image"), checks,
-  };
   if (process.env.ANDROID_MCP_JOURNEY_EVIDENCE) {
-    await writeFile(process.env.ANDROID_MCP_JOURNEY_EVIDENCE, `${JSON.stringify(evidence, null, 2)}\n`, { mode: 0o600 });
+    await writeFile(process.env.ANDROID_MCP_JOURNEY_EVIDENCE, `${JSON.stringify(evidence("passed"), null, 2)}\n`, { mode: 0o600 });
   }
   process.stdout.write(`Codex generic MCP ${scenario} journey passed: ${checks.length} wire assertions, typed PNGs preserved.\n`);
+} catch (error) {
+  const failure = { gate: currentGate, message: redactMessage(error.message), output: lastOutputSummary };
+  console.error(JSON.stringify({ status: "failed", scenario, failure }));
+  if (process.env.ANDROID_MCP_JOURNEY_EVIDENCE) {
+    await writeFile(process.env.ANDROID_MCP_JOURNEY_EVIDENCE, `${JSON.stringify({ ...evidence("failed"), failure }, null, 2)}\n`, { mode: 0o600 });
+  }
+  throw error;
 } finally {
   if (codex && codex.exitCode === null && codex.signalCode === null) {
     codex.kill("SIGTERM");

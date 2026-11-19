@@ -79,6 +79,16 @@ test("output extraction retains call identity and rejects multiple receipts", ()
   assert.throws(() => jsonReceipt([text(step), text(step)]), /one JSON text receipt/);
 });
 
+test("text receipts accept the exact Codex timing envelope without extracting arbitrary JSON", () => {
+  const wrapped = { type: "input_text", text: `Wall time: 1.2500 seconds\nOutput:\n${JSON.stringify(step)}` };
+  assert.deepEqual(jsonReceipt([wrapped]), step);
+  assert.throws(() => jsonReceipt([text(step), wrapped]), /one JSON text receipt/);
+  for (const prefix of ["Error: ", "Untrusted prose\n", "Wall time: unknown seconds\nOutput:\n"]) {
+    assert.throws(() => jsonReceipt([{ type: "input_text", text: `${prefix}${JSON.stringify(step)}` }]), /one JSON text receipt/);
+  }
+  assert.throws(() => jsonReceipt([{ type: "input_text", text: "Wall time: 1.2500 seconds\nOutput:\n{\"ok\":" }]));
+});
+
 test("hosted install evidence rejects wrong build identity and missing installation effects", () => {
   const expectedBuild = {
     repository: "fixture/app", commit_sha: "a".repeat(40), workflow_run_id: 42,
