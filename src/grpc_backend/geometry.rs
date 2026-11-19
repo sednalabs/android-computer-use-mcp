@@ -190,7 +190,10 @@ fn validate_touch_mapper(lines: &[&str]) -> Result<(), &'static str> {
     if entry(parameters, "DeviceType:") != Some("TOUCH_SCREEN")
         || entry(parameters, "GestureMode:") != Some("MULTI_TOUCH")
         || entry(parameters, "OrientationAware:") != Some("true")
-        || entry(parameters, "Orientation:") != Some("ROTATION_0")
+        // Android 15 dumpParameters uses ftl::enum_string, which prints the
+        // actual ui::Rotation enumerator "Rotation0". Accept the equivalent
+        // ui::toCString alias as well, but never infer zero from missing data.
+        || !matches!(entry(parameters, "Orientation:"), Some("Rotation0" | "ROTATION_0"))
     {
         return Err(
             "multi-touch requires an orientation-aware touchscreen with zero input rotation",
@@ -306,7 +309,7 @@ mod tests {
             "Viewport INTERNAL: displayId=0, uniqueId=local:0, port=0, orientation={rotation}, logicalFrame=[0, 0, {width}, {height}], physicalFrame=[0, 0, {width}, {height}], deviceSize=[{width}, {height}], isActive=[1]"
         );
         format!(
-            "Input Reader State:\n  {viewport}\n  Device 7: virtio_input_multi_touch_1\n    Touch Input Mapper (mode - DIRECT):\n      Parameters:\n        GestureMode: MULTI_TOUCH\n        DeviceType: TOUCH_SCREEN\n        OrientationAware: true\n        Orientation: ROTATION_0\n      Raw Touch Axes:\n        X: min=0, max=32767, flat=0, fuzz=0, resolution=0\n        Y: min=0, max=32767, flat=0, fuzz=0, resolution=0\n      Affine Transformation:\n        X scale: 1.000\n        X ymix: 0.000\n        X offset: 0.000\n        Y xmix: 0.000\n        Y scale: 1.000\n        Y offset: 0.000\n      {viewport}\n      DisplayBounds: {width}x{height}\n"
+            "Input Reader State:\n  {viewport}\n  Device 7: virtio_input_multi_touch_1\n    Touch Input Mapper (mode - DIRECT):\n      Parameters:\n        GestureMode: MULTI_TOUCH\n        DeviceType: TOUCH_SCREEN\n        OrientationAware: true\n        Orientation: Rotation0\n      Raw Touch Axes:\n        X: min=0, max=32767, flat=0, fuzz=0, resolution=0\n        Y: min=0, max=32767, flat=0, fuzz=0, resolution=0\n      Affine Transformation:\n        X scale: 1.000\n        X ymix: 0.000\n        X offset: 0.000\n        Y xmix: 0.000\n        Y scale: 1.000\n        Y offset: 0.000\n      {viewport}\n      DisplayBounds: {width}x{height}\n"
         )
     }
 
@@ -389,6 +392,39 @@ mod tests {
     }
 
     #[test]
+    fn requires_explicit_zero_input_orientation_in_known_source_spellings() {
+        // Android 15 ui/Rotation.h names the enumerator Rotation0; ROTATION_0
+        // is its constexpr alias, used by ui::toCString instead of reflection.
+        // https://android.googlesource.com/platform/frameworks/native/+/refs/tags/android-15.0.0_r1/libs/ui/include/ui/Rotation.h
+        // https://android.googlesource.com/platform/frameworks/native/+/refs/tags/android-15.0.0_r1/include/ftl/enum.h
+        let input = diagnostics((1080, 2400), 1);
+        let parse = |input: &str| {
+            LogicalTouchGeometry::from_diagnostics((1080, 2400), "Physical size: 1080x2400", input)
+        };
+        assert!(parse(&input).is_ok());
+        assert!(parse(&input.replace("Orientation: Rotation0", "Orientation: ROTATION_0")).is_ok());
+        assert!(parse(&input.replace("Orientation: Rotation0", "")).is_err());
+        for value in [
+            "",
+            "0",
+            "Rotation90",
+            "Rotation180",
+            "Rotation270",
+            "ROTATION_90",
+            "ROTATION_180",
+            "ROTATION_270",
+            "ROTATION_1",
+            "unknown",
+        ] {
+            assert!(
+                parse(&input.replace("Orientation: Rotation0", &format!("Orientation: {value}")))
+                    .is_err(),
+                "accepted unsupported input orientation {value:?}",
+            );
+        }
+    }
+
+    #[test]
     fn rejects_unqualified_geometry_and_missing_mapper_facts() {
         let input = diagnostics((1080, 2400), 1);
         let wm = "Physical size: 1080x2400\n";
@@ -408,7 +444,7 @@ mod tests {
             ("orientation=1", "orientation=4"),
             ("Viewport INTERNAL:", "Viewport EXTERNAL:"),
             ("OrientationAware: true", "OrientationAware: false"),
-            ("Orientation: ROTATION_0", "Orientation: ROTATION_90"),
+            ("Orientation: Rotation0", "Orientation: ROTATION_90"),
             ("GestureMode: MULTI_TOUCH", "GestureMode: SINGLE_TOUCH"),
             ("DeviceType: TOUCH_SCREEN", "DeviceType: POINTER"),
             ("mode - DIRECT", "mode - POINTER"),

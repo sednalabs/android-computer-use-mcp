@@ -1986,25 +1986,24 @@ impl AndroidEmulatorMcp {
             "verification": tap_verification_json(&verification),
         })];
         let tap_satisfied = !verification.requested || verification.satisfied;
-        if !tap_satisfied && !args.allow_verification_failure {
-            return Err(McpError::internal_error(
-                format!(
-                    "android.tap_element verification failed after dispatch: {}",
-                    json!({
-                        "serial": serial,
-                        "selector": selector,
-                        "attempted_backends": attempted_backends,
-                        "attempts": attempts,
-                        "artifacts": {
-                            "hierarchy_path": pre_tap_hierarchy_path,
-                            "post_tap_hierarchy_path": verification.hierarchy_path,
-                        },
-                        "system_dialog": dialog_report,
-                    })
-                ),
-                None,
-            ));
-        }
+        ensure_action_outcome_satisfied(
+            "android.tap_element",
+            "verification failed after dispatch",
+            !args.allow_verification_failure,
+            tap_satisfied,
+            json!({
+                "serial": serial,
+                "selector": selector,
+                "attempted_backends": attempted_backends,
+                "attempts": attempts,
+                "verification": tap_verification_json(&verification),
+                "artifacts": {
+                    "hierarchy_path": pre_tap_hierarchy_path,
+                    "post_tap_hierarchy_path": verification.hierarchy_path,
+                },
+                "system_dialog": dialog_report,
+            }),
+        )?;
         Ok(structured_receipt(json!({
             "ok": tap_satisfied,
             "serial": serial,
@@ -2125,6 +2124,7 @@ impl AndroidEmulatorMcp {
                 tapped_selector_still_present: Some(true),
                 post_selector_matched: Some(true),
                 ui_changed_from_pre_tap: Some(false),
+                handled_system_dialogs: Vec::new(),
             }
         } else {
             let center = actionable_center(&node, &selector, "type into")?;
@@ -2143,20 +2143,22 @@ impl AndroidEmulatorMcp {
             })
             .await?
         };
-        if !focus_verification.satisfied {
-            return Err(McpError::internal_error(
-                format!(
-                    "android.type_into_element could not confirm that the target field gained focus before typing: {}",
-                    json!({
-                        "serial": serial,
-                        "selector": selector,
-                        "tap_backend_used": tap_dispatch.backend,
-                        "focus_verification": tap_verification_json(&focus_verification),
-                    })
-                ),
-                None,
-            ));
-        }
+        ensure_action_outcome_satisfied(
+            "android.type_into_element",
+            "could not confirm that the target field gained focus before typing",
+            true,
+            focus_verification.satisfied,
+            json!({
+                "serial": serial,
+                "selector": selector,
+                "tap_backend_used": tap_dispatch.backend,
+                "focus_verification": tap_verification_json(&focus_verification),
+                "artifacts": {
+                    "hierarchy_path": hierarchy_path,
+                    "post_tap_hierarchy_path": focus_verification.hierarchy_path,
+                },
+            }),
+        )?;
         let focused_nodes = focus_verification
             .hierarchy_path
             .as_deref()
@@ -2204,6 +2206,7 @@ impl AndroidEmulatorMcp {
                 target_text_matches_requested: Some(true),
                 post_selector_matched: None,
                 ui_changed_from_pre_text: Some(false),
+                handled_system_dialogs: Vec::new(),
             };
             return Ok(structured_receipt(json!({
                 "ok": true,
@@ -2255,6 +2258,12 @@ impl AndroidEmulatorMcp {
                 "text": args.text,
                 "text_backend_used": text_dispatch.dispatch.backend,
                 "text_verification": text_verification_json(&text_dispatch.verification),
+                "focus_verification": tap_verification_json(&focus_verification),
+                "artifacts": {
+                    "hierarchy_path": hierarchy_path,
+                    "post_tap_hierarchy_path": focus_verification.hierarchy_path,
+                    "post_text_hierarchy_path": text_dispatch.verification.hierarchy_path,
+                },
             }),
         )?;
         Ok(structured_receipt(json!({
@@ -2274,6 +2283,7 @@ impl AndroidEmulatorMcp {
                 "hierarchy_path": hierarchy_path,
                 "focus_hierarchy_path": focus_verification.hierarchy_path,
                 "text_hierarchy_path": text_dispatch.verification.hierarchy_path,
+                "post_text_hierarchy_path": text_dispatch.verification.hierarchy_path,
             },
             "stdout": merge_stdout(&tap_dispatch.output, &text_dispatch.dispatch.output),
             "stderr": merge_stderr(&tap_dispatch.output, &text_dispatch.dispatch.output),
@@ -2568,7 +2578,10 @@ impl AndroidEmulatorMcp {
                 match_count: 0,
                 selected_match_index: None,
                 candidate_summary: Vec::new(),
-                handled_system_dialogs: Vec::new(),
+                handled_system_dialogs: verification
+                    .as_ref()
+                    .map(|result| result.handled_system_dialogs.clone())
+                    .unwrap_or_default(),
             }
         };
         ensure_tool_postcondition_satisfied(
@@ -2799,6 +2812,9 @@ impl AndroidEmulatorMcp {
             json!({
                 "focus_postcondition": tool_postcondition_json(&focus_postcondition),
                 "text_verification": text_verification_json(&verified_dispatch.verification),
+                "artifacts": {
+                    "post_text_hierarchy_path": verified_dispatch.verification.hierarchy_path,
+                },
             }),
         )?;
         let postcondition = self
@@ -2829,6 +2845,9 @@ impl AndroidEmulatorMcp {
             "stderr": verified_dispatch.dispatch.output.stderr,
             "focus_postcondition": tool_postcondition_json(&focus_postcondition),
             "text_verification": text_verification_json(&verified_dispatch.verification),
+            "artifacts": {
+                "post_text_hierarchy_path": verified_dispatch.verification.hierarchy_path,
+            },
             "postcondition": tool_postcondition_json(&postcondition),
         })))
     }
@@ -4246,6 +4265,8 @@ impl AndroidEmulatorMcp {
         } = request;
         let mut paste_attempted = false;
         let mut text_verified = false;
+        let mut verification_evidence = None;
+        let mut verification_hierarchy = None;
         // All exits after staging pass through explicit cleanup. Never put this
         // mutation sequence in an outer timeout or choose another input lane.
         let result = async {
@@ -4285,6 +4306,25 @@ impl AndroidEmulatorMcp {
             text_verified = verification
                 .as_ref()
                 .is_ok_and(|verification| verification.requested && verification.satisfied);
+            if let Ok(verification) = &verification {
+                let mut evidence = text_verification_json(verification);
+                if let Some(evidence) = evidence.as_object_mut() {
+                    // Clipboard diagnostics never expose text or selectors.
+                    evidence.remove("target_selector");
+                    evidence.remove("wait_for_selector");
+                }
+                verification_evidence = Some(evidence);
+                verification_hierarchy = verification.hierarchy_path.clone();
+            } else if let Err(error) = &verification
+                && let Some(data) = error.data.as_ref()
+            {
+                verification_evidence = data.get("text_verification").cloned();
+                verification_hierarchy = data
+                    .get("artifacts")
+                    .and_then(|artifacts| artifacts.get("post_text_hierarchy_path"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned);
+            }
             let paste_output = paste_output.map_err(|_| "paste_dispatch")?;
             let verification = verification.map_err(|_| "text_verification")?;
             if !text_verified {
@@ -4309,18 +4349,30 @@ impl AndroidEmulatorMcp {
             sleep(remaining_until(deadline)).await;
         }
         let restoration = transfer.restore_if_owned().await;
+        let failure = |phase, restoration_status| {
+            let mut error =
+                clipboard_text_failure(phase, paste_attempted, text_verified, restoration_status);
+            if let Some(data) = error
+                .data
+                .as_mut()
+                .and_then(serde_json::Value::as_object_mut)
+                && let Some(evidence) = verification_evidence.as_ref()
+            {
+                data.insert("text_verification".into(), evidence.clone());
+                data.insert(
+                    "artifacts".into(),
+                    json!({ "post_text_hierarchy_path": verification_hierarchy }),
+                );
+            }
+            error
+        };
         let restoration_status = match restoration {
             Ok(grpc_backend::ClipboardRestoreOutcome::Restored) => "restored",
             Ok(grpc_backend::ClipboardRestoreOutcome::PreservedInterveningChange) => {
                 "preserved_intervening_change"
             }
             Err(_) => {
-                return Err(clipboard_text_failure(
-                    "clipboard_restore",
-                    paste_attempted,
-                    text_verified,
-                    "unknown",
-                ));
+                return Err(failure("clipboard_restore", "unknown"));
             }
         };
         match result {
@@ -4335,12 +4387,7 @@ impl AndroidEmulatorMcp {
                 result.clipboard_restore = Some(restoration_status);
                 Ok(result)
             }
-            Err(phase) => Err(clipboard_text_failure(
-                phase,
-                paste_attempted,
-                text_verified,
-                restoration_status,
-            )),
+            Err(phase) => Err(failure(phase, restoration_status)),
         }
     }
 
@@ -8177,6 +8224,10 @@ if (root / 'fail-input').exists():
             "deadline",
             "unavailable",
             "raw_existing",
+            "anr_success",
+            "anr_wrong",
+            "anr_missing",
+            "anr_unsafe",
         ] {
             let root = parent.join(scenario);
             fs::create_dir_all(&root).await.unwrap();
@@ -8189,6 +8240,32 @@ if (root / 'fail-input').exists():
             )
             .await
             .unwrap();
+            let dialog = r#"<hierarchy>
+                <node package="android" text="Fixture isn't responding" />
+                <node package="android" resource-id="android:id/aerr_close" text="Close app" clickable="true" enabled="true" bounds="[0,0][40,20]" />
+                <node package="android" resource-id="android:id/aerr_wait" text="Wait" clickable="true" enabled="true" bounds="[60,0][100,20]" />
+                </hierarchy>"#;
+            fs::write(
+                root.join("dialog.xml"),
+                if scenario == "anr_unsafe" {
+                    dialog.replace("android:id/aerr_wait", "fixture:id/aerr_wait")
+                } else {
+                    dialog.to_owned()
+                },
+            )
+            .await
+            .unwrap();
+            if scenario == "anr_wrong" {
+                fs::write(
+                    root.join("after.xml"),
+                    before_xml.replace(
+                        "text=\"\"",
+                        &format!("text=\"{}\"", text.replace("Sedna", "sedna")),
+                    ),
+                )
+                .await
+                .unwrap();
+            }
             let adb = root.join("adb");
             fs::write(
                 &adb,
@@ -8209,14 +8286,21 @@ elif command == 'shell input keyevent KEYCODE_PASTE':
     (root / 'pasted').touch()
     if root.name == 'paste_error':
         sys.exit('paste acknowledgement lost')
+elif command == 'shell input tap 80 10' and root.name.startswith('anr_'):
+    if (root / 'restored').exists():
+        sys.exit('clipboard restored before ANR recovery')
+    (root / 'waited').touch()
 elif command == 'exec-out uiautomator dump /dev/tty':
     if (root / 'restored').exists():
         sys.exit('clipboard restored before text verification')
     count_file = root / 'captures'
     count = int(count_file.read_text()) + 1 if count_file.exists() else 1
     count_file.write_text(str(count))
-    ready = count > 1 and root.name != 'verification_failure'
-    print((root / ('after.xml' if ready else 'before.xml')).read_text())
+    ready = count > 1 and root.name not in ['verification_failure', 'anr_missing']
+    capture = 'after.xml' if ready else 'before.xml'
+    if root.name.startswith('anr_') and not (root / 'waited').exists():
+        capture = 'dialog.xml'
+    print((root / capture).read_text())
 elif command == 'shell dumpsys window windows':
     print('mCurrentFocus=Window{a u0 fixture/.Main}')
 elif command == 'shell dumpsys activity activities':
@@ -8234,6 +8318,9 @@ else:
             let deadline = match scenario {
                 "deadline" => Instant::now() - Duration::from_secs(1),
                 "verification_failure" => Instant::now() + Duration::from_secs(1),
+                "anr_success" => Instant::now() + Duration::from_secs(8),
+                "anr_wrong" | "anr_missing" => Instant::now() + Duration::from_secs(6),
+                "anr_unsafe" => Instant::now() + Duration::from_secs(2),
                 _ => Instant::now() + Duration::from_secs(5),
             };
             let request = VerifiedTextDispatchRequest {
@@ -8290,9 +8377,22 @@ else:
             )
             .await;
             assert_eq!(cleanup.calls, 1, "cleanup must execute exactly once");
-            if matches!(scenario, "success" | "raw_success" | "intervening_change") {
+            if matches!(
+                scenario,
+                "success" | "raw_success" | "intervening_change" | "anr_success"
+            ) {
                 let result = result.unwrap();
                 assert!(result.verification.satisfied);
+                if scenario == "anr_success" {
+                    assert_eq!(
+                        result.verification.stable_polls_observed, 1,
+                        "One fresh exact editable-text proof retains the existing confirmation rule"
+                    );
+                    assert_eq!(
+                        text_verification_json(&result.verification)["handled_system_dialogs"],
+                        json!([{ "kind": "anr", "action": "wait" }])
+                    );
+                }
                 assert_eq!(result.dispatch.backend, "emulator_clipboard_adb");
                 assert_eq!(
                     result.clipboard_restore,
@@ -8320,7 +8420,8 @@ else:
                     data["phase"],
                     match scenario {
                         "paste_error" => "paste_dispatch",
-                        "verification_failure" => "text_verification",
+                        "verification_failure" | "anr_wrong" | "anr_missing" | "anr_unsafe" =>
+                            "text_verification",
                         "cleanup_failure" => "clipboard_restore",
                         "cancelled" => "cancelled_before_next_input",
                         "deadline" => "deadline_before_next_input",
@@ -8337,9 +8438,42 @@ else:
                         "restored"
                     }
                 );
-                if scenario == "verification_failure" {
+                if matches!(
+                    scenario,
+                    "verification_failure" | "anr_wrong" | "anr_missing" | "anr_unsafe"
+                ) {
                     assert!(cleanup.restored_at.unwrap() >= deadline);
                     assert_eq!(data["text_verified"], false);
+                    assert_eq!(data["text_verification"]["satisfied"], false);
+                    assert!(data["text_verification"].get("target_selector").is_none());
+                    assert!(data["text_verification"].get("wait_for_selector").is_none());
+                    assert_eq!(
+                        data["text_verification"]["handled_system_dialogs"],
+                        if matches!(scenario, "anr_wrong" | "anr_missing") {
+                            json!([{ "kind": "anr", "action": "wait" }])
+                        } else {
+                            json!([])
+                        }
+                    );
+                    assert!(
+                        Path::new(
+                            data["artifacts"]["post_text_hierarchy_path"]
+                                .as_str()
+                                .unwrap()
+                        )
+                        .is_file()
+                    );
+                    if matches!(scenario, "anr_wrong" | "anr_missing") {
+                        assert!(
+                            fs::read_to_string(root.join("captures"))
+                                .await
+                                .unwrap()
+                                .parse::<usize>()
+                                .unwrap()
+                                >= 2,
+                            "Failure must include a fresh observation after Wait"
+                        );
+                    }
                 } else if matches!(scenario, "paste_error" | "cleanup_failure") {
                     assert_eq!(data["text_verified"], true);
                 }
@@ -8355,6 +8489,16 @@ else:
                 assert!(mutations.is_empty());
             } else if scenario == "raw_success" {
                 assert_eq!(mutations, ["shell input keyevent KEYCODE_PASTE"]);
+            } else if matches!(scenario, "anr_success" | "anr_wrong" | "anr_missing") {
+                assert_eq!(
+                    mutations,
+                    [
+                        "shell input keycombination CTRL_LEFT A",
+                        "shell input keyevent KEYCODE_PASTE",
+                        "shell input tap 80 10",
+                    ],
+                    "Original paste must run once and clipboard recovery must only choose Wait"
+                );
             } else {
                 assert_eq!(
                     mutations,
@@ -11372,12 +11516,20 @@ else:
         fs::write(root.join("ready.xml"), r#"<hierarchy>
             <node package="fixture" resource-id="fixture:id/increment" text="Increment" clickable="true" enabled="true" bounds="[0,0][100,40]" />
             </hierarchy>"#).await.unwrap();
+        fs::copy(root.join("ready.xml"), root.join("before.xml"))
+            .await
+            .unwrap();
         let adb = root.join("adb");
         fs::write(
             &adb,
             r#"#!/usr/bin/env python3
-import pathlib, shlex, sys
+import io, pathlib, shlex, sys, zipfile
 root = pathlib.Path(__file__).resolve().parent
+if sys.argv[1:] == ['devices', '-l']:
+    print('List of devices attached\nanr-fixture device model:fixture')
+    sys.exit(0)
+if sys.argv[1:3] != ['-s', 'anr-fixture']:
+    sys.exit('wrong serial')
 args = sys.argv[3:]
 if args[0] == 'shell':
     args = ['shell'] + shlex.split(args[1])
@@ -11385,13 +11537,42 @@ command = ' '.join(args)
 with (root / 'calls').open('a') as log:
     log.write(command + '\n')
 if command == 'exec-out uiautomator dump /dev/tty':
-    print((root / ('ready.xml' if (root / 'waited').exists() else 'dialog.xml')).read_text())
+    scenario = (root / 'tap-scenario').read_text() if (root / 'tap-scenario').exists() else None
+    capture = 'ready.xml' if (root / 'waited').exists() else 'dialog.xml'
+    if scenario:
+        if not (root / 'tapped').exists():
+            capture = 'before.xml'
+        elif not (root / 'waited').exists():
+            counter = root / 'post-captures'
+            count = int(counter.read_text()) + 1 if counter.exists() else 1
+            counter.write_text(str(count))
+            capture = 'before.xml' if scenario == 'success' and count == 1 else 'dialog.xml'
+        else:
+            counter = root / 'after-wait-captures'
+            count = int(counter.read_text()) + 1 if counter.exists() else 1
+            counter.write_text(str(count))
+            if scenario == 'cap':
+                capture = 'dialog.xml'
+            elif scenario == 'wrong':
+                capture = 'wrong.xml'
+            elif scenario == 'missing' or (scenario == 'transient' and count > 1):
+                capture = 'before.xml'
+    print((root / capture).read_text())
+elif command == 'exec-out cmd window dump-visible-window-views' and (root / 'tap-scenario').exists():
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, 'w') as archive:
+        archive.writestr('1 fixture/.Main', b'unchanged target app')
+    sys.stdout.buffer.write(payload.getvalue())
 elif command == 'shell dumpsys window windows':
     print('mCurrentFocus=Window{a u0 fixture/.Main}')
 elif command == 'shell dumpsys activity activities':
     print('mResumedActivity: ActivityRecord{a u0 fixture/.Main}')
 elif command == 'shell input tap 80 10':
     (root / 'waited').touch()
+elif command == 'shell input tap 50 20' and (root / 'tap-scenario').exists():
+    if (root / 'tapped').exists():
+        sys.exit('original input was replayed')
+    (root / 'tapped').touch()
 else:
     sys.exit('Unexpected fixture command: ' + command)
 "#,
@@ -11510,6 +11691,158 @@ else:
                 .count(),
             3
         );
+
+        let safe_dialog = fs::read_to_string(&dialog).await.unwrap();
+        let ready = r#"<hierarchy>
+            <node package="fixture" resource-id="fixture:id/increment" text="Increment" clickable="true" enabled="true" bounds="[0,0][100,40]" />
+            <node package="fixture" resource-id="fixture:id/counter" text="Count: 1" bounds="[0,40][100,80]" />
+            </hierarchy>"#;
+        fs::write(root.join("ready.xml"), ready).await.unwrap();
+        fs::write(
+            root.join("wrong.xml"),
+            ready.replace("Count: 1", "Count: 0"),
+        )
+        .await
+        .unwrap();
+        for scenario in [
+            "success",
+            "wrong",
+            "missing",
+            "transient",
+            "unsafe",
+            "intentional",
+            "cap",
+        ] {
+            for name in [
+                "calls",
+                "waited",
+                "tapped",
+                "post-captures",
+                "after-wait-captures",
+            ] {
+                if root.join(name).exists() {
+                    fs::remove_file(root.join(name)).await.unwrap();
+                }
+            }
+            fs::write(root.join("tap-scenario"), scenario)
+                .await
+                .unwrap();
+            fs::write(
+                &dialog,
+                if scenario == "unsafe" {
+                    safe_dialog.replace("android:id/aerr_wait", "fixture:id/aerr_wait")
+                } else {
+                    safe_dialog.clone()
+                },
+            )
+            .await
+            .unwrap();
+            let post_selector = if scenario == "intentional" {
+                json!({ "resource_id": "android:id/aerr_wait" })
+            } else {
+                json!({ "resource_id": "fixture:id/counter", "text": "Count: 1" })
+            };
+            let result = mcp
+                .android_tap_element(Parameters(serde_json::from_value(json!({
+                    "serial": "anr-fixture",
+                    "selector": { "resource_id": "fixture:id/increment" },
+                    "wait_for_selector": post_selector,
+                    "timeout_secs": if scenario == "cap" { 20 } else if scenario == "success" { 8 } else { 6 },
+                    "retry_with_adb_on_no_change": true,
+                })).unwrap()))
+                .await;
+            let expected_waits = match scenario {
+                "unsafe" | "intentional" => 0,
+                "cap" => 4,
+                _ => 1,
+            };
+            let evidence = if matches!(scenario, "success" | "intentional") {
+                let receipt = result.unwrap().structured_content.unwrap();
+                assert_eq!(receipt["verification"]["satisfied"], true, "{scenario}");
+                assert!(
+                    receipt["verification"]["stable_polls_observed"]
+                        .as_u64()
+                        .unwrap()
+                        >= 2
+                );
+                receipt
+            } else {
+                let error = result
+                    .err()
+                    .expect("recovery alone must not satisfy the tap");
+                let data = error.data.unwrap();
+                assert_eq!(data["outcome"], "postcondition_failed", "{scenario}");
+                assert_eq!(data["retry_safe"], false);
+                assert_eq!(data["do_not_replay"], true);
+                assert_eq!(data["verification"]["satisfied"], false);
+                assert!(
+                    Path::new(
+                        data["artifacts"]["post_tap_hierarchy_path"]
+                            .as_str()
+                            .unwrap()
+                    )
+                    .is_file()
+                );
+                data
+            };
+            let handled = evidence["verification"]["handled_system_dialogs"]
+                .as_array()
+                .unwrap();
+            assert_eq!(handled.len(), expected_waits, "{scenario}");
+            assert!(
+                handled
+                    .iter()
+                    .all(|dialog| dialog == &json!({ "kind": "anr", "action": "wait" }))
+            );
+            let calls = fs::read_to_string(root.join("calls")).await.unwrap();
+            let mutations = calls
+                .lines()
+                .filter(|line| line.starts_with("shell input"))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                mutations
+                    .iter()
+                    .filter(|line| **line == "shell input tap 50 20")
+                    .count(),
+                1,
+                "{scenario}"
+            );
+            assert_eq!(
+                mutations
+                    .iter()
+                    .filter(|line| **line == "shell input tap 80 10")
+                    .count(),
+                expected_waits,
+                "{scenario}"
+            );
+            assert_eq!(mutations.len(), 1 + expected_waits, "{scenario}");
+            if scenario == "success" {
+                assert_eq!(
+                    fs::read_to_string(root.join("after-wait-captures"))
+                        .await
+                        .unwrap(),
+                    "2"
+                );
+                assert!(
+                    calls
+                        .lines()
+                        .filter(|line| *line == "exec-out cmd window dump-visible-window-views")
+                        .count()
+                        > 3,
+                    "An unchanged fast app fingerprint must not hide a later system ANR"
+                );
+            } else if matches!(scenario, "wrong" | "missing" | "transient") {
+                let captures = fs::read_to_string(root.join("after-wait-captures"))
+                    .await
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap();
+                assert!(
+                    captures >= if scenario == "transient" { 2 } else { 1 },
+                    "Failure must include fresh original-postcondition evidence after Wait"
+                );
+            }
+        }
         fs::remove_dir_all(root).await.unwrap();
     }
 

@@ -27,6 +27,11 @@ use crate::ui::{
     matching_nodes, parse_ui_nodes_from_xml, resolve_node_selection, selector_matches,
 };
 
+const MAX_POSTCONDITION_ANR_RECOVERIES: usize = 4;
+// The fast fingerprint can contain only the target app's window. Periodically
+// inspect the full hierarchy so an unchanged app cannot hide a system ANR.
+const POSTCONDITION_SEMANTIC_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+
 /// Tracks the outcome of a tap-based interaction.
 #[derive(Debug, Clone)]
 pub(crate) struct TapVerification {
@@ -60,6 +65,8 @@ pub(crate) struct TapVerification {
     pub(crate) post_selector_matched: Option<bool>,
     /// Was a change in the UI detected post-tap?
     pub(crate) ui_changed_from_pre_tap: Option<bool>,
+    /// Safe ANR Wait actions completed during post-tap verification.
+    pub(crate) handled_system_dialogs: Vec<HandledSystemDialog>,
 }
 
 pub(crate) struct TapVerificationStatus {
@@ -106,6 +113,8 @@ pub(crate) struct TextVerification {
     pub(crate) post_selector_matched: Option<bool>,
     /// Was a change in the UI detected post-input?
     pub(crate) ui_changed_from_pre_text: Option<bool>,
+    /// Safe ANR Wait actions completed while waiting for the text effect.
+    pub(crate) handled_system_dialogs: Vec<HandledSystemDialog>,
 }
 
 pub(crate) struct TextVerificationStatus {
@@ -306,6 +315,7 @@ impl AndroidEmulatorMcp {
                 tapped_selector_still_present: None,
                 post_selector_matched: None,
                 ui_changed_from_pre_tap: Some(false),
+                handled_system_dialogs: Vec::new(),
             });
         }
 
@@ -323,6 +333,9 @@ impl AndroidEmulatorMcp {
         let mut ui_changed_from_pre_tap = Some(false);
         let required_satisfied_polls = 2u32;
         let mut force_followup_semantic_capture = false;
+        let mut last_semantic_capture: Option<Instant> = None;
+        let mut handled_system_dialogs = Vec::new();
+        let mut blocked_by_system_dialog = false;
         let target_package = infer_unique_package_name(&relevant_selector_snapshot(
             pre_tap_nodes,
             tapped_selector,
@@ -342,7 +355,16 @@ impl AndroidEmulatorMcp {
                     deadline,
                     target_package.as_deref(),
                 )
-                .await?
+                .await
+                .map_err(|error| {
+                    verification_observation_error(
+                        error,
+                        "verification",
+                        "post_tap_hierarchy_path",
+                        &handled_system_dialogs,
+                        last_hierarchy_path.as_deref(),
+                    )
+                })?
             };
             if use_fast_fingerprint_backend.is_none() {
                 use_fast_fingerprint_backend = Some(fast_fingerprint.is_some());
@@ -352,7 +374,10 @@ impl AndroidEmulatorMcp {
             let should_capture_semantic = should_refresh_semantic_observation(
                 last_fast_fingerprint.as_deref(),
                 fast_fingerprint.as_deref(),
-                force_followup_semantic_capture,
+                force_followup_semantic_capture
+                    || last_semantic_capture.is_some_and(|captured| {
+                        captured.elapsed() >= POSTCONDITION_SEMANTIC_REFRESH_INTERVAL
+                    }),
                 final_poll,
             );
             if let Some(fast_fingerprint) = fast_fingerprint.take() {
@@ -370,10 +395,20 @@ impl AndroidEmulatorMcp {
                     filename_or_timestamp(hierarchy_filename.clone(), "tap-element-verify", "png"),
                     deadline,
                 )
-                .await?
+                .await
+                .map_err(|error| {
+                    verification_observation_error(
+                        error,
+                        "verification",
+                        "post_tap_hierarchy_path",
+                        &handled_system_dialogs,
+                        last_hierarchy_path.as_deref(),
+                    )
+                })?
             else {
                 break;
             };
+            last_semantic_capture = Some(Instant::now());
             remove_artifact_if_exists(last_hierarchy_path.clone()).await;
             let fingerprint = tap_verification_fingerprint(
                 &observation.nodes,
@@ -400,6 +435,47 @@ impl AndroidEmulatorMcp {
             post_selector_matched = status.post_present;
             ui_changed_from_pre_tap = status.ui_changed_from_pre_tap;
             last_hierarchy_path = Some(observation.hierarchy_path.display().to_string());
+            if !status.satisfied {
+                match self
+                    .check_postcondition_system_dialog(
+                        serial,
+                        &observation.hierarchy_path,
+                        &observation.nodes,
+                        deadline,
+                        handled_system_dialogs.len() < MAX_POSTCONDITION_ANR_RECOVERIES,
+                    )
+                    .await
+                    .map_err(|error| {
+                        verification_observation_error(
+                            error,
+                            "verification",
+                            "post_tap_hierarchy_path",
+                            &handled_system_dialogs,
+                            last_hierarchy_path.as_deref(),
+                        )
+                    })? {
+                    SystemDialogCheck::Handled(_) => {
+                        handled_system_dialogs.push(HandledSystemDialog {
+                            kind: "anr",
+                            action: "wait",
+                        });
+                        // Recovery is not proof of the original postcondition.
+                        // Keep the original baseline and require fresh captures.
+                        last_fingerprint = None;
+                        last_fast_fingerprint = None;
+                        last_semantic_capture = None;
+                        stable_polls_observed = 0;
+                        satisfied_polls_observed = 0;
+                        force_followup_semantic_capture = true;
+                        continue;
+                    }
+                    SystemDialogCheck::Blocked(_) => {
+                        blocked_by_system_dialog = true;
+                        break;
+                    }
+                    SystemDialogCheck::None => {}
+                }
+            }
             if status.satisfied {
                 satisfied_polls_observed += 1;
                 force_followup_semantic_capture =
@@ -431,6 +507,7 @@ impl AndroidEmulatorMcp {
                     tapped_selector_still_present,
                     post_selector_matched,
                     ui_changed_from_pre_tap,
+                    handled_system_dialogs,
                 });
             }
 
@@ -448,7 +525,7 @@ impl AndroidEmulatorMcp {
             stabilized: false,
             stable_polls_observed,
             stable_polls_required: required_stable_polls,
-            timed_out: true,
+            timed_out: !blocked_by_system_dialog || Instant::now() >= deadline,
             elapsed_ms: started.elapsed().as_millis(),
             hierarchy_path: last_hierarchy_path,
             tapped_selector_present_pre_tap: Some(pre_tapped_present),
@@ -456,6 +533,7 @@ impl AndroidEmulatorMcp {
             tapped_selector_still_present,
             post_selector_matched,
             ui_changed_from_pre_tap,
+            handled_system_dialogs,
         })
     }
 
@@ -522,6 +600,7 @@ impl AndroidEmulatorMcp {
                 target_text_matches_requested: pre_status.target_text_matches_requested,
                 post_selector_matched: None,
                 ui_changed_from_pre_text: Some(false),
+                handled_system_dialogs: Vec::new(),
             });
         }
 
@@ -540,6 +619,9 @@ impl AndroidEmulatorMcp {
         let started = Instant::now();
         let mut ui_changed_from_pre_text = Some(false);
         let mut force_followup_semantic_capture = false;
+        let mut last_semantic_capture: Option<Instant> = None;
+        let mut handled_system_dialogs = Vec::new();
+        let mut blocked_by_system_dialog = false;
         let target_package = infer_unique_package_name(&relevant_text_snapshot(
             pre_text_nodes,
             target_tracker,
@@ -560,7 +642,16 @@ impl AndroidEmulatorMcp {
                     deadline,
                     target_package.as_deref(),
                 )
-                .await?
+                .await
+                .map_err(|error| {
+                    verification_observation_error(
+                        error,
+                        "text_verification",
+                        "post_text_hierarchy_path",
+                        &handled_system_dialogs,
+                        last_hierarchy_path.as_deref(),
+                    )
+                })?
             };
             if use_fast_fingerprint_backend.is_none() {
                 use_fast_fingerprint_backend = Some(fast_fingerprint.is_some());
@@ -570,7 +661,10 @@ impl AndroidEmulatorMcp {
             let should_capture_semantic = should_refresh_semantic_observation(
                 last_fast_fingerprint.as_deref(),
                 fast_fingerprint.as_deref(),
-                force_followup_semantic_capture,
+                force_followup_semantic_capture
+                    || last_semantic_capture.is_some_and(|captured| {
+                        captured.elapsed() >= POSTCONDITION_SEMANTIC_REFRESH_INTERVAL
+                    }),
                 final_poll,
             );
             if let Some(fast_fingerprint) = fast_fingerprint.take() {
@@ -588,12 +682,31 @@ impl AndroidEmulatorMcp {
                     filename_or_timestamp(hierarchy_filename.clone(), "input-text-verify", "png"),
                     deadline,
                 )
-                .await?
+                .await
+                .map_err(|error| {
+                    verification_observation_error(
+                        error,
+                        "text_verification",
+                        "post_text_hierarchy_path",
+                        &handled_system_dialogs,
+                        last_hierarchy_path.as_deref(),
+                    )
+                })?
             else {
                 break;
             };
+            last_semantic_capture = Some(Instant::now());
             if exact_editable_text {
-                observation.nodes = clipboard_text_nodes_from_xml(&observation.hierarchy_xml)?;
+                observation.nodes = clipboard_text_nodes_from_xml(&observation.hierarchy_xml)
+                    .map_err(|error| {
+                        verification_observation_error(
+                            error,
+                            "text_verification",
+                            "post_text_hierarchy_path",
+                            &handled_system_dialogs,
+                            Some(&observation.hierarchy_path.display().to_string()),
+                        )
+                    })?;
             }
             remove_artifact_if_exists(last_hierarchy_path.clone()).await;
             let fingerprint = text_verification_fingerprint(
@@ -614,6 +727,47 @@ impl AndroidEmulatorMcp {
             post_selector_matched = status.post_present;
             ui_changed_from_pre_text = status.ui_changed_from_pre_text;
             last_hierarchy_path = Some(observation.hierarchy_path.display().to_string());
+            if !status.satisfied {
+                match self
+                    .check_postcondition_system_dialog(
+                        serial,
+                        &observation.hierarchy_path,
+                        &observation.nodes,
+                        deadline,
+                        handled_system_dialogs.len() < MAX_POSTCONDITION_ANR_RECOVERIES,
+                    )
+                    .await
+                    .map_err(|error| {
+                        verification_observation_error(
+                            error,
+                            "text_verification",
+                            "post_text_hierarchy_path",
+                            &handled_system_dialogs,
+                            last_hierarchy_path.as_deref(),
+                        )
+                    })? {
+                    SystemDialogCheck::Handled(_) => {
+                        handled_system_dialogs.push(HandledSystemDialog {
+                            kind: "anr",
+                            action: "wait",
+                        });
+                        // Preserve the original target and exact-text baseline;
+                        // never mistake dismissing an ANR for consumed input.
+                        last_fingerprint = None;
+                        last_fast_fingerprint = None;
+                        last_semantic_capture = None;
+                        stable_polls_observed = 0;
+                        satisfied_polls_observed = 0;
+                        force_followup_semantic_capture = true;
+                        continue;
+                    }
+                    SystemDialogCheck::Blocked(_) => {
+                        blocked_by_system_dialog = true;
+                        break;
+                    }
+                    SystemDialogCheck::None => {}
+                }
+            }
             if status.satisfied {
                 satisfied_polls_observed += 1;
                 force_followup_semantic_capture =
@@ -648,6 +802,7 @@ impl AndroidEmulatorMcp {
                     target_text_matches_requested,
                     post_selector_matched,
                     ui_changed_from_pre_text,
+                    handled_system_dialogs,
                 });
             }
 
@@ -667,7 +822,7 @@ impl AndroidEmulatorMcp {
             stabilized: false,
             stable_polls_observed,
             stable_polls_required: required_stable_polls,
-            timed_out: true,
+            timed_out: !blocked_by_system_dialog || Instant::now() >= deadline,
             elapsed_ms: started.elapsed().as_millis(),
             hierarchy_path: last_hierarchy_path,
             target_selector_present_pre_text: pre_target_present,
@@ -676,6 +831,7 @@ impl AndroidEmulatorMcp {
             target_text_matches_requested,
             post_selector_matched,
             ui_changed_from_pre_text,
+            handled_system_dialogs,
         })
     }
 
@@ -948,7 +1104,7 @@ impl AndroidEmulatorMcp {
                         &observation.hierarchy_path,
                         &observation.nodes,
                         deadline,
-                        last_result.handled_system_dialogs.len() < 4,
+                        last_result.handled_system_dialogs.len() < MAX_POSTCONDITION_ANR_RECOVERIES,
                     )
                     .await?
                 {
@@ -989,6 +1145,31 @@ impl AndroidEmulatorMcp {
     }
 }
 
+fn verification_observation_error(
+    mut error: McpError,
+    verification_key: &str,
+    hierarchy_key: &str,
+    handled_system_dialogs: &[HandledSystemDialog],
+    hierarchy_path: Option<&str>,
+) -> McpError {
+    let mut data = error.data.take().unwrap_or_else(|| json!({}));
+    if !data.is_object() {
+        data = json!({ "cause": data });
+    }
+    // An original input was already dispatched before entering these runners.
+    // Retain the lower-level error and any completed recovery evidence.
+    data["retry_safe"] = json!(false);
+    data["do_not_replay"] = json!(true);
+    data[verification_key] = json!({
+        "requested": true,
+        "satisfied": false,
+        "handled_system_dialogs": handled_system_dialogs,
+    });
+    data["artifacts"] = json!({ hierarchy_key: hierarchy_path });
+    error.data = Some(data);
+    error
+}
+
 pub(crate) fn tap_verification_json(verification: &TapVerification) -> serde_json::Value {
     json!({
         "requested": verification.requested,
@@ -1005,6 +1186,7 @@ pub(crate) fn tap_verification_json(verification: &TapVerification) -> serde_jso
         "tapped_selector_still_present": verification.tapped_selector_still_present,
         "post_selector_matched": verification.post_selector_matched,
         "ui_changed_from_pre_tap": verification.ui_changed_from_pre_tap,
+        "handled_system_dialogs": verification.handled_system_dialogs,
     })
 }
 
@@ -1025,6 +1207,7 @@ pub(crate) fn text_verification_json(verification: &TextVerification) -> serde_j
         "target_text_matches_requested": verification.target_text_matches_requested,
         "post_selector_matched": verification.post_selector_matched,
         "ui_changed_from_pre_text": verification.ui_changed_from_pre_text,
+        "handled_system_dialogs": verification.handled_system_dialogs,
     })
 }
 
@@ -1080,15 +1263,28 @@ pub(crate) fn ensure_action_outcome_satisfied(
     details: serde_json::Value,
 ) -> Result<(), McpError> {
     if requested && !satisfied {
+        let mut data = serde_json::json!({
+            "outcome": "postcondition_failed",
+            "retry_safe": false,
+            "do_not_replay": true,
+            "phase": "verification",
+            "details": details,
+        });
+        // Keep the existing details envelope while exposing machine-readable
+        // verification evidence without requiring callers to parse the message.
+        for key in [
+            "verification",
+            "focus_verification",
+            "text_verification",
+            "artifacts",
+        ] {
+            if let Some(value) = details.get(key) {
+                data[key] = value.clone();
+            }
+        }
         return Err(McpError::internal_error(
             format!("{tool_name} {stage}: {details}"),
-            Some(serde_json::json!({
-                "outcome": "postcondition_failed",
-                "retry_safe": false,
-                "do_not_replay": true,
-                "phase": "verification",
-                "details": details,
-            })),
+            Some(data),
         ));
     }
     Ok(())
@@ -1637,15 +1833,67 @@ fn bounds_look_like_same_control(original: &UiBounds, candidate: &UiBounds) -> b
 #[cfg(test)]
 mod tests {
     use super::{
-        ToolPostconditionEvidenceSource, ToolPostconditionResult, activity_matches,
-        clipboard_text_nodes_from_xml, component_activity_identity, exact_editable_text_status,
-        infer_unique_package_name, should_refresh_semantic_observation,
-        should_refresh_tool_postcondition_observation, text_verification_status,
-        tool_postcondition_json, window_state_postcondition_matches,
+        HandledSystemDialog, ToolPostconditionEvidenceSource, ToolPostconditionResult,
+        activity_matches, clipboard_text_nodes_from_xml, component_activity_identity,
+        ensure_action_outcome_satisfied, exact_editable_text_status, infer_unique_package_name,
+        should_refresh_semantic_observation, should_refresh_tool_postcondition_observation,
+        text_verification_status, tool_postcondition_json, verification_observation_error,
+        window_state_postcondition_matches,
     };
     use crate::tools::AndroidWindowState;
     use crate::ui::{NormalizedUiNode, UiSelector};
     use serde_json::json;
+
+    #[test]
+    fn verification_failures_keep_recovery_evidence_and_dispatch_uncertainty() {
+        let handled = [HandledSystemDialog {
+            kind: "anr",
+            action: "wait",
+        }];
+        for (verification_key, hierarchy_key) in [
+            ("verification", "post_tap_hierarchy_path"),
+            ("text_verification", "post_text_hierarchy_path"),
+        ] {
+            let error = verification_observation_error(
+                crate::McpError::internal_error(
+                    "Wait acknowledgement lost",
+                    Some(json!({
+                        "outcome": "outcome_unknown",
+                        "backend": "adb",
+                        "retry_safe": true,
+                    })),
+                ),
+                verification_key,
+                hierarchy_key,
+                &handled,
+                Some("/tmp/post-input.xml"),
+            );
+            let data = error.data.unwrap();
+            assert_eq!(error.message, "Wait acknowledgement lost");
+            assert_eq!(data["outcome"], "outcome_unknown");
+            assert_eq!(data["backend"], "adb");
+            assert_eq!(data["retry_safe"], false);
+            assert_eq!(data["do_not_replay"], true);
+            assert_eq!(data[verification_key]["satisfied"], false);
+            assert_eq!(
+                data[verification_key]["handled_system_dialogs"],
+                json!([{ "kind": "anr", "action": "wait" }])
+            );
+            assert_eq!(data["artifacts"][hierarchy_key], "/tmp/post-input.xml");
+
+            let error = ensure_action_outcome_satisfied(
+                "fixture",
+                "verification failed",
+                true,
+                false,
+                data,
+            )
+            .unwrap_err();
+            let data = error.data.unwrap();
+            assert_eq!(data[verification_key], data["details"][verification_key]);
+            assert_eq!(data["artifacts"], data["details"]["artifacts"]);
+        }
+    }
 
     #[test]
     fn clipboard_text_proof_requires_changed_exact_editable_value() {

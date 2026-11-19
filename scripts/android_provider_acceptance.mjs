@@ -10,6 +10,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { createMcpStreamableHttpClient } from "../adapters/openai/mcp_streamable_http_client.js";
 import { assertTypedPng } from "./codex_journey_assertions.mjs";
 import { summarizeDisplayGeometry, summarizeInputGeometry, summarizeWmSize } from "./android_provider_geometry.mjs";
+import { classifyAnrOwner, decodeXmlAttribute, summarizeBuildIdentity, summarizeVerification } from "./android_provider_diagnostics.mjs";
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const required = (name) => {
@@ -54,6 +55,7 @@ let server;
 let client;
 let installEvidence;
 let deviceReadiness;
+let deviceIdentity;
 const started = Date.now();
 const adbCall = (args, allowNonzero = false) => {
   const result = spawnSync(adb, ["-s", serial, ...args], { timeout: 20000, maxBuffer: 32 * 1024 * 1024 });
@@ -98,11 +100,29 @@ function recordDeviceGeometry(phase) {
     display: capture(["dumpsys", "display"], summarizeDisplayGeometry),
   });
 }
+function deviceBuildIdentity() {
+  const capture = (command, args) => {
+    const result = spawnSync(command, args, { timeout: 5000, maxBuffer: 64 * 1024 });
+    return result.error || result.status !== 0 ? "" : result.stdout.toString("utf8");
+  };
+  const property = (name) => capture(adb, ["-s", serial, "shell", "getprop", name]);
+  return summarizeBuildIdentity({
+    apiLevel: property("ro.build.version.sdk"), release: property("ro.build.version.release"),
+    buildId: property("ro.build.id"), fingerprint: property("ro.build.fingerprint"),
+    emulator: capture(path.join(sdk, "emulator/emulator"), ["-version"]),
+    adb: capture(adb, ["version"]),
+  });
+}
 async function hierarchyEvidence(value) {
   const candidates = [
-    ...((value.actions || []).filter((row) => row.ok === false).map((row) => ({
-      source: "postcondition", path: (row.receipt?.postcondition || row.error?.data?.postcondition)?.artifacts?.hierarchy_path,
-    }))),
+    ...((value.actions || []).filter((row) => row.ok === false).flatMap((row) => {
+      const data = row.error?.data || row.receipt?.error?.data;
+      return [
+        { source: "text_verification", path: data?.artifacts?.post_text_hierarchy_path },
+        { source: "tap_verification", path: data?.artifacts?.post_tap_hierarchy_path },
+        { source: "postcondition", path: (row.receipt?.postcondition || data?.postcondition)?.artifacts?.hierarchy_path },
+      ];
+    })),
     { source: "final_observation", path: value.observation?.artifacts?.hierarchy_path },
   ].filter((candidate) => typeof candidate.path === "string").slice(0, 2);
   const summaries = [];
@@ -116,12 +136,14 @@ async function hierarchyEvidence(value) {
       assert.ok((await handle.stat()).size <= 1024 * 1024, "Hierarchy evidence is bounded.");
       const xml = await handle.readFile("utf8");
       const nodes = [...xml.matchAll(/<node\b([^>]*)>/g)];
-      summaries.push({ source: candidate.source, node_count: nodes.length, nodes: nodes.slice(0, 64).map((match) => {
-        const attrs = Object.fromEntries([...match[1].matchAll(/([\w:-]+)="([^"]*)"/g)].map((attr) => [attr[1], attr[2]]));
+      const attributes = nodes.slice(0, 64).map((match) =>
+        Object.fromEntries([...match[1].matchAll(/([\w:-]+)="([^"]*)"/g)].map((attr) => [attr[1], attr[2]])),
+      );
+      summaries.push({ source: candidate.source, node_count: nodes.length, anr_owner: classifyAnrOwner(attributes), nodes: attributes.map((attrs) => {
         return {
           package_name: attrs.package?.slice(0, 160), class_name: attrs.class?.slice(0, 160),
-          resource_id: attrs["resource-id"]?.slice(0, 200), label: staticFixtureLabel(attrs.text),
-          content_description: staticFixtureLabel(attrs["content-desc"]),
+          resource_id: attrs["resource-id"]?.slice(0, 200), label: staticFixtureLabel(decodeXmlAttribute(attrs.text)),
+          content_description: staticFixtureLabel(decodeXmlAttribute(attrs["content-desc"])),
           text_length: attrs.text?.length, bounds: attrs.bounds?.slice(0, 80),
           enabled: attrs.enabled, clickable: attrs.clickable, focused: attrs.focused,
         };
@@ -177,6 +199,9 @@ function failureSummary(value) {
       index: row.index, tool: row.tool, outcome: row.outcome, ok: row.ok,
       elapsed_ms: row.elapsed_ms, error: errorSummary(row.error || row.receipt?.error),
       postcondition: conditionSummary(row.receipt?.postcondition || row.error?.data?.postcondition),
+      verification: summarizeVerification(row.receipt?.verification || row.error?.data?.verification),
+      focus_verification: summarizeVerification(row.receipt?.focus_verification || row.error?.data?.focus_verification),
+      text_verification: summarizeVerification(row.receipt?.text_verification || row.error?.data?.text_verification),
     })),
     observation: value.observation && {
       screenshot_present: value.observation.screenshot_present,
@@ -202,8 +227,9 @@ async function call(name, args, { ok = true, image = false } = {}) {
       coordinate_actions_available: observation.coordinate_actions_available,
     };
   }
-  const recoveredDialogs = [value.postcondition, ...(value.actions || []).map((row) =>
-    row.receipt?.postcondition || row.error?.data?.postcondition,
+  const conditions = (entry) => [entry?.postcondition, entry?.verification, entry?.focus_verification, entry?.text_verification];
+  const recoveredDialogs = [...conditions(value), ...(value.actions || []).flatMap((row) =>
+    [...conditions(row.receipt), ...conditions(row.error?.data)],
   )].flatMap(handledDialogs).slice(0, 16);
   if (recoveredDialogs.length) check.handled_system_dialogs = recoveredDialogs;
   checks.push(check);
@@ -211,6 +237,8 @@ async function call(name, args, { ok = true, image = false } = {}) {
     check.failure = failureSummary(value);
     check.failure.device_state = deviceState();
     check.failure.hierarchies = await hierarchyEvidence(value);
+    const anrOwners = [...new Set(check.failure.hierarchies.map((hierarchy) => hierarchy.anr_owner).filter(Boolean))];
+    if (anrOwners.length) check.failure.anr_owner = anrOwners.length === 1 ? anrOwners[0] : "unknown";
     console.error(JSON.stringify({ failed_gate: currentGate, failure: check.failure }));
   }
   assert.equal(value.ok, ok, `Unexpected outcome for ${currentGate}.`);
@@ -315,6 +343,7 @@ try {
   });
   await client.listTools();
   await call("android.wait_for_boot", { serial, timeout_secs: 120 });
+  deviceIdentity = deviceBuildIdentity();
   currentGate = "disposable_device_ready";
   deviceReadiness = { before: deviceState() };
   assert.ok(!deviceReadiness.before.window_policy.fields?.some((field) => field.name === "secure" && field.value === "true"), "The disposable fixture emulator must not have secure credentials.");
@@ -461,8 +490,8 @@ try {
     schema_version: 1, status: "passed", started_at: new Date(started).toISOString(),
     finished_at: new Date().toISOString(), elapsed_ms: Date.now() - started,
     repository, provider_source_sha: sourceSha, provider_binary_sha256: sha256(await readFile(binary)),
-    device_serial: serial, android_build_fingerprint: adbText(["shell", "getprop", "ro.build.fingerprint"]),
-    emulator_version: spawnSync(path.join(sdk, "emulator/emulator"), ["-version"], { encoding: "utf8", timeout: 10000 }).stdout.split("\n")[0],
+    device_serial: serial, android_build_fingerprint: deviceIdentity.android_build_fingerprint,
+    emulator_version: deviceIdentity.emulator_version_line, device_identity: deviceIdentity,
     hosted_build_install_tested: true, actual_simultaneous_touch_tested: true,
     simultaneous_touch_orientations: ["landscape", "portrait"],
     clipboard_restoration_tested: true,
@@ -473,6 +502,7 @@ try {
   await writeFile(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`, { mode: 0o600 });
   console.log(`Real Android provider acceptance passed (${checks.length} recorded checks).`);
 } catch (error) {
+  deviceIdentity ||= deviceBuildIdentity();
   recordDeviceGeometry("failure");
   await writeFile(evidencePath, `${JSON.stringify({
     schema_version: 1, status: "failed", failed_gate: currentGate,
@@ -482,6 +512,7 @@ try {
     landscape_coordinate_input_tested: checks.some((check) => check.gate === "landscape_native_coordinate_tap" && check.ok),
     simultaneous_touch_orientations: checks.filter((check) => check.target_regions_verified && check.ok).map((check) => check.orientation),
     device_readiness: deviceReadiness,
+    device_identity: deviceIdentity,
     device_geometry: geometryEvidence,
     install: installEvidence,
     live_model_judgement: false, checks,

@@ -77,7 +77,14 @@ export function summarizeInputGeometry(output) {
     }
     const currentViewport = viewport(trimmed);
     if (currentViewport) mapper.viewport = currentViewport;
-    const parameter = trimmed.match(/^(OrientationAware|Orientation|GestureMode|DeviceType): (true|false|ROTATION_[0-3]|MULTI_TOUCH|SINGLE_TOUCH|TOUCH_SCREEN|TOUCH_PAD|POINTER)$/);
+    const orientation = trimmed.match(/^Orientation:\s*(.*)$/);
+    if (orientation) {
+      // Android 15 emits enum enumerators (Rotation0), not the ROTATION_0 alias.
+      // Preserve a short explicit token; absence or another shape remains unknown.
+      mapper.orientation_present = true;
+      if (/^[A-Za-z0-9_]{1,32}$/.test(orientation[1])) mapper.Orientation = orientation[1];
+    }
+    const parameter = trimmed.match(/^(OrientationAware|GestureMode|DeviceType): (true|false|MULTI_TOUCH|SINGLE_TOUCH|TOUCH_SCREEN|TOUCH_PAD|POINTER)$/);
     if (parameter) mapper[parameter[1]] = parameter[2];
     if (section === "Raw Touch Axes") {
       const axis = trimmed.match(/^([XY]): /);
