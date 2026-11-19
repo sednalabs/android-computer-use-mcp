@@ -51,9 +51,10 @@ use crate::ui::{
 use crate::verification::{
     InternalNodeTracker, TapVerification, TapVerificationRequest, TextVerification,
     TextVerificationRequest, ToolPostconditionEvidenceSource, ToolPostconditionRequest,
-    ToolPostconditionResult, VerifiedTextDispatchRequest, ensure_action_outcome_satisfied,
-    ensure_tool_postcondition_satisfied, tap_verification_fingerprint, tap_verification_json,
-    text_verification_json, tool_postcondition_json, tracker_matches_node,
+    ToolPostconditionResult, VerifiedTextDispatchRequest, clipboard_text_nodes_from_xml,
+    ensure_action_outcome_satisfied, ensure_tool_postcondition_satisfied,
+    tap_verification_fingerprint, tap_verification_json, text_verification_json,
+    tool_postcondition_json, tracker_matches_node,
 };
 #[cfg(test)]
 use crate::verification::{
@@ -2023,6 +2024,7 @@ impl AndroidEmulatorMcp {
         &self,
         Parameters(args): Parameters<TypeIntoElementArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let requires_clipboard = grpc_backend::requires_clipboard_text(&args.text);
         let selector = normalize_selector_input(args.selector);
         ensure_selector_not_empty(&selector)?;
         let serial = self
@@ -2142,13 +2144,17 @@ impl AndroidEmulatorMcp {
             .hierarchy_path
             .as_deref()
             .map(Path::new)
-            .map(parse_ui_nodes_from_path)
+            .map(|path| parse_text_verification_nodes(path, requires_clipboard))
             .transpose()?
             .unwrap_or_default();
-        let focused_node = focused_nodes
-            .iter()
-            .find(|node| tracker_matches_node(node, &focus_target_tracker))
-            .cloned();
+        let focused_node = if requires_clipboard {
+            Some(clipboard_text_target(&focused_nodes, Some(&focus_target_selector))?.clone())
+        } else {
+            focused_nodes
+                .iter()
+                .find(|node| tracker_matches_node(node, &focus_target_tracker))
+                .cloned()
+        };
         let public_text_target_selector = focused_node
             .as_ref()
             .map(text_verification_target_selector)
@@ -2157,10 +2163,13 @@ impl AndroidEmulatorMcp {
             .as_ref()
             .and_then(InternalNodeTracker::from_target_node)
             .unwrap_or_else(|| InternalNodeTracker::Selector(public_text_target_selector.clone()));
-        if focused_node
-            .as_ref()
-            .is_some_and(|node| node_matches_requested_text(node, &args.text))
-        {
+        if focused_node.as_ref().is_some_and(|node| {
+            if requires_clipboard {
+                node.text.as_deref() == Some(args.text.as_str())
+            } else {
+                node_matches_requested_text(node, &args.text)
+            }
+        }) {
             let no_op_verification = TextVerification {
                 requested: true,
                 target_selector: Some(public_text_target_selector.clone()),
@@ -2243,6 +2252,7 @@ impl AndroidEmulatorMcp {
             "tap_backend_used": tap_dispatch.backend,
             "text_backend_used": text_dispatch.dispatch.backend,
             "text_dispatch_detail": text_dispatch.dispatch.detail,
+            "clipboard_restore": text_dispatch.clipboard_restore,
             "artifacts": {
                 "hierarchy_path": hierarchy_path,
                 "focus_hierarchy_path": focus_verification.hierarchy_path,
@@ -2670,6 +2680,7 @@ impl AndroidEmulatorMcp {
         &self,
         Parameters(args): Parameters<TextArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let requires_clipboard = grpc_backend::requires_clipboard_text(&args.text);
         let expect_focus_selector = normalize_optional_selector_input(args.expect_focus_selector);
         let wait_for_selector = normalize_optional_selector_input(args.wait_for_selector);
         if let Some(selector) = expect_focus_selector.as_ref() {
@@ -2700,27 +2711,41 @@ impl AndroidEmulatorMcp {
             &focus_postcondition,
         )?;
         let pre_text_nodes = if let Some(path) = focus_postcondition.hierarchy_path.as_deref() {
-            parse_ui_nodes_from_path(Path::new(path))?
-        } else if expect_focus_selector.is_some() || wait_for_selector.is_some() {
-            self.capture_ui_observation_with_deadline(
-                &serial,
-                filename_or_timestamp(None, "input-text-pre", "xml"),
-                false,
-                filename_or_timestamp(None, "input-text-pre", "png"),
-                Some(deadline),
-            )
-            .await?
-            .nodes
+            parse_text_verification_nodes(Path::new(path), requires_clipboard)?
+        } else if expect_focus_selector.is_some()
+            || wait_for_selector.is_some()
+            || requires_clipboard
+        {
+            let observation = self
+                .capture_ui_observation_with_deadline(
+                    &serial,
+                    filename_or_timestamp(None, "input-text-pre", "xml"),
+                    false,
+                    filename_or_timestamp(None, "input-text-pre", "png"),
+                    Some(deadline),
+                )
+                .await?;
+            if requires_clipboard {
+                clipboard_text_nodes_from_xml(&observation.hierarchy_xml)?
+            } else {
+                observation.nodes
+            }
         } else {
             Vec::new()
         };
-        let public_text_target_selector = focus_postcondition
-            .node
-            .as_ref()
-            .map(text_verification_target_selector);
-        let text_target_tracker = focus_postcondition
-            .node
-            .as_ref()
+        // Clipboard paste is asynchronous from the provider's perspective. A
+        // focused editable target lets verification prove consumption before
+        // private clipboard cleanup, even when the raw caller gave no selector.
+        let text_target_node = if requires_clipboard {
+            Some(clipboard_text_target(
+                &pre_text_nodes,
+                expect_focus_selector.as_ref(),
+            )?)
+        } else {
+            focus_postcondition.node.as_ref()
+        };
+        let public_text_target_selector = text_target_node.map(text_verification_target_selector);
+        let text_target_tracker = text_target_node
             .and_then(InternalNodeTracker::from_target_node)
             .or_else(|| {
                 public_text_target_selector
@@ -2781,6 +2806,7 @@ impl AndroidEmulatorMcp {
             "text": args.text,
             "backend_used": verified_dispatch.dispatch.backend,
             "dispatch_detail": verified_dispatch.dispatch.detail,
+            "clipboard_restore": verified_dispatch.clipboard_restore,
             "stdout": verified_dispatch.dispatch.output.stdout,
             "stderr": verified_dispatch.dispatch.output.stderr,
             "focus_postcondition": tool_postcondition_json(&focus_postcondition),
@@ -3134,6 +3160,23 @@ struct StableUiWaitRequest<'a> {
 struct VerifiedTextDispatch {
     dispatch: ActionDispatch,
     verification: TextVerification,
+    clipboard_restore: Option<&'static str>,
+}
+
+trait ClipboardTransferCleanup: Send {
+    fn restore_if_owned(
+        &mut self,
+    ) -> impl std::future::Future<
+        Output = Result<grpc_backend::ClipboardRestoreOutcome, grpc_backend::GrpcMutationError>,
+    > + Send;
+}
+
+impl ClipboardTransferCleanup for grpc_backend::ClipboardTransfer {
+    async fn restore_if_owned(
+        &mut self,
+    ) -> Result<grpc_backend::ClipboardRestoreOutcome, grpc_backend::GrpcMutationError> {
+        grpc_backend::ClipboardTransfer::restore_if_owned(self).await
+    }
 }
 
 struct SolarLabAppArgs {
@@ -4017,6 +4060,9 @@ impl AndroidEmulatorMcp {
         &self,
         request: VerifiedTextDispatchRequest<'_>,
     ) -> Result<VerifiedTextDispatch, McpError> {
+        if grpc_backend::requires_clipboard_text(request.text) {
+            return self.send_clipboard_text_with_verification(request).await;
+        }
         let VerifiedTextDispatchRequest {
             serial,
             text,
@@ -4044,6 +4090,7 @@ impl AndroidEmulatorMcp {
                 target_tracker,
                 target_selector,
                 expected_text: Some(text),
+                exact_editable_text: false,
                 wait_for_selector,
                 deadline,
                 hierarchy_filename: hierarchy_filename.clone(),
@@ -4052,7 +4099,199 @@ impl AndroidEmulatorMcp {
         Ok(VerifiedTextDispatch {
             dispatch,
             verification,
+            clipboard_restore: None,
         })
+    }
+
+    async fn send_clipboard_text_with_verification(
+        &self,
+        request: VerifiedTextDispatchRequest<'_>,
+    ) -> Result<VerifiedTextDispatch, McpError> {
+        require_remaining_budget(request.deadline, "Clipboard text input")?;
+        ensure_mutation_not_cancelled()?;
+        if request.target_tracker.is_none() && request.target_selector.is_none() {
+            return Err(clipboard_text_capability_error(
+                "Clipboard text input requires an observable focused editable target",
+            ));
+        }
+        let target = clipboard_text_target(request.pre_text_nodes, None)?;
+        if !request
+            .target_tracker
+            .map(|tracker| tracker_matches_node(target, tracker))
+            .or_else(|| {
+                request
+                    .target_selector
+                    .map(|selector| selector_matches(target, selector))
+            })
+            .unwrap_or(false)
+        {
+            return Err(clipboard_text_capability_error(
+                "Clipboard text input could not confirm the requested focused editable target",
+            ));
+        }
+        if !request.replace_existing_text_on_adb && target.text.as_deref() == Some(request.text) {
+            return Err(clipboard_text_capability_error(
+                "Raw clipboard input cannot distinguish paste consumption from the field's existing matching text",
+            ));
+        }
+        let endpoint = self.grpc_endpoint_for_serial(request.serial).ok_or_else(|| {
+            clipboard_text_capability_error(
+                "Exact Unicode, control-character, and literal %s input requires a serial-bound emulator clipboard",
+            )
+        })?;
+        let mut transfer = match grpc_backend::begin_clipboard_transfer(
+            endpoint.port,
+            endpoint.auth_token.as_deref(),
+            request.text,
+        )
+        .await
+        {
+            Ok(transfer) => transfer,
+            Err(grpc_backend::GrpcMutationError::CancelledBeforeDispatch) => {
+                return Err(cancelled_mutation_error());
+            }
+            Err(grpc_backend::GrpcMutationError::BeforeDispatch(reason)) => {
+                return Err(McpError::internal_error(
+                    "Clipboard transfer could not start; no text was dispatched",
+                    Some(json!({
+                        "outcome": "provider_unavailable",
+                        "phase": "clipboard_preflight",
+                        "detail": reason,
+                        "next_mutation_dispatched": false,
+                        "retry_safe": false,
+                        "do_not_replay": true,
+                    })),
+                ));
+            }
+            Err(grpc_backend::GrpcMutationError::OutcomeUnknown(_)) => {
+                return Err(clipboard_text_failure(
+                    "clipboard_staging",
+                    false,
+                    false,
+                    "unknown",
+                ));
+            }
+        };
+        self.dispatch_staged_clipboard_text(&mut transfer, request)
+            .await
+    }
+
+    async fn dispatch_staged_clipboard_text(
+        &self,
+        transfer: &mut impl ClipboardTransferCleanup,
+        request: VerifiedTextDispatchRequest<'_>,
+    ) -> Result<VerifiedTextDispatch, McpError> {
+        let VerifiedTextDispatchRequest {
+            serial,
+            text,
+            pre_text_nodes,
+            public_target_selector,
+            target_tracker,
+            target_selector,
+            wait_for_selector,
+            deadline,
+            hierarchy_filename,
+            replace_existing_text_on_adb,
+            existing_text_for_adb_replace: _,
+        } = request;
+        let mut paste_attempted = false;
+        let mut text_verified = false;
+        // All exits after staging pass through explicit cleanup. Never put this
+        // mutation sequence in an outer timeout or choose another input lane.
+        let result = async {
+            let selection_output = if replace_existing_text_on_adb {
+                let budget = clipboard_mutation_budget(deadline)?;
+                self.run_adb_shell_with_timeout(
+                    serial,
+                    ["input", "keycombination", "CTRL_LEFT", "A"],
+                    budget,
+                )
+                .await
+                .map_err(|_| "selection_dispatch")?
+            } else {
+                CommandOutput::default()
+            };
+            let budget = clipboard_mutation_budget(deadline)?;
+            paste_attempted = true;
+            let paste_output = self
+                .run_adb_shell_with_timeout(serial, ["input", "keyevent", "KEYCODE_PASTE"], budget)
+                .await;
+            // A command acknowledgement cannot prove the app consumed paste.
+            // Observe even after an uncertain command result, without replay.
+            let verification = self
+                .verify_text_outcome(TextVerificationRequest {
+                    serial,
+                    pre_text_nodes,
+                    public_target_selector,
+                    target_tracker,
+                    target_selector,
+                    expected_text: Some(text),
+                    exact_editable_text: true,
+                    wait_for_selector,
+                    deadline,
+                    hierarchy_filename,
+                })
+                .await;
+            text_verified = verification
+                .as_ref()
+                .is_ok_and(|verification| verification.requested && verification.satisfied);
+            let paste_output = paste_output.map_err(|_| "paste_dispatch")?;
+            let verification = verification.map_err(|_| "text_verification")?;
+            if !text_verified {
+                return Err("text_verification");
+            }
+            Ok(VerifiedTextDispatch {
+                dispatch: ActionDispatch {
+                    backend: "emulator_clipboard_adb",
+                    output: merge_command_outputs(selection_output, paste_output),
+                    detail: None,
+                },
+                verification,
+                clipboard_restore: None,
+            })
+        }
+        .await;
+
+        if paste_attempted && !text_verified {
+            // An app may defer its clipboard read, and ADB discards Android's
+            // input-injection success flag. Preserve the staged value through
+            // the original verification budget before bounded failure cleanup.
+            sleep(remaining_until(deadline)).await;
+        }
+        let restoration = transfer.restore_if_owned().await;
+        let restoration_status = match restoration {
+            Ok(grpc_backend::ClipboardRestoreOutcome::Restored) => "restored",
+            Ok(grpc_backend::ClipboardRestoreOutcome::PreservedInterveningChange) => {
+                "preserved_intervening_change"
+            }
+            Err(_) => {
+                return Err(clipboard_text_failure(
+                    "clipboard_restore",
+                    paste_attempted,
+                    text_verified,
+                    "unknown",
+                ));
+            }
+        };
+        match result {
+            Ok(mut result) => {
+                let prefix = if replace_existing_text_on_adb {
+                    "selected the focused field once and pasted via emulator clipboard and exact-serial ADB"
+                } else {
+                    "pasted via emulator clipboard and exact-serial ADB"
+                };
+                result.dispatch.detail =
+                    Some(format!("{prefix}; clipboard cleanup: {restoration_status}"));
+                result.clipboard_restore = Some(restoration_status);
+                Ok(result)
+            }
+            Err(phase) => Err(clipboard_text_failure(
+                phase,
+                paste_attempted,
+                text_verified,
+                restoration_status,
+            )),
+        }
     }
 
     async fn wait_for_stable_ui_internal(
@@ -6684,10 +6923,96 @@ fn parse_adb_device_line(line: &str) -> Option<serde_json::Value> {
     }))
 }
 
+fn clipboard_text_capability_error(message: &'static str) -> McpError {
+    McpError::invalid_params(
+        message,
+        Some(json!({
+            "outcome": "unsupported_capability",
+            "next_mutation_dispatched": false,
+            "retry_safe": false,
+            "do_not_replay": true,
+        })),
+    )
+}
+
+fn parse_text_verification_nodes(
+    path: &Path,
+    exact_editable_text: bool,
+) -> Result<Vec<NormalizedUiNode>, McpError> {
+    if exact_editable_text {
+        let xml = std::fs::read_to_string(path).map_err(|_| {
+            McpError::internal_error("Clipboard text observation could not be read", None)
+        })?;
+        clipboard_text_nodes_from_xml(&xml)
+    } else {
+        parse_ui_nodes_from_path(path)
+    }
+}
+
+pub(crate) fn is_editable_text_node(node: &NormalizedUiNode) -> bool {
+    node.class_name
+        .as_deref()
+        .is_some_and(|class| class.ends_with("EditText") || class.ends_with("AutoCompleteTextView"))
+}
+
+fn clipboard_text_target<'a>(
+    nodes: &'a [NormalizedUiNode],
+    expected_focus_selector: Option<&UiSelector>,
+) -> Result<&'a NormalizedUiNode, McpError> {
+    let mut candidates = nodes.iter().filter(|node| {
+        node.focused && node.focusable && node.enabled && is_editable_text_node(node)
+    });
+    let target = candidates.next().ok_or_else(|| {
+        clipboard_text_capability_error(
+            "Clipboard text input requires one observable focused editable field",
+        )
+    })?;
+    if candidates.next().is_some()
+        || expected_focus_selector.is_some_and(|selector| !selector_matches(target, selector))
+    {
+        return Err(clipboard_text_capability_error(
+            "Clipboard text input could not uniquely confirm the requested focused editable field",
+        ));
+    }
+    Ok(target)
+}
+
+fn clipboard_mutation_budget(deadline: Instant) -> Result<Duration, &'static str> {
+    if crate::execution::request_cancelled() {
+        return Err("cancelled_before_next_input");
+    }
+    let remaining = remaining_until(deadline);
+    if remaining.is_zero() {
+        return Err("deadline_before_next_input");
+    }
+    Ok(remaining.min(Duration::from_secs(DEFAULT_ADB_COMMAND_TIMEOUT_SECS)))
+}
+
+fn clipboard_text_failure(
+    phase: &'static str,
+    paste_attempted: bool,
+    text_verified: bool,
+    clipboard_restore: &'static str,
+) -> McpError {
+    McpError::internal_error(
+        "Clipboard text operation did not complete; observe before another text action; input was not replayed",
+        Some(json!({
+            "outcome": "outcome_unknown",
+            "backend": "emulator_clipboard_adb",
+            "phase": phase,
+            "paste_attempted": paste_attempted,
+            "text_verified": text_verified,
+            "clipboard_restore": clipboard_restore,
+            "retry_safe": false,
+            "do_not_replay": true,
+        })),
+    )
+}
+
 fn validate_adb_text(text: &str) -> Result<(), McpError> {
-    if !text.is_ascii() || text.chars().any(char::is_control) || text.contains("%s") {
+    if grpc_backend::requires_clipboard_text(text) {
         return Err(McpError::invalid_params(
-            "ADB input text cannot preserve this text exactly; use a serial-bound emulator gRPC keyboard for Unicode, control characters, or literal %s",
+            "ADB input text cannot preserve this text exactly; use verified text input with a serial-bound emulator clipboard for Unicode, control characters, or literal %s",
             Some(
                 json!({"outcome": "unsupported_capability", "retry_safe": true, "do_not_replay": false}),
             ),
@@ -7331,6 +7656,281 @@ mod tests {
         assert!(validate_adb_text("literal %s").is_err());
         assert!(validate_adb_text("Grüße").is_err());
         assert!(validate_adb_text("line\nbreak").is_err());
+    }
+
+    #[test]
+    fn clipboard_raw_target_requires_one_matching_focused_editable_field() {
+        let nodes = clipboard_text_nodes_from_xml(
+            r#"<hierarchy><node class="android.widget.EditText" resource-id="fixture:id/input" text="" focused="true" focusable="true" enabled="true" /></hierarchy>"#,
+        )
+        .unwrap();
+        let selector = UiSelector {
+            resource_id: Some("fixture:id/input".into()),
+            ..UiSelector::default()
+        };
+        assert!(clipboard_text_target(&nodes, Some(&selector)).is_ok());
+        for (class, focused, focusable, enabled) in [
+            ("android.widget.TextView", true, true, true),
+            ("android.widget.EditText", false, true, true),
+            ("android.widget.EditText", true, false, true),
+            ("android.widget.EditText", true, true, false),
+        ] {
+            let mut invalid = nodes.clone();
+            invalid[0].class_name = Some(class.into());
+            invalid[0].focused = focused;
+            invalid[0].focusable = focusable;
+            invalid[0].enabled = enabled;
+            assert!(clipboard_text_target(&invalid, None).is_err());
+        }
+        assert!(clipboard_text_target(&[], None).is_err());
+        assert!(clipboard_text_target(&[nodes[0].clone(), nodes[0].clone()], None).is_err());
+        assert!(
+            clipboard_text_target(
+                &nodes,
+                Some(&UiSelector {
+                    resource_id: Some("fixture:id/other".into()),
+                    ..UiSelector::default()
+                })
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn clipboard_text_keeps_transfer_until_exact_verification_and_cleans_every_exit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct RecordingCleanup {
+            root: PathBuf,
+            result: Result<grpc_backend::ClipboardRestoreOutcome, grpc_backend::GrpcMutationError>,
+            calls: usize,
+            restored_at: Option<Instant>,
+        }
+        impl ClipboardTransferCleanup for RecordingCleanup {
+            async fn restore_if_owned(
+                &mut self,
+            ) -> Result<grpc_backend::ClipboardRestoreOutcome, grpc_backend::GrpcMutationError>
+            {
+                self.calls += 1;
+                self.restored_at = Some(Instant::now());
+                fs::write(self.root.join("restored"), "cleanup")
+                    .await
+                    .unwrap();
+                self.result.clone()
+            }
+        }
+
+        let parent = std::env::temp_dir().join(timestamp_filename("clipboard-lifecycle", None));
+        let text = " Sedna café Ω %s ";
+        let before_xml = r#"<hierarchy><node class="android.widget.EditText" package="fixture" resource-id="fixture:id/input" text="" content-desc=" Sedna café Ω %s " focused="true" focusable="true" enabled="true" bounds="[0,0][100,40]" /></hierarchy>"#;
+        let before = clipboard_text_nodes_from_xml(before_xml).unwrap();
+        let already_matching = clipboard_text_nodes_from_xml(
+            &before_xml.replace("text=\"\"", &format!("text=\"{text}\"")),
+        )
+        .unwrap();
+        let selector = text_verification_target_selector(&before[0]);
+        let tracker = InternalNodeTracker::from_target_node(&before[0]).unwrap();
+        for scenario in [
+            "success",
+            "raw_success",
+            "intervening_change",
+            "paste_error",
+            "verification_failure",
+            "cleanup_failure",
+            "cancelled",
+            "deadline",
+            "unavailable",
+            "raw_existing",
+        ] {
+            let root = parent.join(scenario);
+            fs::create_dir_all(&root).await.unwrap();
+            fs::write(root.join("before.xml"), before_xml)
+                .await
+                .unwrap();
+            fs::write(
+                root.join("after.xml"),
+                before_xml.replace("text=\"\"", &format!("text=\"{text}\"")),
+            )
+            .await
+            .unwrap();
+            let adb = root.join("adb");
+            fs::write(
+                &adb,
+                r#"#!/usr/bin/env python3
+import pathlib, shlex, sys
+root = pathlib.Path(__file__).resolve().parent
+if sys.argv[1:3] != ['-s', 'clipboard-fixture']:
+    sys.exit('wrong serial')
+args = sys.argv[3:]
+if args[0] == 'shell':
+    args = ['shell'] + shlex.split(args[1])
+command = ' '.join(args)
+with (root / 'calls').open('a') as log:
+    log.write(command + '\n')
+if command == 'shell input keycombination CTRL_LEFT A':
+    pass
+elif command == 'shell input keyevent KEYCODE_PASTE':
+    (root / 'pasted').touch()
+    if root.name == 'paste_error':
+        sys.exit('paste acknowledgement lost')
+elif command == 'exec-out uiautomator dump /dev/tty':
+    if (root / 'restored').exists():
+        sys.exit('clipboard restored before text verification')
+    count_file = root / 'captures'
+    count = int(count_file.read_text()) + 1 if count_file.exists() else 1
+    count_file.write_text(str(count))
+    ready = count > 1 and root.name != 'verification_failure'
+    print((root / ('after.xml' if ready else 'before.xml')).read_text())
+elif command == 'shell dumpsys window windows':
+    print('mCurrentFocus=Window{a u0 fixture/.Main}')
+elif command == 'shell dumpsys activity activities':
+    print('mResumedActivity: ActivityRecord{a u0 fixture/.Main}')
+else:
+    sys.exit('Unexpected fixture command')
+"#,
+            )
+            .await
+            .unwrap();
+            fs::set_permissions(&adb, std::fs::Permissions::from_mode(0o700))
+                .await
+                .unwrap();
+            let mcp = adb_fixture_server(&root);
+            let deadline = match scenario {
+                "deadline" => Instant::now() - Duration::from_secs(1),
+                "verification_failure" => Instant::now() + Duration::from_secs(1),
+                _ => Instant::now() + Duration::from_secs(5),
+            };
+            let request = VerifiedTextDispatchRequest {
+                serial: "clipboard-fixture",
+                text,
+                pre_text_nodes: if scenario == "raw_existing" {
+                    &already_matching
+                } else {
+                    &before
+                },
+                public_target_selector: Some(&selector),
+                target_tracker: Some(&tracker),
+                target_selector: Some(&selector),
+                wait_for_selector: None,
+                deadline,
+                hierarchy_filename: None,
+                replace_existing_text_on_adb: !matches!(scenario, "raw_success" | "raw_existing"),
+                existing_text_for_adb_replace: None,
+            };
+            if matches!(scenario, "unavailable" | "raw_existing") {
+                let error = mcp
+                    .send_text_with_verification(request)
+                    .await
+                    .err()
+                    .unwrap();
+                if scenario == "raw_existing" {
+                    assert!(error.message.contains("existing matching text"));
+                }
+                assert_eq!(error.data.unwrap()["outcome"], "unsupported_capability");
+                assert!(!root.join("calls").exists());
+                continue;
+            }
+            let mut cleanup = RecordingCleanup {
+                root: root.clone(),
+                result: match scenario {
+                    "cleanup_failure" => Err(grpc_backend::GrpcMutationError::OutcomeUnknown(
+                        "private cleanup failure".into(),
+                    )),
+                    "intervening_change" => {
+                        Ok(grpc_backend::ClipboardRestoreOutcome::PreservedInterveningChange)
+                    }
+                    _ => Ok(grpc_backend::ClipboardRestoreOutcome::Restored),
+                },
+                calls: 0,
+                restored_at: None,
+            };
+            let token = tokio_util::sync::CancellationToken::new();
+            if scenario == "cancelled" {
+                token.cancel();
+            }
+            let result = crate::execution::with_cancellation(
+                token,
+                mcp.dispatch_staged_clipboard_text(&mut cleanup, request),
+            )
+            .await;
+            assert_eq!(cleanup.calls, 1, "cleanup must execute exactly once");
+            if matches!(scenario, "success" | "raw_success" | "intervening_change") {
+                let result = result.unwrap();
+                assert!(result.verification.satisfied);
+                assert_eq!(result.dispatch.backend, "emulator_clipboard_adb");
+                assert_eq!(
+                    result.clipboard_restore,
+                    Some(if scenario == "intervening_change" {
+                        "preserved_intervening_change"
+                    } else {
+                        "restored"
+                    })
+                );
+                assert!(
+                    fs::read_to_string(root.join("captures"))
+                        .await
+                        .unwrap()
+                        .parse::<usize>()
+                        .unwrap()
+                        >= 2
+                );
+            } else {
+                let error = result.err().unwrap();
+                let data = error.data.as_ref().unwrap();
+                assert_eq!(data["outcome"], "outcome_unknown");
+                assert_eq!(data["retry_safe"], false);
+                assert_eq!(data["do_not_replay"], true);
+                assert_eq!(
+                    data["phase"],
+                    match scenario {
+                        "paste_error" => "paste_dispatch",
+                        "verification_failure" => "text_verification",
+                        "cleanup_failure" => "clipboard_restore",
+                        "cancelled" => "cancelled_before_next_input",
+                        "deadline" => "deadline_before_next_input",
+                        _ => unreachable!(),
+                    }
+                );
+                assert!(!error.to_string().contains(text));
+                assert!(!error.to_string().contains("private cleanup failure"));
+                assert_eq!(
+                    data["clipboard_restore"],
+                    if scenario == "cleanup_failure" {
+                        "unknown"
+                    } else {
+                        "restored"
+                    }
+                );
+                if scenario == "verification_failure" {
+                    assert!(cleanup.restored_at.unwrap() >= deadline);
+                    assert_eq!(data["text_verified"], false);
+                } else if matches!(scenario, "paste_error" | "cleanup_failure") {
+                    assert_eq!(data["text_verified"], true);
+                }
+            }
+            let calls = fs::read_to_string(root.join("calls"))
+                .await
+                .unwrap_or_default();
+            let mutations = calls
+                .lines()
+                .filter(|line| line.starts_with("shell input"))
+                .collect::<Vec<_>>();
+            if matches!(scenario, "cancelled" | "deadline") {
+                assert!(mutations.is_empty());
+            } else if scenario == "raw_success" {
+                assert_eq!(mutations, ["shell input keyevent KEYCODE_PASTE"]);
+            } else {
+                assert_eq!(
+                    mutations,
+                    [
+                        "shell input keycombination CTRL_LEFT A",
+                        "shell input keyevent KEYCODE_PASTE"
+                    ]
+                );
+            }
+        }
+        fs::remove_dir_all(parent).await.unwrap();
     }
 
     #[test]
@@ -10405,6 +11005,34 @@ else:
             !root.join("calls").exists(),
             "Expired or exhausted recovery must not dispatch"
         );
+        let dialog_selector = UiSelector {
+            resource_id: Some("android:id/aerr_wait".into()),
+            ..UiSelector::default()
+        };
+        let intentional_dialog = mcp
+            .wait_for_tool_postcondition(ToolPostconditionRequest {
+                serial: "anr-fixture",
+                selector: Some(&dialog_selector),
+                match_index: None,
+                wait_for_activity: Some("fixture.Main"),
+                wait_for_package: Some("fixture"),
+                deadline: Instant::now() + Duration::from_secs(10),
+                include_screenshot: false,
+                artifact_prefix: "intentional-anr-postcondition",
+            })
+            .await
+            .unwrap();
+        assert!(intentional_dialog.satisfied);
+        assert!(intentional_dialog.handled_system_dialogs.is_empty());
+        assert!(!root.join("waited").exists());
+        assert!(
+            !fs::read_to_string(root.join("calls"))
+                .await
+                .unwrap()
+                .lines()
+                .any(|line| line.starts_with("shell input")),
+            "A satisfied postcondition must not trigger dialog recovery"
+        );
         let selector = UiSelector {
             resource_id: Some("fixture:id/increment".into()),
             ..UiSelector::default()
@@ -10445,7 +11073,7 @@ else:
                 .lines()
                 .filter(|line| *line == "exec-out uiautomator dump /dev/tty")
                 .count(),
-            2
+            3
         );
         fs::remove_dir_all(root).await.unwrap();
     }

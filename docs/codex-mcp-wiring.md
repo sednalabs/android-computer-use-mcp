@@ -54,6 +54,30 @@ its generic MCP configuration; no Codex-specific dynamic-tool adapter is
 required. The artifact paths and hierarchy remain evidence for replay or
 debugging, while the typed image is the model-visible visual observation.
 
+### Coordinates after client image resizing
+
+Coordinate input uses native Android pixels. The matching observation receipt's
+`width` and `height` describe that native frame. At the qualified Sedna Codex
+revision [`04a76a98ca1c6ebe79417fc5e904f7562c7a0a5b`](https://github.com/sednalabs/codex/blob/04a76a98ca1c6ebe79417fc5e904f7562c7a0a5b/codex-rs/core/src/image_preparation.rs),
+high/default image processing applies a 2048-pixel maximum dimension and a
+2500-patch budget. It can resize the PNG without changing the JSON receipt or
+adding a coordinate transform.
+
+When choosing a point from a resized image, use its actual pixel dimensions
+`image_width` and `image_height` to map back to the receipt's native dimensions:
+
+```text
+x_native = round(x_image * native_width / image_width)
+y_native = round(y_image * native_height / image_height)
+```
+
+Clamp each result to the native bounds, and submit it with the same fresh
+`observation_id`. Recompute after rotation or another observation; do not assume
+a fixed scale from a device profile. Prefer semantic selectors when available.
+The scripted consumer checks qualify typed-image delivery and action receipts;
+they do not establish live-model pointing accuracy. Other Codex revisions must
+be checked against their own image-processing behavior.
+
 Start the daemon separately from the repository checkout:
 
 ```bash

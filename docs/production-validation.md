@@ -48,6 +48,37 @@ uses no real device or model credential. It checks image-bearing results,
 cross-session and concurrent duplicate IDs, the exact underlying mutation log,
 and durable status after restarting the provider with its device offline.
 
+## Text input and clipboard ownership
+
+The emulator keyboard API translates text into key events and cannot preserve
+arbitrary Unicode. Non-ASCII text, control characters and literal `%s` therefore
+use the serial-bound emulator clipboard API and one exact-device ADB paste.
+The provider selects this route before input, verifies the target field, then
+restores the previous clipboard text if the clipboard still contains its staged
+value. Raw text input needs a uniquely observable focused editable field for
+this route. A failed or uncertain paste is never retried through another backend.
+Use `android.type_into_element` for exact replacement of an existing value.
+Raw input keeps insertion semantics and can confirm success only when the final
+editable value exactly matches the requested text; hidden or deferred editor
+contents cannot supply that proof.
+
+Clipboard transfers are serialized in the provider process. Prior clipboard
+text stays in private memory and is excluded from receipts and diagnostics.
+Snapshot, staging and restoration are bounded; cleanup continues after request
+cancellation. If a scheduled clipboard write or restoration has an uncertain
+outcome, that emulator endpoint cannot start another clipboard transfer in the
+same provider process. Inspect and reset the emulator clipboard before
+restarting the provider to resume these transfers.
+
+The emulator API exposes text only, so it cannot preserve rich clipboard
+formats. A `restored` cleanup receipt confirms emulator API readback; propagation
+to the Android guest is asynchronous and the fixture checks it separately.
+The API has no atomic compare-and-set: ownership checks preserve an
+observed intervening change but cannot exclude an external write racing the
+restore itself. Use this path with an emulator dedicated to automation and avoid
+concurrent host clipboard writers. The real-device gate verifies ASCII entry,
+exact Unicode replacement and restoration of a known nonempty clipboard value.
+
 ## Pinning the actual Sedna consumer
 
 `scripts/sedna_codex_consumer_revision.txt` contains a full immutable commit ID.

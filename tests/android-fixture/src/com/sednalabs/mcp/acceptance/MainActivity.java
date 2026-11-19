@@ -2,6 +2,8 @@ package com.sednalabs.mcp.acceptance;
 
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.graphics.Color;
 import android.os.Bundle;
 import android.view.Gravity;
@@ -15,6 +17,7 @@ import android.widget.TextView;
 
 /** Disposable, offline UI fixture. No permissions, account data or network use. */
 public final class MainActivity extends Activity {
+    private static final String CLIPBOARD_SENTINEL = "sednalabs-acceptance-clipboard-sentinel";
     private int count;
     private int maxPointers;
     private String text = "";
@@ -24,7 +27,17 @@ public final class MainActivity extends Activity {
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
+        ClipboardManager clipboard = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+        clipboard.setPrimaryClip(ClipData.newPlainText("Android MCP acceptance", CLIPBOARD_SENTINEL));
         showControls();
+    }
+
+    private boolean clipboardPreserved() {
+        ClipboardManager clipboard = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+        ClipData clip = clipboard.getPrimaryClip();
+        return clip != null && clip.getItemCount() == 1
+            && clip.getItemAt(0).getText() != null
+            && CLIPBOARD_SENTINEL.contentEquals(clip.getItemAt(0).getText());
     }
 
     private int dp(int value) {
@@ -78,7 +91,7 @@ public final class MainActivity extends Activity {
         page.addView(input);
         page.addView(button(R.id.dialog, "Open dialog", view ->
             new AlertDialog.Builder(this).setTitle("Acceptance dialog")
-                .setMessage("Dialog is visible")
+                .setMessage(clipboardPreserved() ? "Clipboard preserved" : "Clipboard changed")
                 .setPositiveButton("Close dialog", (dialog, which) -> dialog.dismiss())
                 .show()));
         page.addView(button(R.id.scroll, "Open scroll page", view -> {

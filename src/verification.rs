@@ -19,12 +19,12 @@ use crate::McpError;
 use crate::server::AndroidEmulatorMcp;
 use crate::tools::{
     AndroidWindowState, SystemDialogCheck, filename_or_timestamp,
-    has_meaningful_observation_budget, is_command_timeout_error, remaining_until,
-    remove_artifact_if_exists,
+    has_meaningful_observation_budget, is_command_timeout_error, is_editable_text_node,
+    remaining_until, remove_artifact_if_exists,
 };
 use crate::ui::{
     NormalizedUiNode, SelectionFailure, SelectorCandidateSummary, UiBounds, UiSelector,
-    matching_nodes, resolve_node_selection, selector_matches,
+    matching_nodes, parse_ui_nodes_from_xml, resolve_node_selection, selector_matches,
 };
 
 /// Tracks the outcome of a tap-based interaction.
@@ -124,6 +124,8 @@ pub(crate) struct TextVerificationRequest<'a> {
     pub(crate) target_tracker: Option<&'a InternalNodeTracker>,
     pub(crate) target_selector: Option<&'a UiSelector>,
     pub(crate) expected_text: Option<&'a str>,
+    /// Require changed, exact editable text rather than labels or descriptions.
+    pub(crate) exact_editable_text: bool,
     pub(crate) wait_for_selector: Option<&'a UiSelector>,
     pub(crate) deadline: Instant,
     pub(crate) hierarchy_filename: Option<String>,
@@ -468,20 +470,36 @@ impl AndroidEmulatorMcp {
             target_tracker,
             target_selector,
             expected_text,
+            exact_editable_text,
             wait_for_selector,
             deadline,
             hierarchy_filename,
         } = request;
         let requested =
             target_tracker.is_some() || target_selector.is_some() || wait_for_selector.is_some();
-        let pre_status = text_verification_status(
-            pre_text_nodes,
-            pre_text_nodes,
-            target_tracker,
-            target_selector,
-            expected_text,
-            wait_for_selector,
-        );
+        let status_for_nodes = |nodes: &[NormalizedUiNode]| {
+            let mut status = text_verification_status(
+                pre_text_nodes,
+                nodes,
+                target_tracker,
+                target_selector,
+                expected_text,
+                wait_for_selector,
+            );
+            if exact_editable_text {
+                let (matches, changed) = exact_editable_text_status(
+                    pre_text_nodes,
+                    nodes,
+                    target_tracker,
+                    target_selector,
+                    expected_text,
+                );
+                status.target_text_matches_requested = Some(matches);
+                status.satisfied &= matches && changed;
+            }
+            status
+        };
+        let pre_status = status_for_nodes(pre_text_nodes);
         let pre_target_present = pre_status.target_present;
         let pre_post_present = pre_status.pre_post_present;
         if !requested {
@@ -562,7 +580,7 @@ impl AndroidEmulatorMcp {
                 sleep(poll_interval).await;
                 continue;
             }
-            let Some(observation) = self
+            let Some(mut observation) = self
                 .capture_ui_observation_until_deadline(
                     serial,
                     filename_or_timestamp(hierarchy_filename.clone(), "input-text-verify", "xml"),
@@ -574,6 +592,9 @@ impl AndroidEmulatorMcp {
             else {
                 break;
             };
+            if exact_editable_text {
+                observation.nodes = clipboard_text_nodes_from_xml(&observation.hierarchy_xml)?;
+            }
             remove_artifact_if_exists(last_hierarchy_path.clone()).await;
             let fingerprint = text_verification_fingerprint(
                 &observation.nodes,
@@ -587,14 +608,7 @@ impl AndroidEmulatorMcp {
                 stable_polls_observed = 1;
                 last_fingerprint = Some(fingerprint);
             }
-            let status = text_verification_status(
-                pre_text_nodes,
-                &observation.nodes,
-                target_tracker,
-                target_selector,
-                expected_text,
-                wait_for_selector,
-            );
+            let status = status_for_nodes(&observation.nodes);
             target_selector_still_present = status.target_present;
             target_text_matches_requested = status.target_text_matches_requested;
             post_selector_matched = status.post_present;
@@ -927,7 +941,7 @@ impl AndroidEmulatorMcp {
                 candidate_summary,
                 handled_system_dialogs: std::mem::take(&mut last_result.handled_system_dialogs),
             };
-            if selector.is_some() {
+            if selector.is_some() && !satisfied {
                 match self
                     .check_postcondition_system_dialog(
                         serial,
@@ -1177,6 +1191,57 @@ pub(crate) fn tap_verification_status(
         ui_changed_from_pre_tap: Some(ui_changed_from_pre_tap),
         satisfied: absent_ok && post_ok,
     }
+}
+
+pub(crate) fn clipboard_text_nodes_from_xml(xml: &str) -> Result<Vec<NormalizedUiNode>, McpError> {
+    let mut nodes = parse_ui_nodes_from_xml(xml)?;
+    let document = roxmltree::Document::parse(xml)
+        .map_err(|_| McpError::internal_error("Clipboard text observation was invalid", None))?;
+    for (node, element) in nodes.iter_mut().zip(
+        document
+            .descendants()
+            .filter(|element| element.has_tag_name("node")),
+    ) {
+        if is_editable_text_node(node) {
+            // General selector normalization trims labels; paste verification
+            // must retain exact whitespace and case from the editable value.
+            node.text = element.attribute("text").map(str::to_owned);
+        }
+    }
+    Ok(nodes)
+}
+
+fn exact_editable_text_status(
+    pre_text_nodes: &[NormalizedUiNode],
+    nodes: &[NormalizedUiNode],
+    target_tracker: Option<&InternalNodeTracker>,
+    target_selector: Option<&UiSelector>,
+    expected_text: Option<&str>,
+) -> (bool, bool) {
+    let Some(expected_text) = expected_text else {
+        return (false, false);
+    };
+    let matches_target = |node: &&NormalizedUiNode| {
+        is_editable_text_node(node)
+            && target_tracker
+                .map(|tracker| tracker_matches_node(node, tracker))
+                .or_else(|| target_selector.map(|selector| selector_matches(node, selector)))
+                .unwrap_or(false)
+    };
+    let mut previous = pre_text_nodes.iter().filter(matches_target);
+    let mut current = nodes.iter().filter(matches_target);
+    let (Some(previous), Some(current), None, None) = (
+        previous.next(),
+        current.next(),
+        previous.next(),
+        current.next(),
+    ) else {
+        return (false, false);
+    };
+    (
+        current.text.as_deref() == Some(expected_text),
+        previous.text != current.text,
+    )
 }
 
 pub(crate) fn text_verification_status(
@@ -1573,13 +1638,80 @@ fn bounds_look_like_same_control(original: &UiBounds, candidate: &UiBounds) -> b
 mod tests {
     use super::{
         ToolPostconditionEvidenceSource, ToolPostconditionResult, activity_matches,
-        component_activity_identity, infer_unique_package_name,
-        should_refresh_semantic_observation, should_refresh_tool_postcondition_observation,
+        clipboard_text_nodes_from_xml, component_activity_identity, exact_editable_text_status,
+        infer_unique_package_name, should_refresh_semantic_observation,
+        should_refresh_tool_postcondition_observation, text_verification_status,
         tool_postcondition_json, window_state_postcondition_matches,
     };
     use crate::tools::AndroidWindowState;
-    use crate::ui::NormalizedUiNode;
+    use crate::ui::{NormalizedUiNode, UiSelector};
     use serde_json::json;
+
+    #[test]
+    fn clipboard_text_proof_requires_changed_exact_editable_value() {
+        let nodes = |text: &str| {
+            clipboard_text_nodes_from_xml(&format!(
+                r#"<hierarchy><node class="android.widget.EditText" resource-id="fixture:id/input" text="{text}" content-desc="Sedna Ω" focused="true" focusable="true" enabled="true" /></hierarchy>"#
+            ))
+            .unwrap()
+        };
+        let before = nodes("before");
+        let selector = UiSelector {
+            resource_id: Some("fixture:id/input".into()),
+            ..UiSelector::default()
+        };
+        let wrong_visible_text = nodes("wrong");
+        assert!(
+            text_verification_status(
+                &before,
+                &wrong_visible_text,
+                None,
+                Some(&selector),
+                Some("Sedna Ω"),
+                None,
+            )
+            .satisfied,
+            "The generic label matcher is intentionally preserved"
+        );
+        for (value, expected, matches) in [
+            ("wrong", "Sedna Ω", false),
+            ("sedna Ω", "Sedna Ω", false),
+            (" Sedna Ω ", "Sedna Ω", false),
+            ("Sedna Ω", " Sedna Ω ", false),
+            (" Sedna Ω ", " Sedna Ω ", true),
+            ("Sedna Ω", "Sedna Ω", true),
+        ] {
+            let current = nodes(value);
+            assert_eq!(current[0].text.as_deref(), Some(value));
+            assert_eq!(
+                exact_editable_text_status(
+                    &before,
+                    &current,
+                    None,
+                    Some(&selector),
+                    Some(expected),
+                ),
+                (matches, true),
+            );
+        }
+        let matching = nodes("Sedna Ω");
+        assert_eq!(
+            exact_editable_text_status(
+                &matching,
+                &matching,
+                None,
+                Some(&selector),
+                Some("Sedna Ω"),
+            ),
+            (true, false),
+            "Unchanged text cannot prove clipboard consumption"
+        );
+        let duplicate = vec![matching[0].clone(), matching[0].clone()];
+        assert_eq!(
+            exact_editable_text_status(&before, &duplicate, None, Some(&selector), Some("Sedna Ω"),),
+            (false, false),
+        );
+    }
 
     fn node_with_package(package_name: Option<&str>) -> NormalizedUiNode {
         NormalizedUiNode {

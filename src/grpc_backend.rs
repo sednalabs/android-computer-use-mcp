@@ -20,6 +20,11 @@ use tonic::transport::{Channel, Endpoint};
 use crate::emulator_grpc::emulator_controller_client::EmulatorControllerClient;
 use crate::emulator_grpc::{ImageFormat, KeyboardEvent, Touch, TouchEvent, image_format};
 
+mod clipboard;
+pub(crate) use clipboard::{
+    ClipboardRestoreOutcome, ClipboardTransfer, begin_clipboard_transfer, requires_clipboard_text,
+};
+
 const GRPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const GRPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const DOUBLE_TAP_INTER_TAP_INTERVAL_MS: u64 = 80;
@@ -161,6 +166,13 @@ pub async fn send_text(
     auth_token: Option<&str>,
     text: &str,
 ) -> Result<(), GrpcMutationError> {
+    ensure_mutation_not_cancelled()?;
+    if requires_clipboard_text(text) {
+        return Err(GrpcMutationError::BeforeDispatch(
+            "this text requires a verified clipboard transfer; emulator keyboard translation is lossy"
+                .to_string(),
+        ));
+    }
     let Some(payload) = keyboard_text_payload(text) else {
         return Ok(());
     };

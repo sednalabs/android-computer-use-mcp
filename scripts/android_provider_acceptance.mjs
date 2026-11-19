@@ -64,9 +64,9 @@ const id = (name) => ({ resource_id: `${packageName}:id/${name}` });
 const text = (value) => ({ text: value, text_exact: true });
 const fixtureLabels = new Set([
   "Android MCP acceptance", "Increment", "Acceptance text input", "Enter test text",
-  "Open dialog", "Acceptance dialog", "Dialog is visible", "Close dialog",
+  "Open dialog", "Acceptance dialog", "Clipboard preserved", "Clipboard changed", "Close dialog",
   "Open scroll page", "Scroll acceptance page", "Scroll destination reached",
-  "Back to controls", "Touch pad", "Acceptance touch pad", "Sedna café Ω %s",
+  "Back to controls", "Touch pad", "Acceptance touch pad", "Sedna ASCII", "Sedna café Ω %s",
   "System UI isn't responding", "System UI isn’t responding",
   "Pixel Launcher isn't responding", "Launcher3 isn't responding",
   "Android MCP Acceptance isn't responding", "Wait", "Close app",
@@ -142,6 +142,8 @@ function failureSummary(value) {
       code: error.code, kind: error.kind,
       message: typeof error.message === "string" ? error.message.slice(0, 1500) : undefined,
       outcome: error.data?.outcome, mutation_dispatched: error.data?.mutation_dispatched,
+      phase: error.data?.phase, paste_attempted: error.data?.paste_attempted,
+      text_verified: error.data?.text_verified, clipboard_restore: error.data?.clipboard_restore,
     };
   const conditionSummary = (condition) => condition && {
     requested: condition.requested, satisfied: condition.satisfied,
@@ -321,11 +323,20 @@ try {
   const duplicateStep = await step("increment-1", increment);
   assert.equal(duplicateStep.duplicate_action_id, true);
   await waitFor(text("Count: 1"));
+  const ascii = "Sedna ASCII";
+  await step("ascii", [action("android.type_into_element", { selector: id("text_input"), text: ascii })]);
+  await waitFor({ ...id("text_input"), ...text(ascii) });
+  checks.push({ gate: "ascii_text_verified", ok: true });
   const unicode = "Sedna café Ω %s";
-  await step("unicode", [action("android.type_into_element", { selector: id("text_input"), text: unicode, timeout_secs: 30 })]);
+  const typedUnicode = await step("unicode", [action("android.type_into_element", { selector: id("text_input"), text: unicode, timeout_secs: 30 })]);
+  assert.equal(typedUnicode.actions[0].receipt.text_backend_used, "emulator_clipboard_adb");
+  assert.equal(typedUnicode.actions[0].receipt.clipboard_restore, "restored");
   await waitFor({ ...id("text_input"), ...text(unicode) });
+  checks.push({ gate: "unicode_replaced_ascii_via_clipboard", backend: "emulator_clipboard_adb", clipboard_restore: "restored", ok: true });
   await step("hide-keyboard", [action("android.input.keyevent", { keycode: "KEYCODE_BACK" })]);
   await step("dialog", [action("android.tap_element", { selector: id("dialog"), wait_for_selector: text("Acceptance dialog") })]);
+  await waitFor(text("Clipboard preserved"));
+  checks.push({ gate: "clipboard_restored_after_unicode", ok: true });
   await step("dismiss-dialog", [action("android.input.keyevent", { keycode: "KEYCODE_BACK" })]);
   await waitFor(id("increment"));
   await step("scroll-page", [action("android.tap_element", { selector: id("scroll"), wait_for_selector: text("Scroll acceptance page") })]);
@@ -380,6 +391,7 @@ try {
     device_serial: serial, android_build_fingerprint: adbText(["shell", "getprop", "ro.build.fingerprint"]),
     emulator_version: spawnSync(path.join(sdk, "emulator/emulator"), ["-version"], { encoding: "utf8", timeout: 10000 }).stdout.split("\n")[0],
     hosted_build_install_tested: true, actual_simultaneous_touch_tested: true,
+    clipboard_restoration_tested: true,
     live_model_judgement: false, multi_device_isolation_tested: false,
     install: installEvidence, checks,
   };
@@ -390,6 +402,7 @@ try {
     schema_version: 1, status: "failed", failed_gate: currentGate,
     provider_source_sha: sourceSha, elapsed_ms: Date.now() - started,
     hosted_build_install_tested: Boolean(installEvidence),
+    clipboard_restoration_tested: checks.some((check) => check.gate === "clipboard_restored_after_unicode" && check.ok),
     device_readiness: deviceReadiness,
     install: installEvidence,
     live_model_judgement: false, checks,

@@ -4,6 +4,9 @@ This offline APK gives the real-emulator gate stable controls and observable
 effects. It requests no permissions and makes no network requests. The touch pad
 reports the maximum simultaneous pointer count received by `MotionEvent`; two
 independent taps cannot satisfy the two-pointer check.
+On launch, the fixture writes a fixed nonsecret clipboard sentinel. Its dialog
+reports only whether that sentinel is preserved, allowing the gate to verify
+clipboard restoration after exact Unicode entry without exposing clipboard text.
 
 The builder uses Android platform 35, build tools 35.0.0, a Java compiler and
 standard ZIP tools. It creates a fresh signing key for each run. The APK is for a
@@ -33,8 +36,9 @@ optional overrides.
 `scripts/android_provider_acceptance.mjs` owns a fresh loopback server and refuses
 an occupied endpoint or an already installed fixture. It checks provider identity
 rejection, archive-digest rejection, exact installed APK bytes, install-only
-behaviour, durable duplicate IDs, semantic taps, Unicode text, dialogs, scrolling,
-orientation, genuine simultaneous touch, lifecycle and partial batch failure.
+behaviour, durable duplicate IDs, semantic taps, exact ASCII entry and Unicode replacement, clipboard
+restoration, dialogs, scrolling, orientation, genuine simultaneous touch,
+lifecycle and partial batch failure.
 The emulator must publish a gRPC endpoint bound to its serial. No synthetic
 discovery metadata or ADB approximation is accepted for the multi-touch check.
 The runner requires a disposable emulator without secure credentials, wakes it,
