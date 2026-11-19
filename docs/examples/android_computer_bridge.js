@@ -126,7 +126,7 @@ export function createAndroidComputerBridge({
             durationMs: action.duration_ms,
             waitForSelector: action.wait_for_selector ?? null,
             expectScrollChange: action.expect_scroll_change ?? false,
-            timeoutSecs: action.timeout_secs ?? 5,
+            ...(action.timeout_secs == null ? {} : { timeoutSecs: action.timeout_secs }),
           },
         );
         return { type: action.type, start, end, result };
@@ -140,7 +140,7 @@ export function createAndroidComputerBridge({
           swipe.y2,
           {
             expectScrollChange: true,
-            timeoutSecs: action.timeout_secs ?? 5,
+            ...(action.timeout_secs == null ? {} : { timeoutSecs: action.timeout_secs }),
           },
         );
         return { type: action.type, swipe, result };

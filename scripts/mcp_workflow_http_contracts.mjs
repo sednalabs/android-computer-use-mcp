@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { writeFile } from "node:fs/promises";
+import { request as httpRequest } from "node:http";
 import { createMcpStreamableHttpClient } from "../adapters/openai/mcp_streamable_http_client.js";
 import {
   assertObservationReceipt,
@@ -33,6 +34,85 @@ function output(result, ok = true) {
 }
 const checks = [];
 try {
+  const endpoint = process.env.MCP_ENDPOINT;
+  const health = new URL("/health", endpoint);
+  const sessionCount = async () => {
+    const response = await fetch(health, { signal: AbortSignal.timeout(10000) });
+    assert.equal(response.status, 200);
+    return (await response.json()).session.active_sessions;
+  };
+  const discover = {
+    jsonrpc: "2.0", id: 0, method: "server/discover",
+    params: { _meta: {
+      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+      "io.modelcontextprotocol/clientInfo": { name: "http-contract", version: "1" },
+      "io.modelcontextprotocol/clientCapabilities": {},
+    } },
+  };
+  const probeHeaders = {
+    "content-type": "application/json",
+    accept: "application/json, text/event-stream",
+    "mcp-protocol-version": "2026-07-28",
+    "mcp-method": "server/discover",
+  };
+  const probe = (headers = {}, body = JSON.stringify(discover)) => fetch(endpoint, {
+    method: "POST",
+    headers: { ...probeHeaders, ...headers },
+    body,
+    signal: AbortSignal.timeout(10000),
+  });
+  assert.equal(await sessionCount(), 0);
+  for (const id of [0, "discover-probe"]) {
+    const response = await probe({}, JSON.stringify({ ...discover, id }));
+    assert.equal(response.status, 400);
+    assert.equal(response.headers.get("mcp-session-id"), null);
+    const error = await response.json();
+    assert.equal(error.jsonrpc, "2.0");
+    assert.equal(error.id, id);
+    assert.equal(error.error.code, -32601);
+    assert.equal(error.result, undefined);
+    assert.equal(error.error.data, undefined);
+  }
+  checks.push({ gate: "modern_discovery_declined_for_legacy_initialize" });
+
+  // Fetch replaces Host with the URL authority; use HTTP directly for this guard.
+  const invalidHostStatus = await new Promise((resolve, reject) => {
+    const request = httpRequest(endpoint, {
+      method: "POST",
+      headers: { ...probeHeaders, host: "untrusted.invalid" },
+      signal: AbortSignal.timeout(10000),
+    }, (response) => {
+      response.resume();
+      response.on("end", () => resolve(response.statusCode));
+      response.on("error", reject);
+    });
+    request.on("error", reject);
+    request.end(JSON.stringify(discover));
+  });
+  assert.equal(invalidHostStatus, 403);
+  for (const session of ["", "unknown-session"]) {
+    const response = await probe({ "mcp-session-id": session });
+    assert.equal(response.status, 404);
+    await response.arrayBuffer();
+  }
+  const headerMismatch = await probe({ "mcp-method": "tools/list" });
+  assert.equal(headerMismatch.status, 400);
+  assert.equal((await headerMismatch.json()).error.code, -32020);
+  const legacyDiscover = structuredClone(discover);
+  legacyDiscover.params._meta["io.modelcontextprotocol/protocolVersion"] = "2025-06-18";
+  const legacyProbe = await probe(
+    { "mcp-protocol-version": "2025-06-18" }, JSON.stringify(legacyDiscover),
+  );
+  assert.equal(legacyProbe.status, 400);
+  const legacyError = await legacyProbe.json();
+  assert.equal(legacyError.result, undefined);
+  assert.equal(legacyError.error, "Missing session ID.");
+  const oversized = await probe({}, JSON.stringify(discover) + " ".repeat(64 * 1024));
+  assert.equal(oversized.status, 413);
+  await oversized.arrayBuffer();
+  assert.equal(await sessionCount(), 0);
+  checks.push({ gate: "discovery_guards_preserved_without_session_allocation" });
+
   for (const client of clients) {
     const tools = await client.listTools();
     assert.equal(tools.length, 45);

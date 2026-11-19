@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, open, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, open, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
@@ -51,6 +51,7 @@ let currentGate = "start";
 let server;
 let client;
 let installEvidence;
+let deviceReadiness;
 const started = Date.now();
 const adbCall = (args, allowNonzero = false) => {
   const result = spawnSync(adb, ["-s", serial, ...args], { timeout: 20000, maxBuffer: 32 * 1024 * 1024 });
@@ -61,6 +62,56 @@ const adbCall = (args, allowNonzero = false) => {
 const adbText = (args, allowNonzero = false) => adbCall(args, allowNonzero).toString("utf8").trim();
 const id = (name) => ({ resource_id: `${packageName}:id/${name}` });
 const text = (value) => ({ text: value, text_exact: true });
+const fixtureLabels = new Set([
+  "Android MCP acceptance", "Increment", "Acceptance text input", "Enter test text",
+  "Open dialog", "Acceptance dialog", "Dialog is visible", "Close dialog",
+  "Open scroll page", "Scroll acceptance page", "Scroll destination reached",
+  "Back to controls", "Touch pad", "Acceptance touch pad", "Sedna café Ω %s",
+]);
+const staticFixtureLabel = (label) => typeof label === "string" &&
+  (fixtureLabels.has(label) || /^(?:Count: \d{1,3}|Max pointers: [0-5]|Scroll row \d{1,2})$/.test(label))
+  ? label : undefined;
+function deviceState() {
+  const capture = (args) => {
+    const result = spawnSync(adb, ["-s", serial, "shell", "dumpsys", ...args], { timeout: 5000, maxBuffer: 1024 * 1024 });
+    if (result.error || result.status !== 0) return { available: false };
+    const pattern = /\b(mWakefulness|mInteractive|mAwake|mScreenOnEarly|mScreenOnFully|mKeyguardShowing|mKeyguardOccluded|showing|showingAndNotOccluded|inputRestricted|occluded|secure|deviceHasKeyguard)\s*[:=]\s*(true|false|Awake|Asleep|Dreaming|Dozing)\b/g;
+    return { available: true, fields: [...result.stdout.toString("utf8").matchAll(pattern)].slice(0, 40).map((match) => ({ name: match[1], value: match[2] })) };
+  };
+  return { power: capture(["power"]), window_policy: capture(["window", "policy"]) };
+}
+async function hierarchyEvidence(value) {
+  const candidates = [
+    ...((value.actions || []).filter((row) => row.ok === false).map((row) => ({
+      source: "postcondition", path: (row.receipt?.postcondition || row.error?.data?.postcondition)?.artifacts?.hierarchy_path,
+    }))),
+    { source: "final_observation", path: value.observation?.artifacts?.hierarchy_path },
+  ].filter((candidate) => typeof candidate.path === "string").slice(0, 2);
+  const summaries = [];
+  for (const candidate of candidates) {
+    let handle;
+    try {
+      const resolved = await realpath(candidate.path);
+      const relative = path.relative(await realpath(artifacts), resolved);
+      assert.ok(relative.startsWith(`uiautomator${path.sep}`) && !path.isAbsolute(relative));
+      handle = await open(resolved, "r");
+      assert.ok((await handle.stat()).size <= 1024 * 1024, "Hierarchy evidence is bounded.");
+      const xml = await handle.readFile("utf8");
+      const nodes = [...xml.matchAll(/<node\b([^>]*)>/g)];
+      summaries.push({ source: candidate.source, node_count: nodes.length, nodes: nodes.slice(0, 64).map((match) => {
+        const attrs = Object.fromEntries([...match[1].matchAll(/([\w:-]+)="([^"]*)"/g)].map((attr) => [attr[1], attr[2]]));
+        return {
+          package_name: attrs.package?.slice(0, 160), class_name: attrs.class?.slice(0, 160),
+          resource_id: attrs["resource-id"]?.slice(0, 200), label: staticFixtureLabel(attrs.text),
+          text_length: attrs.text?.length, bounds: attrs.bounds?.slice(0, 80),
+          enabled: attrs.enabled, clickable: attrs.clickable, focused: attrs.focused,
+        };
+      }) });
+    } catch { summaries.push({ source: candidate.source, available: false }); }
+    finally { if (handle) await handle.close().catch(() => {}); }
+  }
+  return summaries;
+}
 function receipt(result) {
   if (!Array.isArray(result?.content)) return result;
   const texts = result.content.filter((part) => part.type === "text");
@@ -103,6 +154,8 @@ function failureSummary(value) {
     observation: value.observation && {
       screenshot_present: value.observation.screenshot_present,
       ui_available: value.observation.ui_available, elapsed_ms: value.observation.elapsed_ms,
+      node_count: value.observation.node_count,
+      visible_node_count: value.observation.visible_ui?.total_labeled_count,
       notes: value.observation.notes?.slice(0, 4).map((note) => String(note).slice(0, 200)),
     },
   };
@@ -116,6 +169,8 @@ async function call(name, args, { ok = true, image = false } = {}) {
   checks.push(check);
   if (value.ok !== ok) {
     check.failure = failureSummary(value);
+    check.failure.device_state = deviceState();
+    check.failure.hierarchies = await hierarchyEvidence(value);
     console.error(JSON.stringify({ failed_gate: currentGate, failure: check.failure }));
   }
   assert.equal(value.ok, ok, `Unexpected outcome for ${currentGate}.`);
@@ -180,6 +235,16 @@ try {
   });
   await client.listTools();
   await call("android.wait_for_boot", { serial, timeout_secs: 120 });
+  currentGate = "disposable_device_ready";
+  deviceReadiness = { before: deviceState() };
+  assert.ok(!deviceReadiness.before.window_policy.fields?.some((field) => field.name === "secure" && field.value === "true"), "The disposable fixture emulator must not have secure credentials.");
+  adbCall(["shell", "svc", "power", "stayon", "true"]);
+  adbCall(["shell", "input", "keyevent", "KEYCODE_WAKEUP"]);
+  adbCall(["shell", "wm", "dismiss-keyguard"]);
+  await delay(250);
+  deviceReadiness.after = deviceState();
+  assert.equal(deviceReadiness.after.power.fields?.find((field) => field.name === "mWakefulness")?.value, "Awake", "The disposable emulator must be awake before UI acceptance.");
+  checks.push({ gate: "disposable_device_awake", ok: true, state: deviceReadiness });
   const target = (await call("android.resolve_target", { serial })).resolved_target;
   assert.equal(target.device_serial, serial);
   const expectedBuild = {
@@ -309,6 +374,7 @@ try {
     schema_version: 1, status: "failed", failed_gate: currentGate,
     provider_source_sha: sourceSha, elapsed_ms: Date.now() - started,
     hosted_build_install_tested: Boolean(installEvidence),
+    device_readiness: deviceReadiness,
     install: installEvidence,
     live_model_judgement: false, checks,
   }, null, 2)}\n`, { mode: 0o600 });

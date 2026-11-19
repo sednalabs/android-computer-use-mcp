@@ -287,7 +287,7 @@ function evidence(status) {
     serial, android_build_fingerprint: process.env.ANDROID_BUILD_FINGERPRINT || null,
     emulator_version: process.env.ANDROID_EMULATOR_VERSION || null,
     scripted_model_fixture: true, live_model_judgement: false,
-    tool_discovery: deferredDiscovery ? "client_tool_search" : "initial_catalog",
+    tool_discovery: requestCount === 0 ? "not_reached" : deferredDiscovery ? "client_tool_search" : "initial_catalog",
     hosted_build_install_tested: checks.some((check) => check.gate === "hosted_install_receipt_and_image"), checks,
   };
 }

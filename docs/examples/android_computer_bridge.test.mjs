@@ -99,7 +99,7 @@ test("executeActionBatch supports batched zoom, click, and reset_zoom actions", 
   assert.deepEqual(result.view.region, { left: 0, top: 0, width: 1080, height: 1920 });
 });
 
-test("scroll actions are bridged to raw swipe calls with expected scroll change", async () => {
+test("scroll and drag actions preserve explicit timeouts and otherwise use the runtime default", async () => {
   const runtime = createRuntimeStub();
   const bridge = createAndroidComputerBridge({
     runtime,
@@ -111,11 +111,17 @@ test("scroll actions are bridged to raw swipe calls with expected scroll change"
 
   await bridge.executeActionBatch([
     { type: "scroll", x: 270, y: 480, scroll_y: 600, timeout_secs: 9 },
+    { type: "scroll", x: 270, y: 480, scroll_y: 600 },
+    { type: "drag", x1: 100, y1: 100, x2: 200, y2: 200 },
+    { type: "drag", x1: 100, y1: 100, x2: 200, y2: 200, timeout_secs: 12 },
   ]);
 
   assert.equal(runtime.calls[0].fn, "swipe");
   assert.equal(runtime.calls[0].options.expectScrollChange, true);
   assert.equal(runtime.calls[0].options.timeoutSecs, 9);
+  assert.equal(Object.hasOwn(runtime.calls[1].options, "timeoutSecs"), false);
+  assert.equal(Object.hasOwn(runtime.calls[2].options, "timeoutSecs"), false);
+  assert.equal(runtime.calls[3].options.timeoutSecs, 12);
 });
 
 test("captureView preserves base screenshot path and applies optional crop hook", async () => {

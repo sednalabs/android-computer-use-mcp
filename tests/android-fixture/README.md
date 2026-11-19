@@ -37,6 +37,9 @@ behaviour, durable duplicate IDs, semantic taps, Unicode text, dialogs, scrollin
 orientation, genuine simultaneous touch, lifecycle and partial batch failure.
 The emulator must publish a gRPC endpoint bound to its serial. No synthetic
 discovery metadata or ADB approximation is accepted for the multi-touch check.
+The runner requires a disposable emulator without secure credentials, wakes it,
+keeps it awake while plugged in, and requests normal keyguard dismissal before
+the UI journey. It records bounded power and keyguard state to diagnose readiness.
 
 The same hosted bundle is reusable by the pinned Sedna Codex consumer gate. Resolve
 the current target dynamically and attach `expected_build` containing the exact
@@ -45,6 +48,8 @@ workflow definitions alone do not establish a passing run: evidence is written
 only after the runner executes, and any failed check marks the receipt as failed.
 
 Evidence contains timings, image dimensions and hashes, build provenance and
-check outcomes. It excludes screenshots, UI dumps, arbitrary device logs and
+check outcomes. Failed calls also include bounded hierarchy summaries with
+package names, classes, resource IDs and allowlisted static fixture labels.
+It excludes screenshots, full UI dumps, arbitrary device logs and
 credentials. This is a representative scripted journey, not a long-duration soak,
 multi-device isolation test or live-model judgement evaluation.

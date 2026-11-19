@@ -139,6 +139,34 @@ test("typeIntoElement forwards timeout and stores stabilized hierarchy artifact"
   assert.equal(runtime.getState().lastUiDumpPath, "/tmp/type-stable.xml");
 });
 
+test("action helpers leave the MCP timeout default intact and preserve explicit overrides", async () => {
+  const calls = [];
+  const runtime = createAndroidEmulatorRuntime({
+    callMcp: async (toolName, args) => {
+      calls.push({ toolName, args });
+      return { ok: true };
+    },
+  });
+  const actions = [
+    ["launchApp", ["com.example.app"]],
+    ["tapElement", [{ text: "Search" }]],
+    ["typeIntoElement", [{ resource_id: "com.example:id/query" }, "earth"]],
+    ["tap", [10, 20]],
+    ["typeText", ["earth"]],
+    ["swipe", [10, 20, 30, 40]],
+    ["keyevent", ["KEYCODE_BACK"]],
+  ];
+
+  for (const [method, args] of actions) {
+    await runtime[method](...args);
+    assert.equal(Object.hasOwn(calls.at(-1).args, "timeout_secs"), false, method);
+    await runtime[method](...args, { timeoutSecs: null });
+    assert.equal(Object.hasOwn(calls.at(-1).args, "timeout_secs"), false, method);
+    await runtime[method](...args, { timeoutSecs: 9 });
+    assert.equal(calls.at(-1).args.timeout_secs, 9, method);
+  }
+});
+
 test("getToolLoadingPlan exposes eager bootstrap tools and deferred semantic tools", () => {
   const runtime = createAndroidEmulatorRuntime({
     callMcp: async () => ({ ok: true }),
