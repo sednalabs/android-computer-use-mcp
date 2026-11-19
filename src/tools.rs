@@ -3258,15 +3258,6 @@ pub(crate) fn has_meaningful_observation_budget(deadline: Instant) -> bool {
     remaining_until(deadline) >= Duration::from_millis(MIN_OBSERVATION_BUDGET_MS)
 }
 
-fn bounded_deadline(deadline: Instant, soft_budget: Duration) -> Instant {
-    let soft_deadline = Instant::now() + soft_budget;
-    if soft_deadline < deadline {
-        soft_deadline
-    } else {
-        deadline
-    }
-}
-
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct AndroidWindowState {
     pub(crate) current_focus: Option<String>,
@@ -10420,15 +10411,6 @@ else:
 
         assert!(!tracker_matches_node(&unfocused, &focus_tracker));
         assert!(tracker_matches_node(&focused, &focus_tracker));
-    }
-
-    #[test]
-    fn bounded_deadline_prefers_shorter_soft_budget() {
-        let hard_deadline = Instant::now() + Duration::from_secs(5);
-        let bounded = bounded_deadline(hard_deadline, Duration::from_millis(250));
-
-        assert!(bounded <= hard_deadline);
-        assert!(remaining_until(bounded) <= Duration::from_millis(300));
     }
 
     #[test]
