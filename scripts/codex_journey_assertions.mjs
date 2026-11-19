@@ -13,6 +13,27 @@ function crc32(bytes) {
   return (crc ^ 0xffffffff) >>> 0;
 }
 
+export function assertAndroidToolCatalog(tools, enabledTools) {
+  assert.ok(Array.isArray(tools), "Missing model-facing tool catalog.");
+  const namespaces = tools.filter((tool) => tool.type === "namespace" && tool.name === "mcp__android");
+  assert.equal(namespaces.length, 1, "Expected exactly one Android MCP namespace.");
+  const functions = namespaces[0].tools;
+  assert.ok(Array.isArray(functions));
+  assert.ok(functions.every((tool) => tool.type === "function"), "Android tools must remain function-shaped.");
+  const names = functions.map((tool) => tool.name).sort();
+  assert.deepEqual(names, enabledTools.map((name) => name.replaceAll(".", "_")).sort(), "The Android MCP catalog differs from the exact enabled-tool allowlist.");
+  return names;
+}
+
+export function assertAndroidToolDiscovery(body, callId, enabledTools) {
+  const outputs = body.input?.filter((item) => item.type === "tool_search_output" && item.call_id === callId);
+  assert.equal(outputs?.length, 1, "Missing or duplicated tool-discovery response.");
+  assert.equal(outputs[0].status, "completed");
+  assert.equal(outputs[0].execution, "client");
+  assert.equal(outputs[0].tools?.length, 1, "Exact Android discovery unexpectedly returned another namespace.");
+  return assertAndroidToolCatalog(outputs[0].tools, enabledTools);
+}
+
 export function callOutput(body, callId) {
   const call = body.input?.find((item) => item.type === "function_call_output" && item.call_id === callId);
   assert.ok(call, `Missing model-facing output for ${callId}.`);

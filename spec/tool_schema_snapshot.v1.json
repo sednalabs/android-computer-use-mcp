@@ -5,7 +5,6 @@
       "description": "Capture a PNG screenshot from the device and save it locally.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "description": "Arguments for capturing a device screenshot artifact.",
         "properties": {
           "filename": {
             "default": null,
@@ -24,7 +23,6 @@
             ]
           }
         },
-        "title": "ScreenshotArgs",
         "type": "object"
       },
       "name": "android.capture_screenshot"
@@ -33,7 +31,6 @@
       "description": "Capture recent logcat output and save it locally.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "description": "Arguments for collecting recent logcat output as an artifact.",
         "properties": {
           "filename": {
             "default": null,
@@ -62,7 +59,6 @@
             ]
           }
         },
-        "title": "LogcatArgs",
         "type": "object"
       },
       "name": "android.collect_logcat"
@@ -71,7 +67,6 @@
       "description": "Dump the current UI hierarchy XML and save it locally.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "description": "Arguments for dumping the current UI hierarchy as an artifact.",
         "properties": {
           "filename": {
             "default": null,
@@ -90,7 +85,6 @@
             ]
           }
         },
-        "title": "UiDumpArgs",
         "type": "object"
       },
       "name": "android.dump_ui_hierarchy"
@@ -232,7 +226,6 @@
           }
         },
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "description": "Arguments for finding a UI element based on a selector.",
         "properties": {
           "hierarchy_filename": {
             "default": null,
@@ -268,7 +261,6 @@
         "required": [
           "selector"
         ],
-        "title": "FindUiElementArgs",
         "type": "object"
       },
       "name": "android.find_ui_element"
@@ -289,7 +281,6 @@
         "required": [
           "action_id"
         ],
-        "title": "ActionStatusArgs",
         "type": "object"
       },
       "name": "android.get_action_status"
@@ -311,7 +302,6 @@
             ]
           }
         },
-        "title": "SerialArgs",
         "type": "object"
       },
       "name": "android.get_orientation"
@@ -323,7 +313,6 @@
       "description": "Report SDK paths, known AVDs, and attached Android devices.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "title": "EmptyArgs",
         "type": "object"
       },
       "name": "android.health"
@@ -465,7 +454,6 @@
           }
         },
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "description": "Arguments for sending a double-tap input event to an absolute screen coordinate.",
         "properties": {
           "serial": {
             "default": null,
@@ -514,7 +502,6 @@
           "x",
           "y"
         ],
-        "title": "DoubleTapArgs",
         "type": "object"
       },
       "name": "android.input.double_tap"
@@ -656,7 +643,6 @@
           }
         },
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "description": "Arguments for sending a chorded Android key combination to the device.",
         "properties": {
           "key": {
             "default": null,
@@ -729,7 +715,6 @@
             "description": "Optional selector to verify after the key combination."
           }
         },
-        "title": "KeycombinationArgs",
         "type": "object"
       },
       "name": "android.input.keycombination"
@@ -871,7 +856,6 @@
           }
         },
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "description": "Arguments for sending a key event to the device.",
         "properties": {
           "keycode": {
             "description": "Android keycode name to dispatch, such as `KEYCODE_ENTER`.",
@@ -927,7 +911,6 @@
         "required": [
           "keycode"
         ],
-        "title": "KeyeventArgs",
         "type": "object"
       },
       "name": "android.input.keyevent"
@@ -1069,7 +1052,6 @@
           }
         },
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "description": "Arguments for sending a long-press input event to an absolute screen coordinate.",
         "properties": {
           "duration_ms": {
             "default": null,
@@ -1128,7 +1110,6 @@
           "x",
           "y"
         ],
-        "title": "LongPressArgs",
         "type": "object"
       },
       "name": "android.input.long_press"
@@ -1175,7 +1156,6 @@
           }
         },
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "description": "Arguments for sending an atomic multi-touch gesture.",
         "properties": {
           "duration_ms": {
             "default": null,
@@ -1219,7 +1199,6 @@
         "required": [
           "pointers"
         ],
-        "title": "MultiTouchArgs",
         "type": "object"
       },
       "name": "android.input.multi_touch"
@@ -1361,7 +1340,6 @@
           }
         },
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "description": "Arguments for swiping between two screen coordinates.",
         "properties": {
           "duration_ms": {
             "default": null,
@@ -1439,7 +1417,6 @@
           "x2",
           "y2"
         ],
-        "title": "SwipeArgs",
         "type": "object"
       },
       "name": "android.input.swipe"
@@ -1581,7 +1558,6 @@
           }
         },
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "description": "Arguments for tapping an absolute screen coordinate.",
         "properties": {
           "retry_with_adb_on_no_change": {
             "default": false,
@@ -1652,7 +1628,6 @@
           "x",
           "y"
         ],
-        "title": "TapArgs",
         "type": "object"
       },
       "name": "android.input.tap"
@@ -1794,7 +1769,6 @@
           }
         },
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "description": "Arguments for sending text input to the currently focused element.",
         "properties": {
           "expect_focus_selector": {
             "anyOf": [
@@ -1846,7 +1820,6 @@
         "required": [
           "text"
         ],
-        "title": "TextArgs",
         "type": "object"
       },
       "name": "android.input.text"
@@ -1855,7 +1828,6 @@
       "description": "Capture the current UI hierarchy, optionally pair it with a screenshot, and return a normalized UI tree.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "description": "Arguments for inspecting the current UI hierarchy and screenshot.",
         "properties": {
           "hierarchy_filename": {
             "default": null,
@@ -1887,7 +1859,6 @@
             ]
           }
         },
-        "title": "InspectUiArgs",
         "type": "object"
       },
       "name": "android.inspect_ui"
@@ -1896,7 +1867,6 @@
       "description": "Install an APK onto the target device.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "description": "Arguments for installing an APK onto a device.",
         "properties": {
           "apk_path": {
             "description": "Absolute or relative path to the APK file on the host.",
@@ -1919,7 +1889,6 @@
         "required": [
           "apk_path"
         ],
-        "title": "InstallApkArgs",
         "type": "object"
       },
       "name": "android.install_apk"
@@ -2179,7 +2148,6 @@
           "action_id",
           "build"
         ],
-        "title": "InstallBuildWorkflowArgs",
         "type": "object"
       },
       "name": "android.install_build_from_run"
@@ -2321,7 +2289,6 @@
           }
         },
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "description": "Arguments for launching an installed Android app and optionally waiting for readiness.",
         "properties": {
           "activity": {
             "default": null,
@@ -2385,7 +2352,6 @@
         "required": [
           "package_name"
         ],
-        "title": "LaunchAppArgs",
         "type": "object"
       },
       "name": "android.launch_app"
@@ -2394,7 +2360,6 @@
       "description": "Launch a named AVD in the background.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "description": "Arguments for launching an Android Virtual Device (AVD).",
         "properties": {
           "avd_name": {
             "description": "Name of the AVD to launch.",
@@ -2436,7 +2401,6 @@
         "required": [
           "avd_name"
         ],
-        "title": "LaunchAvdArgs",
         "type": "object"
       },
       "name": "android.launch_avd"
@@ -2445,7 +2409,6 @@
       "description": "Launch a named AVD, wait for its emulator serial to appear, and verify boot readiness.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "description": "Arguments for launching an AVD and awaiting successful boot.",
         "properties": {
           "avd_name": {
             "description": "Name of the AVD to launch.",
@@ -2505,7 +2468,6 @@
         "required": [
           "avd_name"
         ],
-        "title": "LaunchAvdAndWaitArgs",
         "type": "object"
       },
       "name": "android.launch_avd_and_wait"
@@ -2517,7 +2479,6 @@
       "description": "List installed Android apps, optionally limited to launcher-visible apps.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "description": "Arguments for listing installed Android apps.",
         "properties": {
           "launcher_only": {
             "default": true,
@@ -2533,7 +2494,6 @@
             ]
           }
         },
-        "title": "ListAppsArgs",
         "type": "object"
       },
       "name": "android.list_apps"
@@ -2545,7 +2505,6 @@
       "description": "List known local Android virtual devices.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "title": "EmptyArgs",
         "type": "object"
       },
       "name": "android.list_avds"
@@ -2567,7 +2526,6 @@
             ]
           }
         },
-        "title": "SerialArgs",
         "type": "object"
       },
       "name": "android.list_devices"
@@ -2724,7 +2682,6 @@
             ]
           }
         },
-        "title": "ObserveArgs",
         "type": "object"
       },
       "name": "android.observe"
@@ -2866,7 +2823,6 @@
           }
         },
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "description": "Arguments for opening a URL on the Android device.",
         "properties": {
           "serial": {
             "default": null,
@@ -2922,7 +2878,6 @@
         "required": [
           "url"
         ],
-        "title": "OpenUrlArgs",
         "type": "object"
       },
       "name": "android.open_url"
@@ -2931,7 +2886,6 @@
       "description": "Read a previously generated artifact file from the configured artifact directory and return its contents for remote consumers.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "description": "Arguments for reading a previously generated artifact file.",
         "properties": {
           "encoding": {
             "default": null,
@@ -2949,7 +2903,6 @@
         "required": [
           "path"
         ],
-        "title": "ReadArtifactArgs",
         "type": "object"
       },
       "name": "android.read_artifact"
@@ -3075,7 +3028,6 @@
           }
         },
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "description": "Resolve and validate the exact Android provider session for a call.",
         "properties": {
           "serial": {
             "default": null,
@@ -3098,7 +3050,6 @@
             "description": "Optional exact session target. Omitted fields resolve only from this\nprovider process's one configured identity tuple."
           }
         },
-        "title": "ResolveAndroidTargetArgs",
         "type": "object"
       },
       "name": "android.resolve_target"
@@ -3240,7 +3191,6 @@
           }
         },
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "description": "Arguments for scrolling until a matching element becomes visible.",
         "properties": {
           "direction": {
             "default": null,
@@ -3294,7 +3244,6 @@
         "required": [
           "selector"
         ],
-        "title": "ScrollUntilVisibleArgs",
         "type": "object"
       },
       "name": "android.scroll_until_visible"
@@ -3436,7 +3385,6 @@
           }
         },
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "description": "Arguments for changing device orientation.",
         "properties": {
           "orientation": {
             "description": "Desired orientation: portrait, landscape, reverse_portrait, or reverse_landscape.",
@@ -3476,7 +3424,6 @@
         "required": [
           "orientation"
         ],
-        "title": "SetOrientationArgs",
         "type": "object"
       },
       "name": "android.set_orientation"
@@ -3688,7 +3635,6 @@
           "action_id",
           "actions"
         ],
-        "title": "StepArgs",
         "type": "object"
       },
       "name": "android.step"
@@ -3830,7 +3776,6 @@
           }
         },
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "description": "Arguments for tapping on a UI element.",
         "properties": {
           "allow_verification_failure": {
             "default": false,
@@ -3903,7 +3848,6 @@
         "required": [
           "selector"
         ],
-        "title": "TapElementArgs",
         "type": "object"
       },
       "name": "android.tap_element"
@@ -3912,7 +3856,6 @@
       "description": "Force-stop an installed Android app by package name.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "description": "Arguments for app-management operations by package name.",
         "properties": {
           "package_name": {
             "description": "Android package name.",
@@ -3940,7 +3883,6 @@
         "required": [
           "package_name"
         ],
-        "title": "PackageNameArgs",
         "type": "object"
       },
       "name": "android.terminate_app"
@@ -4132,7 +4074,6 @@
           "selector",
           "text"
         ],
-        "title": "TypeIntoElementArgs",
         "type": "object"
       },
       "name": "android.type_into_element"
@@ -4141,7 +4082,6 @@
       "description": "Uninstall an Android app by package name.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "description": "Arguments for app-management operations by package name.",
         "properties": {
           "package_name": {
             "description": "Android package name.",
@@ -4169,7 +4109,6 @@
         "required": [
           "package_name"
         ],
-        "title": "PackageNameArgs",
         "type": "object"
       },
       "name": "android.uninstall_app"
@@ -4181,7 +4120,6 @@
       "description": "Wait until sys.boot_completed=1 and package manager is responsive.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "description": "Arguments for waiting until an emulator reports boot completion.",
         "properties": {
           "serial": {
             "default": null,
@@ -4202,7 +4140,6 @@
             ]
           }
         },
-        "title": "WaitForBootArgs",
         "type": "object"
       },
       "name": "android.wait_for_boot"
@@ -4211,7 +4148,6 @@
       "description": "Wait until the UI hierarchy and top window state stop changing, then return a paired observation bundle.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "description": "Arguments for waiting until the UI state has stabilized.",
         "properties": {
           "hierarchy_filename": {
             "default": null,
@@ -4273,7 +4209,6 @@
             ]
           }
         },
-        "title": "WaitForStableUiArgs",
         "type": "object"
       },
       "name": "android.wait_for_stable_ui"
@@ -4415,7 +4350,6 @@
           }
         },
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "description": "Arguments for waiting for a UI element to appear or disappear.",
         "properties": {
           "absent": {
             "default": false,
@@ -4466,7 +4400,6 @@
         "required": [
           "selector"
         ],
-        "title": "WaitUiElementArgs",
         "type": "object"
       },
       "name": "android.wait_for_ui_element"
@@ -4478,7 +4411,6 @@
       "description": "Read the current active-build metadata for the hosted interactive session.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "title": "EmptyArgs",
         "type": "object"
       },
       "name": "interactive_session.get_current_build"
@@ -4490,7 +4422,6 @@
       "description": "Report hosted interactive-session configuration, live session root, and active build metadata.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "title": "EmptyArgs",
         "type": "object"
       },
       "name": "interactive_session.get_status"
@@ -4732,7 +4663,6 @@
           "workflow_run_id",
           "artifact_name"
         ],
-        "title": "InteractiveSessionInstallBuildArgs",
         "type": "object"
       },
       "name": "interactive_session.install_build_from_run"
@@ -4759,7 +4689,6 @@
             ]
           }
         },
-        "title": "InteractiveSessionRelaunchArgs",
         "type": "object"
       },
       "name": "interactive_session.relaunch_current_build"
@@ -4791,7 +4720,6 @@
             ]
           }
         },
-        "title": "SolarLabScenarioArgs",
         "type": "object"
       },
       "name": "solarlab.scenario.stage_first_focus_earth"
@@ -4823,7 +4751,6 @@
             ]
           }
         },
-        "title": "SolarLabScenarioArgs",
         "type": "object"
       },
       "name": "solarlab.scenario.stage_first_immersive_roundtrip"
@@ -4969,7 +4896,6 @@
             ]
           }
         },
-        "title": "SolarLabSemanticActionArgs",
         "type": "object"
       },
       "name": "solarlab.semantic_action"

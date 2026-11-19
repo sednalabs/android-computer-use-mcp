@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { zstdDecompressSync } from "node:zlib";
 import {
-  assertBootReadiness, assertInstallReceipt, assertObservationReceipt, assertScreenshotReceipt,
+  assertAndroidToolCatalog, assertAndroidToolDiscovery, assertBootReadiness, assertInstallReceipt, assertObservationReceipt, assertScreenshotReceipt,
   assertStepReceipt, assertTypedPng, callOutput, jsonReceipt,
 } from "./codex_journey_assertions.mjs";
 
@@ -121,6 +121,21 @@ const finalMessage = (responseId) => sse([
   },
   responseCompleted(responseId),
 ]);
+const toolDiscoveryCallId = "android-mcp-discovery";
+const discoverTools = (responseId, enabledTools) => sse([
+  responseCreated(responseId),
+  {
+    type: "response.output_item.done",
+    item: {
+      type: "tool_search_call", call_id: toolDiscoveryCallId, execution: "client",
+      arguments: {
+        query: enabledTools.map((name) => `mcp__android__${name.replaceAll(".", "_")}`).join(" "),
+        limit: enabledTools.length,
+      },
+    },
+  },
+  responseCompleted(responseId),
+]);
 
 const successActionId = `codex-consumer-${protocolMode || "default"}-success`;
 const failureActionId = `codex-consumer-${protocolMode || "default"}-partial-failure`;
@@ -222,6 +237,7 @@ let api;
 let codex;
 let apiFailure;
 let requestCount = 0;
+let deferredDiscovery = false;
 let stderr = "";
 
 try {
@@ -251,15 +267,32 @@ try {
 
       if (requestCount === 1) {
         const android = body.tools?.find((tool) => tool.type === "namespace" && tool.name === "mcp__android");
-        assert.deepEqual(android?.tools?.map((tool) => tool.name).sort(), enabledTools.map((name) => name.replaceAll(".", "_")).sort());
-      } else {
-        const previous = steps[requestCount - 2];
-        assert.ok(previous, `Unexpected extra Responses API request ${requestCount}.`);
-        checks.push(previous.check(callOutput(body, `android-mcp-call-${requestCount - 1}`)));
+        if (!android) {
+          // The pinned consumer defers MCP tools and exposes them through its
+          // client-executed discovery tool. Require the entire allowlist to be
+          // returned before dispatching any Android operation.
+          const search = body.tools?.find((tool) => tool.type === "tool_search");
+          const advertised = body.tools?.map((tool) => ({ type: tool.type, name: tool.name }));
+          assert.equal(search?.execution, "client", `Android tools and client discovery are both missing: ${JSON.stringify(advertised)}.`);
+          deferredDiscovery = true;
+          response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
+          response.end(discoverTools(`android-mcp-response-${requestCount}`, enabledTools));
+          return;
+        }
+        assertAndroidToolCatalog(body.tools, enabledTools);
+      } else if (requestCount === 2 && deferredDiscovery) {
+        const names = assertAndroidToolDiscovery(body, toolDiscoveryCallId, enabledTools);
+        checks.push({ gate: "deferred_tool_discovery", namespace: "mcp__android", tools: names });
       }
-      const next = steps[requestCount - 1];
+      const toolRequestNumber = requestCount - Number(deferredDiscovery);
+      if (toolRequestNumber > 1) {
+        const previous = steps[toolRequestNumber - 2];
+        assert.ok(previous, `Unexpected extra Responses API request ${requestCount}.`);
+        checks.push(previous.check(callOutput(body, `android-mcp-call-${toolRequestNumber - 1}`)));
+      }
+      const next = steps[toolRequestNumber - 1];
       const stream = next
-        ? toolCall(`android-mcp-response-${requestCount}`, `android-mcp-call-${requestCount}`, next.name, typeof next.args === "function" ? next.args() : next.args)
+        ? toolCall(`android-mcp-response-${requestCount}`, `android-mcp-call-${toolRequestNumber}`, next.name, typeof next.args === "function" ? next.args() : next.args)
         : finalMessage(`android-mcp-response-${requestCount}`);
 
       response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
@@ -340,7 +373,7 @@ try {
   });
   assert.equal(apiFailure, undefined, apiFailure?.message);
   assert.equal(exit.code, 0, `Codex CLI exited ${exit.code ?? exit.signal}: ${stderr.replaceAll(fakeKey, "[redacted]").slice(-1200)}`);
-  assert.equal(requestCount, steps.length + 1, "Every tool result must return to the model before the fixture completes.");
+  assert.equal(requestCount, steps.length + 1 + Number(deferredDiscovery), "Every tool result must return to the model before the fixture completes.");
   const evidence = {
     schema_version: 1, status: "passed", scenario, started_at: startedAt,
     completed_at: new Date().toISOString(), consumer: consumerProvenance,
@@ -351,6 +384,7 @@ try {
     serial, android_build_fingerprint: process.env.ANDROID_BUILD_FINGERPRINT || null,
     emulator_version: process.env.ANDROID_EMULATOR_VERSION || null,
     scripted_model_fixture: true, live_model_judgement: false,
+    tool_discovery: deferredDiscovery ? "client_tool_search" : "initial_catalog",
     hosted_build_install_tested: checks.some((check) => check.gate === "hosted_install_receipt_and_image"), checks,
   };
   if (process.env.ANDROID_MCP_JOURNEY_EVIDENCE) {

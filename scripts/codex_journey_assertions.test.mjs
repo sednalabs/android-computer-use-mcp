@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { assertInstallReceipt, assertObservationReceipt, assertStepReceipt, assertTypedPng, callOutput, jsonReceipt } from "./codex_journey_assertions.mjs";
+import { assertAndroidToolCatalog, assertAndroidToolDiscovery, assertInstallReceipt, assertObservationReceipt, assertStepReceipt, assertTypedPng, callOutput, jsonReceipt } from "./codex_journey_assertions.mjs";
 
 const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ip1sAAAAASUVORK5CYII=", "base64");
 const image = { type: "input_image", detail: "high", image_url: `data:image/png;base64,${png.toString("base64")}` };
@@ -12,6 +12,27 @@ const step = {
   actions: [{ index: 0, outcome: "dispatched" }, { index: 1, outcome: "postcondition_failed" }],
 };
 const expected = { serial: step.serial, actionId: step.action_id, success: false, count: 1, attempted: 2, failedIndex: 1 };
+
+test("direct and deferred catalogs preserve the exact Android allowlist", () => {
+  const enabled = ["android.observe", "android.step"];
+  const catalog = [{ type: "namespace", name: "mcp__android", tools: [
+    { type: "function", name: "android_step" }, { type: "function", name: "android_observe" },
+  ] }];
+  const output = { type: "tool_search_output", call_id: "discover-1", status: "completed", execution: "client", tools: catalog };
+  assert.deepEqual(assertAndroidToolCatalog(catalog, enabled), ["android_observe", "android_step"]);
+  assert.deepEqual(assertAndroidToolDiscovery({ input: [output] }, "discover-1", enabled), ["android_observe", "android_step"]);
+  assert.throws(() => assertAndroidToolDiscovery({ input: [output] }, "another-call", enabled));
+  assert.throws(() => assertAndroidToolDiscovery({ input: [output, output] }, "discover-1", enabled));
+  for (const tools of [
+    [],
+    [{ ...catalog[0], name: "mcp__another_device" }],
+    [{ ...catalog[0], tools: catalog[0].tools.slice(0, 1) }],
+    [{ ...catalog[0], tools: [...catalog[0].tools, { type: "function", name: "android_uninstall_app" }] }],
+  ]) {
+    assert.throws(() => assertAndroidToolCatalog(tools, enabled));
+    assert.throws(() => assertAndroidToolDiscovery({ input: [{ ...output, tools }] }, "discover-1", enabled));
+  }
+});
 
 test("model-facing typed PNG bytes retain dimensions and digest", () => {
   const result = assertTypedPng([text({ ok: true }), image]);

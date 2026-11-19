@@ -74,15 +74,54 @@ function imageEvidence(result) {
   assert.equal(images[0].mimeType, "image/png");
   return assertTypedPng([{ type: "input_image", detail: "high", image_url: `data:image/png;base64,${images[0].data}` }]);
 }
+function failureSummary(value) {
+  // Keep actionable errors while excluding screenshots, hierarchies, transport
+  // stdout/stderr, request arguments and arbitrary receipt fields from evidence.
+  const errorSummary = (error) => typeof error === "string"
+    ? { message: error.slice(0, 1500) }
+    : error && {
+      code: error.code, kind: error.kind,
+      message: typeof error.message === "string" ? error.message.slice(0, 1500) : undefined,
+      outcome: error.data?.outcome, mutation_dispatched: error.data?.mutation_dispatched,
+    };
+  const conditionSummary = (condition) => condition && {
+    requested: condition.requested, satisfied: condition.satisfied,
+    timed_out: condition.timed_out, elapsed_ms: condition.elapsed_ms,
+    evidence_source: condition.evidence_source, match_count: condition.match_count,
+    observed_package: condition.observed_package, observed_activity: condition.observed_activity,
+  };
+  return {
+    outcome: value.outcome, executed_action_count: value.executed_action_count,
+    attempted_action_count: value.attempted_action_count, failed_index: value.failed_index,
+    retry_safe: value.retry_safe, do_not_replay: value.do_not_replay,
+    error: errorSummary(value.error),
+    actions: value.actions?.slice(0, 16).map((row) => ({
+      index: row.index, tool: row.tool, outcome: row.outcome, ok: row.ok,
+      elapsed_ms: row.elapsed_ms, error: errorSummary(row.error || row.receipt?.error),
+      postcondition: conditionSummary(row.receipt?.postcondition || row.error?.data?.postcondition),
+    })),
+    observation: value.observation && {
+      screenshot_present: value.observation.screenshot_present,
+      ui_available: value.observation.ui_available, elapsed_ms: value.observation.elapsed_ms,
+      notes: value.observation.notes?.slice(0, 4).map((note) => String(note).slice(0, 200)),
+    },
+  };
+}
 async function call(name, args, { ok = true, image = false } = {}) {
-  currentGate = name;
+  currentGate = args.action_id ? `${name}:${args.action_id}` : name;
   const begin = Date.now();
   const result = await client.callTool(name, args);
   const value = receipt(result);
-  assert.equal(value.ok, ok, `Unexpected outcome for ${name}.`);
+  const check = { tool: name, action_id: args.action_id, ok: value.ok, expected_ok: ok, elapsed_ms: Date.now() - begin };
+  checks.push(check);
+  if (value.ok !== ok) {
+    check.failure = failureSummary(value);
+    console.error(JSON.stringify({ failed_gate: currentGate, failure: check.failure }));
+  }
+  assert.equal(value.ok, ok, `Unexpected outcome for ${currentGate}.`);
   if (image) assert.equal(Boolean(result.isError), !ok, `${name} MCP error flag must match the receipt.`);
   const imageReceipt = image ? imageEvidence(result) : undefined;
-  checks.push({ tool: name, ok, elapsed_ms: Date.now() - begin, ...(imageReceipt ? { image: imageReceipt } : {}) });
+  if (imageReceipt) check.image = imageReceipt;
   return value;
 }
 async function step(name, actions, extra = {}) {
@@ -194,7 +233,7 @@ try {
 
   await step("launch", [action("android.launch_app", {
     package_name: packageName, activity: activityName,
-    wait_for_selector: id("increment"), wait_for_package: packageName,
+    wait_for_selector: id("increment"), wait_for_package: packageName, timeout_secs: 30,
   })]);
   const increment = [action("android.tap_element", { selector: id("increment"), wait_for_selector: text("Count: 1") })];
   await step("increment-1", increment);
@@ -240,7 +279,7 @@ try {
   await step("terminate", [action("android.terminate_app", { package_name: packageName })]);
   assert.equal(adbText(["shell", "pidof", packageName], true), "");
   await step("relaunch", [action("android.launch_app", {
-    package_name: packageName, activity: activityName, wait_for_selector: text("Count: 0"),
+    package_name: packageName, activity: activityName, wait_for_selector: text("Count: 0"), timeout_secs: 30,
   })]);
   const failed = await call("android.step", {
     serial, action_id: "provider-acceptance-partial-failure", actions: [
@@ -270,6 +309,7 @@ try {
     schema_version: 1, status: "failed", failed_gate: currentGate,
     provider_source_sha: sourceSha, elapsed_ms: Date.now() - started,
     hosted_build_install_tested: Boolean(installEvidence),
+    install: installEvidence,
     live_model_judgement: false, checks,
   }, null, 2)}\n`, { mode: 0o600 });
   throw error;
