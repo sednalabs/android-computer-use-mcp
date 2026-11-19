@@ -3,7 +3,8 @@ import test from "node:test";
 import { summarizeDisplayGeometry, summarizeInputGeometry, summarizeWmSize } from "./android_provider_geometry.mjs";
 import {
   awakeUnlockedReadiness, classifyAnrOwner, pollReadOnlyReadiness,
-  summarizeBuildIdentity, summarizeCredentialReadiness, summarizeVerification,
+  summarizeAnrTraces, summarizeBuildIdentity, summarizeCredentialReadiness,
+  summarizeCurrentAnrWindow, summarizeVerification,
 } from "./android_provider_diagnostics.mjs";
 
 const viewport = "Viewport INTERNAL: displayId=0, uniqueId=private-display, port=0, orientation=1, logicalFrame=[0, 0, 2400, 1080], physicalFrame=[0, 0, 2400, 1080], deviceSize=[2400, 1080], isActive=[1]";
@@ -133,6 +134,143 @@ test("ANR owner requires real system controls and exact whitelisted title eviden
   assert.equal(classifyAnrOwner(nodes("System UI isn't responding").map((node) => ({ ...node, package: "private-app" }))), undefined);
   const ambiguous = [...nodes("System UI isn't responding"), { package: "android", "resource-id": "android:id/alertTitle", text: "Launcher3 isn't responding" }];
   assert.equal(classifyAnrOwner(ambiguous), "unknown");
+});
+
+const anrWindow = (process = "com.android.systemui") => `  Window #0 Window{a123 u0 Application Not Responding: ${process}}:
+    mOwnerUid=1000 showForAllUsers=true package=android appop=NONE
+    mAttrs={private-window-details}
+    mHasSurface=true isReadyForDisplay()=true mWindowRemovalAllowed=false
+    isVisible=true
+`;
+
+test("current ANR window owner requires one active system window and observed controls", () => {
+  const summary = summarizeCurrentAnrWindow(anrWindow(), true);
+  assert.deepEqual(summary, {
+    available: true, system_controls_observed: true, anr_window_count: 1,
+    active_anr_window_count: 1, process_category: "system_ui", owner: "system_ui",
+  });
+  assert.equal(summarizeCurrentAnrWindow(anrWindow("com.sednalabs.mcp.acceptance"), true).owner, "acceptance_fixture");
+  assert.equal(summarizeCurrentAnrWindow(anrWindow("com.android.launcher3"), true).owner, "other");
+  assert.equal(summarizeCurrentAnrWindow(anrWindow(), false).owner, "unknown");
+  assert.equal(summarizeCurrentAnrWindow(`  mCurrentFocus=Window{a123 u0 Application Not Responding: com.android.systemui}\n`, true).owner, "unknown");
+  assert.doesNotMatch(JSON.stringify(summary), /private|a123|com\.android|1000/);
+});
+
+test("current ANR window owner ignores proved inactive windows and rejects ambiguity", () => {
+  for (const inactive of [
+    anrWindow().replace("com.android.systemui}", "com.android.systemui EXITING}"),
+    anrWindow().replace("isVisible=true", "isVisible=false"),
+    anrWindow().replace("isReadyForDisplay()=true", "isReadyForDisplay()=false"),
+    `${anrWindow()}    mAnimatingExit=false mRemoveOnExit=false mDestroying=true mRemoved=false\n`,
+  ]) {
+    assert.equal(summarizeCurrentAnrWindow(inactive, true).owner, "unknown");
+    assert.equal(summarizeCurrentAnrWindow(`${inactive}${anrWindow("com.sednalabs.mcp.acceptance")}`, true).owner, "acceptance_fixture");
+  }
+  for (const ambiguous of [
+    anrWindow().repeat(2),
+    anrWindow().replace("mOwnerUid=1000", "mOwnerUid=10123"),
+    anrWindow().replace("package=android", "package=private-app"),
+    anrWindow().replace("    isVisible=true\n", ""),
+    anrWindow().replace("    isVisible=true\n", "    isVisible=true\n    isVisible=false\n"),
+    anrWindow().replace("    mHasSurface=true", "      mHasSurface=true"),
+    `${anrWindow()}${anrWindow("private-process")}`,
+  ]) assert.equal(summarizeCurrentAnrWindow(ambiguous, true).owner, "unknown");
+});
+
+test("ANR window summaries discard unknown process names and reject oversized input", () => {
+  const unknown = summarizeCurrentAnrWindow(anrWindow("private-process"), true);
+  assert.equal(unknown.process_category, "unknown");
+  assert.doesNotMatch(JSON.stringify(unknown), /private|a123|1000/);
+  for (const dump of [anrWindow().repeat(129), "x".repeat(8193), "\n".repeat(32769), "x\n".repeat(1024 * 1024 + 1)]) {
+    assert.deepEqual(summarizeCurrentAnrWindow(dump, true), { available: false, reason: "bounds_exceeded" });
+  }
+  assert.deepEqual(summarizeCurrentAnrWindow(undefined, true), { available: false, reason: "unavailable" });
+});
+
+const anrTrace = (process = "com.android.systemui", pid = "123") => `----- pid ${pid} at 2026-11-19 00:00:00 -----
+Cmd line: ${process}
+Original command line: private-command
+Build fingerprint: private-fingerprint
+"main" prio=5 tid=1 Native
+  | sysTid=123 private-thread-detail
+  at libcore.io.Linux.write(Native method)
+  at libcore.io.IoBridge.write(IoBridge.java:123)
+  at android.view.ViewDebug.dumpEncoded(ViewDebug.java:456)
+  at private.app.Secret.method(Secret.java:789)
+  at android.os.Looper.loop(Looper.java:99)
+
+"Binder:123_A" prio=5 tid=3 Runnable
+  at android.view.ViewRootImpl$W.executeCommand(ViewRootImpl.java:12)
+  at android.view.ViewDebug.dispatchCommand(ViewDebug.java:34)
+
+"private-thread-name" prio=5 tid=4 Waiting
+  at private.app.Hidden.method(Hidden.java:999)
+----- end ${pid} -----
+`;
+
+test("historical ANR trace summaries retain only known process categories and frame symbols", () => {
+  const summary = summarizeAnrTraces(`ACTIVITY MANAGER LAST ANR TRACES\nFile: /private/path\nSubject: Input dispatching timed out (private-reason)\n${anrTrace()}${anrTrace("private.process", "456")}`);
+  assert.equal(summary.relation, "latest_anr_directory_file");
+  assert.equal(summary.reason_category, "input_dispatch");
+  assert.equal(summary.processes.length, 1);
+  assert.equal(summary.processes_omitted, true);
+  assert.equal(summary.processes[0].process_category, "system_ui");
+  assert.equal(summary.processes[0].complete, true);
+  assert.equal(summary.processes[0].frames_allowlisted_only, true);
+  assert.deepEqual(summary.processes[0].threads, [
+    { category: "main", state: "Native", known_frames: ["libcore.io.Linux.write", "libcore.io.IoBridge.write", "android.view.ViewDebug.dumpEncoded", "android.os.Looper.loop"] },
+    { category: "binder", state: "Runnable", known_frames: ["android.view.ViewRootImpl$W.executeCommand", "android.view.ViewDebug.dispatchCommand"] },
+  ]);
+  assert.doesNotMatch(JSON.stringify(summary), /private|123|456|789|\.java|com\.android\.systemui|2026/);
+});
+
+test("trace metadata is scoped to exact process and thread boundaries", () => {
+  const duplicate = anrTrace().replace("Cmd line: com.android.systemui", "Cmd line: com.android.systemui\nCmd line: private.process");
+  assert.equal(summarizeAnrTraces(duplicate).processes.length, 0);
+  const unframed = anrTrace().replace(/^----- pid[^\n]*\n/, "");
+  assert.equal(summarizeAnrTraces(unframed).processes.length, 0);
+  const trailing = `${anrTrace()}"main" prio=5 tid=1 Blocked\n  at android.view.View.encode(View.java:1)\n`;
+  assert.doesNotMatch(JSON.stringify(summarizeAnrTraces(trailing)), /android\.view\.View\.encode/);
+  const unknownThread = anrTrace().replace('"Binder:123_A" prio=5 tid=3 Runnable', '"private-thread" malformed');
+  assert.doesNotMatch(JSON.stringify(summarizeAnrTraces(unknownThread)), /executeCommand|private/);
+  const partial = summarizeAnrTraces(anrTrace().replace("----- end 123 -----", ""));
+  assert.equal(partial.processes.length, 0);
+  assert.equal(partial.incomplete_process_sections, true);
+  assert.equal(summarizeAnrTraces(anrTrace().replace("----- end 123 -----", "----- end 456 -----")).processes.length, 0);
+});
+
+test("ANR reasons and thread states use static categories and discard arbitrary detail", () => {
+  for (const [reason, expected] of [
+    ["private-window is not responding. Waited 5000ms for FocusEvent(hasFocus=true)", "input_dispatch"],
+    ["private-app does not have a focused window", "input_dispatch_no_focused_window"],
+    ["Broadcast of Intent { private-payload }", "broadcast_receiver"],
+    ["executing service private-service, waited 100ms", "service_execution"],
+    ["Context.startForegroundService() did not then call Service.startForeground(): private-service", "service_start"],
+    ["private-reason", "unknown"],
+  ]) {
+    const summary = summarizeAnrTraces(`Subject: ${reason}\n${anrTrace().replace('tid=1 Native', 'tid=1 WaitingForGcToComplete')}`);
+    assert.equal(summary.reason_category, expected);
+    assert.equal(summary.processes[0].threads[0].state, "WaitingForGcToComplete");
+    assert.doesNotMatch(JSON.stringify(summary), /private/);
+  }
+  assert.equal(summarizeAnrTraces(`Subject: Broadcast of private\nSubject: executing service private\n${anrTrace()}`).reason_category, "unknown");
+  assert.equal(summarizeAnrTraces(anrTrace().replace('tid=1 Native', 'tid=1 PrivateState')).processes[0].threads[0].state, "unknown");
+});
+
+test("ANR trace summaries bound output and prioritize main and observer stacks", () => {
+  const binder = '"Binder:123_B" prio=5 tid=7 Native\n  at android.os.Binder.execTransact(Binder.java:1)\n';
+  const busy = anrTrace().replace('"main"', `${binder.repeat(20)}"main"`);
+  const summary = summarizeAnrTraces(busy);
+  assert.equal(summary.processes[0].threads.length, 12);
+  assert.equal(summary.processes[0].threads[0].category, "main");
+  assert.ok(summary.processes[0].threads[1].known_frames.includes("android.view.ViewRootImpl$W.executeCommand"));
+  assert.equal(summary.processes[0].threads_omitted, true);
+  assert.equal(summarizeAnrTraces(anrTrace().repeat(9)).processes.length, 8);
+  assert.equal(summarizeAnrTraces(anrTrace().repeat(9)).processes_omitted, true);
+  for (const dump of [anrTrace().repeat(65), "x".repeat(8193), "\n".repeat(32769), "x\n".repeat(1024 * 1024 + 1)]) {
+    assert.deepEqual(summarizeAnrTraces(dump), { available: false, reason: "bounds_exceeded" });
+  }
+  assert.deepEqual(summarizeAnrTraces(undefined), { available: false, reason: "unavailable" });
 });
 
 test("verification summaries bound recovery evidence and omit text and selector contents", () => {

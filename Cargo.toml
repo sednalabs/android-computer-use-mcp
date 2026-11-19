@@ -34,7 +34,7 @@ tonic-prost = "0.14.5"
 prost = "0.14.3"
 prost-types = "0.14.1"
 reqwest = { version = "0.12.23", default-features = false, features = ["json", "rustls-tls"] }
-zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
+zip = { version = "=9.7.0", default-features = false, features = ["deflate"] }
 png = { version = "0.18", default-features = false }
 
 [dev-dependencies]

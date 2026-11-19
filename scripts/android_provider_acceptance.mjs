@@ -12,7 +12,8 @@ import { assertTypedPng } from "./codex_journey_assertions.mjs";
 import { summarizeDisplayGeometry, summarizeInputGeometry, summarizeWmSize } from "./android_provider_geometry.mjs";
 import {
   awakeUnlockedReadiness, classifyAnrOwner, decodeXmlAttribute, pollReadOnlyReadiness,
-  summarizeBuildIdentity, summarizeCredentialReadiness, summarizeVerification,
+  summarizeAnrTraces, summarizeBuildIdentity, summarizeCredentialReadiness,
+  summarizeCurrentAnrWindow, summarizeVerification,
 } from "./android_provider_diagnostics.mjs";
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -179,6 +180,33 @@ async function hierarchyEvidence(value) {
   }
   return summaries;
 }
+function anrDiagnostics(hierarchies) {
+  const deadline = performance.now() + 10000;
+  const capture = (args, summarize) => {
+    const remaining = Math.ceil(deadline - performance.now());
+    if (remaining <= 0) return { available: false, reason: "deadline" };
+    const result = spawnSync(adb, ["-s", serial, "shell", "dumpsys", ...args], {
+      timeout: Math.min(5000, remaining), maxBuffer: 2 * 1024 * 1024,
+    });
+    if (result.error || result.status !== 0) return {
+      available: false, reason: result.error?.code === "ETIMEDOUT" ? "timeout"
+        : result.error?.code === "ENOBUFS" ? "bounds_exceeded" : "command_failed",
+    };
+    return summarize(result.stdout.toString("utf8"));
+  };
+  const hierarchy = hierarchies.find((item) => item.source === "final_observation") || hierarchies[0];
+  const controlsObserved = ["android:id/aerr_wait", "android:id/aerr_close"].every((resource) =>
+    hierarchy?.nodes?.some((node) => node.package_name === "android" && node.resource_id === resource));
+  // These reads only inspect existing windows/traces after failure; they never
+  // dump another UI hierarchy, generate a fresh stack trace or send input.
+  return {
+    current_dialog: {
+      ...capture(["window", "windows"], (output) => summarizeCurrentAnrWindow(output, controlsObserved)),
+      controls_source: hierarchy?.source,
+    },
+    historical_trace: capture(["activity", "lastanr-traces"], summarizeAnrTraces),
+  };
+}
 function receipt(result) {
   if (!Array.isArray(result?.content)) return result;
   const texts = result.content.filter((part) => part.type === "text");
@@ -263,6 +291,7 @@ async function call(name, args, { ok = true, image = false } = {}) {
     check.failure = failureSummary(value);
     check.failure.device_state = deviceState();
     check.failure.hierarchies = await hierarchyEvidence(value);
+    check.failure.anr_diagnostics = anrDiagnostics(check.failure.hierarchies);
     const anrOwners = [...new Set(check.failure.hierarchies.map((hierarchy) => hierarchy.anr_owner).filter(Boolean))];
     if (anrOwners.length) check.failure.anr_owner = anrOwners.length === 1 ? anrOwners[0] : "unknown";
     console.error(JSON.stringify({ failed_gate: currentGate, failure: check.failure }));

@@ -46,6 +46,197 @@ export function classifyAnrOwner(nodes) {
   return owners.get(titles[0]) || "unknown";
 }
 
+const knownAnrProcesses = new Map([
+  ["com.android.systemui", "system_ui"],
+  ["com.sednalabs.mcp.acceptance", "acceptance_fixture"],
+  ["com.android.launcher3", "launcher"],
+  ["com.google.android.apps.nexuslauncher", "launcher"],
+  ["system_server", "system_server"],
+]);
+const anrOwner = (category) => ["system_ui", "acceptance_fixture"].includes(category)
+  ? category : category === "unknown" ? "unknown" : "other";
+
+function boundedDiagnosticLines(output, maxBytes = 2 * 1024 * 1024) {
+  if (typeof output !== "string") return { available: false, reason: "unavailable" };
+  if (Buffer.byteLength(output, "utf8") > maxBytes) return { available: false, reason: "bounds_exceeded" };
+  const lines = output.split(/\r?\n/);
+  if (lines.length > 32768 || lines.some((line) => line.length > 8192)) return { available: false, reason: "bounds_exceeded" };
+  return { available: true, lines };
+}
+
+// AppNotRespondingDialog sets a nonlocalized window title containing the process
+// name. Only source-defined main Window # blocks count; other dump references do
+// not establish which ANR dialog is currently displayed. No raw names survive.
+// Android 15: AppNotRespondingDialog.java, RootWindowContainer.dumpWindowsNoHeader,
+// and WindowState.dump/toString in frameworks/base/services/core/java/com/android/server.
+export function summarizeCurrentAnrWindow(output, systemControlsObserved = false) {
+  const parsed = boundedDiagnosticLines(output);
+  if (!parsed.available) return parsed;
+  const summary = { available: true, system_controls_observed: systemControlsObserved === true, anr_window_count: 0, active_anr_window_count: 0, owner: "unknown" };
+  const blocks = [];
+  let block;
+  for (const line of parsed.lines) {
+    if (/^  Window #/.test(line)) {
+      block = undefined;
+      if (!line.includes(" Application Not Responding: ")) continue;
+      const match = line.match(/^  Window #\d{1,5} Window\{[a-fA-F0-9]{1,16} u\d{1,6} Application Not Responding: ([^\r\n}]{1,200})\}:$/);
+      block = { title: match?.[1], lines: [] };
+      blocks.push(block);
+      if (blocks.length > 128) return { available: false, reason: "bounds_exceeded" };
+      continue;
+    }
+    if (block && line.length - line.trimStart().length >= 4) block.lines.push(line);
+    else if (line.trim()) block = undefined;
+  }
+  summary.anr_window_count = blocks.length;
+  const active = [];
+  let ambiguous = false;
+  for (const candidate of blocks) {
+    const exits = candidate.lines.filter((line) => /^    mAnimatingExit=/.test(line));
+    if (candidate.title?.endsWith(" EXITING")) continue;
+    if (exits.length > 1 || (exits.length === 1
+      && !/^    mAnimatingExit=(true|false) mRemoveOnExit=(true|false) mDestroying=(true|false) mRemoved=(true|false)$/.test(exits[0]))) {
+      ambiguous = true; continue;
+    }
+    if (exits.length && /\b(?:mAnimatingExit|mRemoveOnExit|mDestroying|mRemoved)=true\b/.test(exits[0])) continue;
+    const owners = candidate.lines.filter((line) => /^    mOwnerUid=/.test(line));
+    const surfaces = candidate.lines.filter((line) => /^    mHasSurface=/.test(line));
+    const visible = candidate.lines.filter((line) => /^    isVisible=/.test(line));
+    if (surfaces.length === 1 && /^    mHasSurface=(?:false|true) isReadyForDisplay\(\)=false\b/.test(surfaces[0])) continue;
+    if (visible.length === 1 && visible[0] === "    isVisible=false") continue;
+    if (!candidate.title || owners.length !== 1 || surfaces.length !== 1 || visible.length !== 1
+      || !/^    mOwnerUid=1000 showForAllUsers=(?:true|false) package=android(?:\s|$)/.test(owners[0])
+      || !/^    mHasSurface=true isReadyForDisplay\(\)=true\b/.test(surfaces[0])
+      || visible[0] !== "    isVisible=true") { ambiguous = true; continue; }
+    active.push(knownAnrProcesses.get(candidate.title) || "unknown");
+  }
+  summary.active_anr_window_count = active.length;
+  if (ambiguous) summary.ambiguous = true;
+  if (systemControlsObserved === true && !ambiguous && active.length === 1) {
+    summary.process_category = active[0];
+    summary.owner = anrOwner(active[0]);
+  }
+  return summary;
+}
+
+const knownAnrFrames = new Set([
+  "android.view.ViewDebug.dispatchCommand", "android.view.ViewDebug.dumpEncoded",
+  "android.view.ViewRootImpl$W.executeCommand", "android.view.View.encode",
+  "android.view.ViewGroup.encodeProperties", "android.os.BinderProxy.transactNative",
+  "android.os.BinderProxy.transact", "android.os.Binder.execTransactInternal",
+  "android.os.Binder.execTransact", "libcore.io.Linux.write", "libcore.io.IoBridge.write",
+  "java.io.FileOutputStream.write", "android.os.MessageQueue.nativePollOnce",
+  "android.os.MessageQueue.next", "android.os.Looper.loop", "android.os.Looper.loopOnce",
+  "android.os.Handler.handleCallback", "android.os.Handler.dispatchMessage",
+  "android.app.ActivityThread.main", "android.app.ActivityThread.handleBindApplication",
+  "android.app.LoadedApk.makeApplicationInner", "android.app.Instrumentation.callApplicationOnCreate",
+  "com.android.systemui.SystemUIApplication.onCreate", "java.lang.Object.wait",
+  "java.lang.Thread.sleep", "java.util.concurrent.CountDownLatch.await", "java.util.concurrent.FutureTask.get",
+]);
+const knownAnrThreadStates = new Set([
+  "Native", "Runnable", "Sleeping", "Blocked", "Waiting", "TimedWaiting", "Suspended",
+  "WaitingForGcToComplete", "WaitingPerformingGc", "WaitingForGcThreadFlip",
+  "WaitingForJniOnLoad", "WaitingForLockInflation", "WaitingForCheckPointsToRun",
+]);
+const observerFrames = new Set([
+  "android.view.ViewDebug.dispatchCommand", "android.view.ViewDebug.dumpEncoded",
+  "android.view.ViewRootImpl$W.executeCommand", "android.view.View.encode", "android.view.ViewGroup.encodeProperties",
+]);
+
+function anrReasonCategory(reason) {
+  if (typeof reason !== "string") return "unknown";
+  // Only fixed Android reason templates are classified; the app, window,
+  // intent and input-event descriptions are private and never returned.
+  if (reason.startsWith("Input dispatching timed out")) return "input_dispatch";
+  if (/^.{1,512} is not responding\. Waited \d{1,10}ms for .{1,4096}$/.test(reason)) return "input_dispatch";
+  if (/^.{1,512} does not have a focused window$/.test(reason)) return "input_dispatch_no_focused_window";
+  if (reason.startsWith("Broadcast of ")) return "broadcast_receiver";
+  if (reason.startsWith("executing service ")) return "service_execution";
+  if (reason.startsWith("Context.startForegroundService() did not then call Service.startForeground(): ")) return "service_start";
+  return "unknown";
+}
+
+// `lastanr-traces` selects the most recently modified /data/anr file, including
+// temporary predumps, without association to the currently displayed ANR.
+// ART delimits processes with pid/end headers and an
+// exact Cmd line field. Keep only known process categories and literal known
+// frame symbols; neither process IDs, thread names nor arbitrary stack data is
+// retained. Every included process is historical captured context, not blame.
+export function summarizeAnrTraces(output) {
+  const parsed = boundedDiagnosticLines(output);
+  if (!parsed.available) return parsed;
+  const summary = { available: true, relation: "latest_anr_directory_file", reason_category: "unknown", processes: [] };
+  const subjects = [];
+  const blocks = [];
+  let block;
+  let thread;
+  let processStarted = false;
+  for (const line of parsed.lines) {
+    if (!processStarted && line.startsWith("Subject: ")) subjects.push(line.slice(9));
+    if (line.startsWith("----- pid ")) {
+      processStarted = true;
+      thread = undefined;
+      block = undefined;
+      const header = line.match(/^----- pid (\d{1,10}) at [^\r\n]{1,80} -----$/);
+      if (header) {
+        block = { pid: header[1], commands: [], threads: [], complete: false };
+        blocks.push(block);
+        if (blocks.length > 64) return { available: false, reason: "bounds_exceeded" };
+      }
+      continue;
+    }
+    if (line.startsWith("----- end ")) {
+      if (block) block.complete = line === `----- end ${block.pid} -----`;
+      block = undefined;
+      thread = undefined;
+      continue;
+    }
+    if (!block) continue;
+    if (line.startsWith("Cmd line: ")) {
+      block.commands.push(knownAnrProcesses.get(line.slice(10)) || "unknown");
+      thread = undefined;
+      continue;
+    }
+    if (line.startsWith('"')) {
+      thread = undefined;
+      const header = line.match(/^"([^"\r\n]{1,256})"(?: daemon)? prio=\d{1,2} tid=\d{1,6} ([A-Za-z]+)(?: .*)?$/);
+      if (header && block.commands.length === 1 && block.commands[0] !== "unknown") {
+        thread = {
+          category: header[1] === "main" ? "main" : /^Binder:\d+_[0-9A-Fa-f]+$/.test(header[1]) ? "binder" : "other",
+          state: knownAnrThreadStates.has(header[2]) ? header[2] : "unknown",
+          known_frames: [],
+        };
+        block.threads.push(thread);
+        if (block.threads.length > 2048) return { available: false, reason: "bounds_exceeded" };
+      }
+      continue;
+    }
+    const frame = thread && line.match(/^\s+at ([A-Za-z0-9_.$]+)\([^\r\n]*\)$/);
+    if (frame && knownAnrFrames.has(frame[1]) && !thread.known_frames.includes(frame[1])) {
+      thread.known_frames.push(frame[1]);
+    }
+  }
+  if (subjects.length === 1) summary.reason_category = anrReasonCategory(subjects[0]);
+  if (subjects.length > 1) summary.ambiguous_subject = true;
+  let omitted = false;
+  for (const candidate of blocks) {
+    if (candidate.commands.length !== 1 || candidate.commands[0] === "unknown") { omitted = true; continue; }
+    if (!candidate.complete) { summary.incomplete_process_sections = true; omitted = true; continue; }
+    const priority = (item) => item.category === "main" ? 0
+      : item.known_frames.some((frame) => observerFrames.has(frame)) ? 1 : 2;
+    const relevant = candidate.threads.filter((item) => item.category === "main" || item.known_frames.length)
+      .sort((left, right) => priority(left) - priority(right));
+    if (summary.processes.length >= 8) { omitted = true; continue; }
+    summary.processes.push({
+      process_category: candidate.commands[0], complete: candidate.complete,
+      frames_allowlisted_only: true, threads: relevant.slice(0, 12),
+      threads_omitted: relevant.length > 12,
+    });
+  }
+  summary.processes_omitted = omitted;
+  return summary;
+}
+
 export function summarizeVerification(verification) {
   if (!verification) return undefined;
   return {
