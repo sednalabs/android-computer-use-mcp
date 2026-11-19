@@ -50,9 +50,11 @@ and durable status after restarting the provider with its device offline.
 
 ## Text input and clipboard ownership
 
-The emulator keyboard API translates text into key events and cannot preserve
-arbitrary Unicode. Non-ASCII text, control characters and literal `%s` therefore
-use the serial-bound emulator clipboard API and one exact-device ADB paste.
+Printable ASCII text uses the validated ADB text route. The emulator keyboard
+API translates text into key events; its scheduling acknowledgement did not
+produce even ASCII field contents in [real acceptance](https://github.com/sednalabs/android-computer-use-mcp/actions/runs/44434613937) and cannot preserve
+arbitrary Unicode. Non-ASCII text, control characters and literal `%s` use the
+serial-bound emulator clipboard API and one exact-device ADB paste.
 The provider selects this route before input, verifies the target field, then
 restores the previous clipboard text if the clipboard still contains its staged
 value. Raw text input needs a uniquely observable focused editable field for

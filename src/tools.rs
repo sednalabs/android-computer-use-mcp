@@ -4401,41 +4401,9 @@ impl AndroidEmulatorMcp {
         serial: &str,
         text: &str,
     ) -> Result<ActionDispatch, McpError> {
-        let mut preflight_failure = None;
-        if let Some(endpoint) = self.grpc_endpoint_for_serial(serial) {
-            match grpc_backend::send_text(endpoint.port, endpoint.auth_token.as_deref(), text).await
-            {
-                Ok(()) => {
-                    return Ok(ActionDispatch {
-                        backend: "grpc",
-                        output: CommandOutput::default(),
-                        detail: None,
-                    });
-                }
-                Err(grpc_backend::GrpcMutationError::BeforeDispatch(detail)) => {
-                    preflight_failure = Some(detail)
-                }
-                Err(grpc_backend::GrpcMutationError::CancelledBeforeDispatch) => {
-                    return Err(cancelled_mutation_error());
-                }
-                Err(err) => return Err(uncertain_mutation_error("text", &err.to_string())),
-            }
-        }
-
-        let mut dispatch = self.send_text_via_adb_internal(serial, text).await?;
-        dispatch.detail = preflight_failure.map(|detail| {
-            format!(
-                "selected ADB before any gRPC mutation after read-only preflight failure: {detail}"
-            )
-        });
-        Ok(dispatch)
-    }
-
-    async fn send_text_via_adb_internal(
-        &self,
-        serial: &str,
-        text: &str,
-    ) -> Result<ActionDispatch, McpError> {
+        // Emulator keyboard acknowledgement does not establish text delivery.
+        // Select ADB for printable ASCII before dispatch; Unicode and other
+        // lossy keyboard cases use the verified clipboard lane above.
         validate_adb_text(text)?;
         let output = self
             .run_adb_shell(serial, ["input", "text", &escape_adb_text(text)])
@@ -4443,7 +4411,7 @@ impl AndroidEmulatorMcp {
         Ok(ActionDispatch {
             backend: "adb",
             output,
-            detail: None,
+            detail: Some("selected ADB text input for printable ASCII".to_string()),
         })
     }
 
@@ -4453,9 +4421,8 @@ impl AndroidEmulatorMcp {
         text: &str,
         existing_text: Option<&str>,
     ) -> Result<ActionDispatch, McpError> {
-        if self.grpc_endpoint_for_serial(serial).is_none() {
-            validate_adb_text(text)?;
-        }
+        // Validate the chosen transport before select-all changes device state.
+        validate_adb_text(text)?;
         let _ = existing_text;
         let selection_output = self
             .run_adb_shell(serial, ["input", "keycombination", "CTRL_LEFT", "A"])
@@ -7656,6 +7623,102 @@ mod tests {
         assert!(validate_adb_text("literal %s").is_err());
         assert!(validate_adb_text("Grüße").is_err());
         assert!(validate_adb_text("line\nbreak").is_err());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn ascii_replacement_preselects_one_exact_serial_adb_text_without_clipboard() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(timestamp_filename("ascii-text", None));
+        fs::create_dir_all(&root).await.unwrap();
+        let adb = root.join("adb");
+        fs::write(
+            &adb,
+            r#"#!/usr/bin/env python3
+import json, pathlib, shlex, sys
+root = pathlib.Path(__file__).resolve().parent
+if sys.argv[1:3] != ['-s', 'ascii-fixture']:
+    sys.exit('wrong serial')
+args = sys.argv[3:]
+if args[0] != 'shell':
+    sys.exit('unexpected transport')
+command = shlex.split(args[1])
+with (root / 'calls').open('a') as log:
+    log.write(json.dumps([sys.argv[1], sys.argv[2], command]) + '\n')
+if command[:2] == ['input', 'text'] and (root / 'fail-text').exists():
+    sys.exit('text acknowledgement lost')
+"#,
+        )
+        .await
+        .unwrap();
+        fs::set_permissions(&adb, std::fs::Permissions::from_mode(0o700))
+            .await
+            .unwrap();
+        let mcp = adb_fixture_server(&root);
+        let text = "  Sedna's ASCII & value  ";
+        let dispatch = mcp
+            .send_text_with_verification(VerifiedTextDispatchRequest {
+                serial: "ascii-fixture",
+                text,
+                pre_text_nodes: &[],
+                public_target_selector: None,
+                target_tracker: None,
+                target_selector: None,
+                wait_for_selector: None,
+                deadline: Instant::now() + Duration::from_secs(5),
+                hierarchy_filename: None,
+                replace_existing_text_on_adb: true,
+                existing_text_for_adb_replace: Some("old field text"),
+            })
+            .await
+            .unwrap();
+        assert_eq!(dispatch.dispatch.backend, "adb");
+        assert_eq!(dispatch.clipboard_restore, None);
+        assert!(!dispatch.verification.requested);
+        let read_calls = || async {
+            fs::read_to_string(root.join("calls"))
+                .await
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let expected = vec![
+            json!([
+                "-s",
+                "ascii-fixture",
+                ["input", "keycombination", "CTRL_LEFT", "A"]
+            ]),
+            json!([
+                "-s",
+                "ascii-fixture",
+                ["input", "text", "%s%sSedna's%sASCII%s&%svalue%s%s"]
+            ]),
+        ];
+        assert_eq!(read_calls().await, expected);
+
+        for unsupported in ["Grüße", "line\nbreak", "literal %s"] {
+            assert!(
+                mcp.send_text_replacing_via_adb_internal("ascii-fixture", unsupported, None)
+                    .await
+                    .is_err()
+            );
+        }
+        assert_eq!(read_calls().await, expected, "validate before select-all");
+
+        fs::write(root.join("fail-text"), "fail").await.unwrap();
+        assert!(
+            mcp.send_text_replacing_via_adb_internal("ascii-fixture", text, None)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            read_calls().await,
+            [expected.clone(), expected].concat(),
+            "An uncertain input command must not be retried"
+        );
+        fs::remove_dir_all(root).await.unwrap();
     }
 
     #[test]

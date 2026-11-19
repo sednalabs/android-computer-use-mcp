@@ -161,6 +161,11 @@ async fn send_tap_with_client(
     .await
 }
 
+/// Submit low-level emulator keyboard translation and await its RPC acknowledgement.
+///
+/// Success confirms transport completion only; the emulator can acknowledge this
+/// request without delivering text to a focused field. MCP text tools therefore
+/// preselect ADB for printable ASCII and verified clipboard paste for other text.
 pub async fn send_text(
     port: u16,
     auth_token: Option<&str>,

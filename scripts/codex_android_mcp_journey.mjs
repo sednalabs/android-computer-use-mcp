@@ -451,5 +451,7 @@ try {
     api.closeAllConnections?.();
     await new Promise((resolve) => api.close(resolve));
   }
-  await rm(tmpRoot, { recursive: true, force: true });
+  // Background plugin checkout can briefly outlive the CLI and race removal.
+  // Retry transient filesystem errors with bounded backoff; final errors still fail.
+  await rm(tmpRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 }
